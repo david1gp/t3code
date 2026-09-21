@@ -58,26 +58,34 @@ interface ReadBoolean<Value> {
 }
 
 /**
- * The specification defines exactly one true value, the case-insensitive
- * string `true`, and says an implementation must not extend that list. So a
- * value that reads as affirmative anywhere else is false here, and the
- * specification asks for a warning when it happens, because being read as the
- * opposite of what it looks like is the whole problem with these values.
+ * The one true value the OpenTelemetry specification allows, and the one false
+ * value it recognizes as a deliberate no. Quoted rather than paraphrased
+ * because the restriction is the surprising part:
  *
- * Only `false`, empty and unset are quiet: those are the ways of saying no
- * that the specification recognizes.
+ * > Any value that represents a Boolean MUST be set to true only by the
+ * > case-insensitive string `"true"` [...] An implementation MUST NOT extend
+ * > this definition and define additional values that are interpreted as true.
+ *
+ * So `OTEL_SDK_DISABLED=1`, `=yes` and `=on` are all false, and accepting them
+ * is not ours to choose. That is also why the specification asks for a warning
+ * on anything it does not recognize: a value that looks affirmative and is read
+ * as false is the failure these variables actually produce, and silence would
+ * leave an operator believing telemetry is off when it is still being exported.
  */
-const specBoolean = (name: string) =>
+const OTEL_SPEC_TRUE = "true";
+const OTEL_SPEC_FALSE = "false";
+
+const otelSpecBoolean = (name: string) =>
   optionalString(name).pipe(
     Effect.map((raw): ReadBoolean<boolean> => {
       if (raw === undefined) {
         return { value: false, warnings: [] };
       }
       const value = raw.toLowerCase();
-      if (value === "true") {
+      if (value === OTEL_SPEC_TRUE) {
         return { value: true, warnings: [] };
       }
-      if (value === "false") {
+      if (value === OTEL_SPEC_FALSE) {
         return { value: false, warnings: [] };
       }
       return {
@@ -90,31 +98,32 @@ const specBoolean = (name: string) =>
   );
 
 /**
- * A `T3CODE_*` name is ours, so the specification's one-true-spelling rule does
- * not bind it and it answers to the same values as every other `T3CODE_*`
- * boolean. Those are `Config.Boolean`'s literals rather than anything
- * OpenTelemetry defines, listed here because they are matched
- * case-insensitively: the standard name beside this one accepts `TRUE`, and
- * our own name being the stricter of the two would be the surprise.
+ * The values every `T3CODE_*` boolean in this codebase accepts, which are
+ * `Config.Boolean`'s literals. The specification constrains the names it
+ * defines, not ours, so a name of our own is read the way the rest of T3 Code's
+ * variables are read instead of being held to a rule that was written for
+ * `OTEL_*`. Matched case-insensitively, because the standard name beside this
+ * one accepts `TRUE` and our own name being the stricter of the two would be
+ * the surprise.
  *
  * `undefined` means the name did not answer, either because it is unset or
  * because its value was unreadable, and the source under it decides instead. A
  * typo therefore costs that variable and nothing else.
  */
-const T3_AFFIRMATIVE = ["true", "yes", "on", "1", "y"];
-const T3_NEGATIVE = ["false", "no", "off", "0", "n"];
+const CONFIG_BOOLEAN_TRUE = new Set(["true", "yes", "on", "1", "y"]);
+const CONFIG_BOOLEAN_FALSE = new Set(["false", "no", "off", "0", "n"]);
 
-const t3Boolean = (name: string) =>
+const configBoolean = (name: string) =>
   optionalString(name).pipe(
     Effect.map((raw): ReadBoolean<boolean | undefined> => {
       if (raw === undefined) {
         return { value: undefined, warnings: [] };
       }
       const value = raw.toLowerCase();
-      if (T3_AFFIRMATIVE.includes(value)) {
+      if (CONFIG_BOOLEAN_TRUE.has(value)) {
         return { value: true, warnings: [] };
       }
-      if (T3_NEGATIVE.includes(value)) {
+      if (CONFIG_BOOLEAN_FALSE.has(value)) {
         return { value: false, warnings: [] };
       }
       return {
@@ -140,8 +149,8 @@ const disabledBy = (name: string) =>
  * the switch at its default rather than taking the process down with it.
  */
 export const load: Effect.Effect<OtelEnvironment> = Effect.gen(function* () {
-  const t3 = yield* t3Boolean("T3CODE_OTEL_SDK_DISABLED");
-  const spec = yield* specBoolean("OTEL_SDK_DISABLED");
+  const t3 = yield* configBoolean("T3CODE_OTEL_SDK_DISABLED");
+  const spec = yield* otelSpecBoolean("OTEL_SDK_DISABLED");
   // One setting under two names: T3 Code's own answers it, and the standard
   // name answers it only when ours is unset.
   const disabled = t3.value ?? spec.value;

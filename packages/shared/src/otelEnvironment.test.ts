@@ -55,7 +55,7 @@ describe("OtelEnvironment", () => {
     }),
   );
 
-  it.effect("T3CODE_OTEL_SDK_DISABLED accepts the wider T3 Code affirmatives", () =>
+  it.effect("T3CODE_OTEL_SDK_DISABLED accepts the values every T3CODE_* boolean accepts", () =>
     Effect.gen(function* () {
       const numeric = yield* OtelEnvironment.load.pipe(withEnv({ T3CODE_OTEL_SDK_DISABLED: "1" }));
       assert.isTrue(numeric.disabled);
@@ -66,8 +66,9 @@ describe("OtelEnvironment", () => {
       const off = yield* OtelEnvironment.load.pipe(withEnv({ T3CODE_OTEL_SDK_DISABLED: "off" }));
       assert.isFalse(off.disabled);
 
-      // Config.Boolean's own literals, so T3 Code's variables do not disagree
-      // with each other about what a yes looks like.
+      // Config.Boolean's literals, because the specification constrains the
+      // names it defines and not ours, and T3 Code's own variables should not
+      // disagree with each other about what a yes looks like.
       const shortYes = yield* OtelEnvironment.load.pipe(withEnv({ T3CODE_OTEL_SDK_DISABLED: "y" }));
       assert.isTrue(shortYes.disabled);
 

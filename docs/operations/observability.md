@@ -564,17 +564,25 @@ machine that already exports `OTEL_SDK_DISABLED` for everything else can still o
 with `T3CODE_OTEL_SDK_DISABLED=false` without touching the ambient variable everything else depends
 on.
 
-The two names accept different values. `OTEL_SDK_DISABLED` follows the OpenTelemetry
-specification, which recognizes only the case-insensitive string `true` and forbids implementations
-from accepting anything else; `OTEL_SDK_DISABLED=1` and `OTEL_SDK_DISABLED=yes` therefore leave
-export running. Because that is the opposite of what those values look like, they are reported as a
-warning at startup, and the warning is reported even when `T3CODE_OTEL_SDK_DISABLED` already
-answered, since the value is wrong either way.
+The two names accept different values, and the narrower one is not a choice we made.
+`OTEL_SDK_DISABLED` is a name the OpenTelemetry specification defines, and the specification says a
+boolean variable it defines "MUST be set to true only by the case-insensitive string `true`" and
+that "an implementation MUST NOT extend this definition and define additional values that are
+interpreted as true". So `OTEL_SDK_DISABLED=1` and `OTEL_SDK_DISABLED=yes` leave export running:
+reading them as affirmative would make T3 Code disagree with every other OpenTelemetry SDK reading
+the same variable on the same machine, which is the whole point of the variable having a standard
+name.
 
-`T3CODE_OTEL_SDK_DISABLED` is T3 Code's own name, so it accepts the same values as every other
-`T3CODE_*` boolean: `true`, `yes`, `on`, `1`, `y` and their negations, case-insensitively. A value
-that matches none of them is a warning rather than a refusal to start, and that name is treated as
-unset so `OTEL_SDK_DISABLED` decides instead.
+A value that looks affirmative and is read as false is the failure that rule produces, so the
+specification asks for a warning on anything it does not recognize, and one is reported at startup.
+It is reported even when `T3CODE_OTEL_SDK_DISABLED` already answered, since the value is wrong
+either way. Only `false`, blank and unset are quiet, because those are the ways of saying no that
+the specification recognizes.
+
+`T3CODE_OTEL_SDK_DISABLED` is a name of ours, which the specification does not constrain, so it is
+read the way every other `T3CODE_*` boolean is read: `true`, `yes`, `on`, `1`, `y` and their
+negations, case-insensitively. A value that matches none of them is a warning rather than a refusal
+to start, and that name is treated as unset so `OTEL_SDK_DISABLED` decides instead.
 
 An endpoint stored in Settings never overrides the switch: when it is set, the server and desktop
 app report every OTLP endpoint as unset no matter what was persisted.
