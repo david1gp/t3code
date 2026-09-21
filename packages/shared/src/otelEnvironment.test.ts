@@ -116,6 +116,24 @@ describe("OtelEnvironment", () => {
     }),
   );
 
+  it.effect("padding around a value is not part of the value", () =>
+    Effect.gen(function* () {
+      // The specification is silent on whitespace, and other SDKs read a
+      // boolean as trim then compare, so a variable a shell or .env file padded
+      // still says what the operator wrote. Reading "  " as unset and " true "
+      // as a bad value would also be two different answers to the same
+      // question.
+      const padded = yield* OtelEnvironment.load.pipe(withEnv({ OTEL_SDK_DISABLED: " true " }));
+      assert.isTrue(padded.disabled);
+
+      const paddedBad = yield* OtelEnvironment.load.pipe(withEnv({ OTEL_SDK_DISABLED: " yes " }));
+      assert.isFalse(paddedBad.disabled);
+      assert.deepStrictEqual(paddedBad.warnings, [
+        "OTEL_SDK_DISABLED=yes was read as false; the OpenTelemetry specification recognizes only the string true, so use OTEL_SDK_DISABLED=true or T3CODE_OTEL_SDK_DISABLED to say it any other way",
+      ]);
+    }),
+  );
+
   it.effect("names the switch that turned telemetry off", () =>
     Effect.gen(function* () {
       const viaT3 = yield* OtelEnvironment.load.pipe(withEnv({ T3CODE_OTEL_SDK_DISABLED: "true" }));

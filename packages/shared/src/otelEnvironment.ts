@@ -40,6 +40,12 @@ export interface OtelEnvironment {
  * A set but blank value is not an answer. It is how a machine clears a variable
  * it inherited without being able to unset it, so taking one as an answer would
  * suppress the source under it that could have been used instead.
+ *
+ * Padding is dropped for the same reason, before any value is compared: a shell
+ * or a `.env` file can add it without the operator writing it, and reading `  `
+ * as unset while reading ` true ` as a bad value would be two answers to one
+ * question. The specification says nothing about whitespace, and other SDKs
+ * trim before they compare.
  */
 const blankAsUnset = (value: string | undefined) => {
   const trimmed = value?.trim();
