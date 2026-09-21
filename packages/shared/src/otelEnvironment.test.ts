@@ -33,6 +33,28 @@ describe("OtelEnvironment", () => {
     }),
   );
 
+  it.effect("warns about a value the specification reads as the opposite of its meaning", () =>
+    Effect.gen(function* () {
+      const affirmative = yield* OtelEnvironment.load.pipe(withEnv({ OTEL_SDK_DISABLED: "yes" }));
+      assert.isFalse(affirmative.disabled);
+      assert.include(affirmative.warnings.join("\n"), "OTEL_SDK_DISABLED=yes was read as false");
+
+      const spelled = yield* OtelEnvironment.load.pipe(withEnv({ OTEL_SDK_DISABLED: "false" }));
+      assert.isFalse(spelled.disabled);
+      assert.deepStrictEqual(spelled.warnings, []);
+    }),
+  );
+
+  it.effect("keeps complaining about a bad standard value when T3 Code's name answered", () =>
+    Effect.gen(function* () {
+      const resolved = yield* OtelEnvironment.load.pipe(
+        withEnv({ T3CODE_OTEL_SDK_DISABLED: "false", OTEL_SDK_DISABLED: "yes" }),
+      );
+      assert.isFalse(resolved.disabled);
+      assert.include(resolved.warnings.join("\n"), "OTEL_SDK_DISABLED=yes was read as false");
+    }),
+  );
+
   it.effect("T3CODE_OTEL_SDK_DISABLED accepts the wider T3 Code affirmatives", () =>
     Effect.gen(function* () {
       const numeric = yield* OtelEnvironment.load.pipe(withEnv({ T3CODE_OTEL_SDK_DISABLED: "1" }));
@@ -43,6 +65,14 @@ describe("OtelEnvironment", () => {
 
       const off = yield* OtelEnvironment.load.pipe(withEnv({ T3CODE_OTEL_SDK_DISABLED: "off" }));
       assert.isFalse(off.disabled);
+
+      // The same set Config.Boolean accepts, so T3 Code's own variables do not
+      // disagree with each other about what a yes looks like.
+      const shortYes = yield* OtelEnvironment.load.pipe(withEnv({ T3CODE_OTEL_SDK_DISABLED: "y" }));
+      assert.isTrue(shortYes.disabled);
+
+      const shortNo = yield* OtelEnvironment.load.pipe(withEnv({ T3CODE_OTEL_SDK_DISABLED: "n" }));
+      assert.isFalse(shortNo.disabled);
     }),
   );
 

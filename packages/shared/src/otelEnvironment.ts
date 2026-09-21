@@ -52,42 +52,71 @@ const optionalString = (name: string) =>
     Config.map((value) => blankAsUnset(Option.getOrUndefined(value))),
   );
 
-/**
- * The specification defines exactly one true value: the case-insensitive
- * string `true`. Everything else is false, including values that read as
- * affirmative elsewhere, because implementations are told not to extend the
- * list.
- */
-const specBoolean = (name: string) =>
-  optionalString(name).pipe(Effect.map((raw) => raw?.toLowerCase() === "true"));
+interface ReadBoolean<Value> {
+  readonly value: Value;
+  readonly warnings: ReadonlyArray<string>;
+}
 
 /**
- * A `T3CODE_*` name is ours, so it answers to the affirmatives people actually
- * type rather than the single value the specification allows. `undefined` means
- * the name did not answer, either because it is unset or because its value was
- * unreadable, and the source under it decides instead. A typo therefore costs
- * that variable and nothing else, the same as everywhere else here.
+ * The specification defines exactly one true value, the case-insensitive
+ * string `true`, and says an implementation must not extend that list. So a
+ * value that reads as affirmative anywhere else is false here, and the
+ * specification asks for a warning when it happens, because being read as the
+ * opposite of what it looks like is the whole problem with these values.
+ *
+ * Only `false`, empty and unset are quiet: those are the ways of saying no
+ * that the specification recognizes.
  */
+const specBoolean = (name: string) =>
+  optionalString(name).pipe(
+    Effect.map((raw): ReadBoolean<boolean> => {
+      if (raw === undefined) {
+        return { value: false, warnings: [] };
+      }
+      const value = raw.toLowerCase();
+      if (value === "true") {
+        return { value: true, warnings: [] };
+      }
+      if (value === "false") {
+        return { value: false, warnings: [] };
+      }
+      return {
+        value: false,
+        warnings: [
+          `${name}=${raw} was read as false; the OpenTelemetry specification recognizes only the string true, so use ${name}=true or T3CODE_${name} to say it any other way`,
+        ],
+      };
+    }),
+  );
+
+/**
+ * A `T3CODE_*` name is ours, so it answers to everything the rest of T3 Code's
+ * own variables answer to, which is what `Config.Boolean` accepts. `undefined`
+ * means the name did not answer, either because it is unset or because its
+ * value was unreadable, and the source under it decides instead. A typo
+ * therefore costs that variable and nothing else.
+ */
+const T3_AFFIRMATIVE = ["true", "yes", "on", "1", "y"];
+const T3_NEGATIVE = ["false", "no", "off", "0", "n"];
+
 const t3Boolean = (name: string) =>
   optionalString(name).pipe(
-    Effect.map(
-      (raw): { readonly value: boolean | undefined; readonly warnings: ReadonlyArray<string> } => {
-        if (raw === undefined) {
-          return { value: undefined, warnings: [] };
-        }
-        const value = raw.toLowerCase();
-        if (["true", "1", "yes", "on"].includes(value)) {
-          return { value: true, warnings: [] };
-        }
-        if (["false", "0", "no", "off"].includes(value)) {
-          return { value: false, warnings: [] };
-        }
-        return {
-          value: undefined,
-          warnings: [`${name}=${raw} is not a yes or a no and was ignored`],
-        };
-      },
-    ),
+    Effect.map((raw): ReadBoolean<boolean | undefined> => {
+      if (raw === undefined) {
+        return { value: undefined, warnings: [] };
+      }
+      const value = raw.toLowerCase();
+      if (T3_AFFIRMATIVE.includes(value)) {
+        return { value: true, warnings: [] };
+      }
+      if (T3_NEGATIVE.includes(value)) {
+        return { value: false, warnings: [] };
+      }
+      return {
+        value: undefined,
+        warnings: [`${name}=${raw} is not a yes or a no and was ignored`],
+      };
+    }),
   );
 
 /**
@@ -108,14 +137,17 @@ const disabledBy = (name: string) =>
 export const load: Effect.Effect<OtelEnvironment> = Effect.gen(function* () {
   const t3 = yield* t3Boolean("T3CODE_OTEL_SDK_DISABLED");
   const spec = yield* specBoolean("OTEL_SDK_DISABLED");
-  // One setting, read the way every other setting here is read: T3 Code's own
-  // name answers it, and the standard name answers it only when ours is unset.
-  const disabled = t3.value ?? spec;
+  // One setting under two names: T3 Code's own answers it, and the standard
+  // name answers it only when ours is unset.
+  const disabled = t3.value ?? spec.value;
   return {
     disabled,
     warnings: [
       ...new Set([
         ...t3.warnings,
+        // The standard name's own complaint is worth hearing even when T3
+        // Code's name answered instead, because the value is still wrong.
+        ...spec.warnings,
         ...(disabled
           ? [disabledBy(t3.value === true ? "T3CODE_OTEL_SDK_DISABLED" : "OTEL_SDK_DISABLED")]
           : []),

@@ -564,12 +564,17 @@ machine that already exports `OTEL_SDK_DISABLED` for everything else can still o
 with `T3CODE_OTEL_SDK_DISABLED=false` without touching the ambient variable everything else depends
 on.
 
-The two names accept different values. `OTEL_SDK_DISABLED` follows the OpenTelemetry specification,
-which recognizes only the case-insensitive string `true`; anything else, including other words that
-read as affirmative, leaves it enabled. `T3CODE_OTEL_SDK_DISABLED` is T3 Code's own name, so it
-accepts the wider set of values used elsewhere in this codebase: `true`, `1`, `yes`, `on` and their
-negations. A value that matches neither is a warning at startup rather than a refusal to start, and
-the switch falls back to whatever the rest of the precedence order says.
+The two names accept different values. `OTEL_SDK_DISABLED` follows the OpenTelemetry
+specification, which recognizes only the case-insensitive string `true` and forbids implementations
+from accepting anything else; `OTEL_SDK_DISABLED=1` and `OTEL_SDK_DISABLED=yes` therefore leave
+export running. Because that is the opposite of what those values look like, they are reported as a
+warning at startup, and the warning is reported even when `T3CODE_OTEL_SDK_DISABLED` already
+answered, since the value is wrong either way.
+
+`T3CODE_OTEL_SDK_DISABLED` is T3 Code's own name, so it accepts the same values as every other
+`T3CODE_*` boolean: `true`, `yes`, `on`, `1`, `y` and their negations, case-insensitively. A value
+that matches none of them is a warning rather than a refusal to start, and that name is treated as
+unset so `OTEL_SDK_DISABLED` decides instead.
 
 An endpoint stored in Settings never overrides the switch: when it is set, the server and desktop
 app report every OTLP endpoint as unset no matter what was persisted.
