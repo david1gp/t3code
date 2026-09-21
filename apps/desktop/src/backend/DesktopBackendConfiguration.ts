@@ -96,6 +96,13 @@ const DESKTOP_BACKEND_ENV_NAMES = [
 const WSL_FORWARDED_ENV_NAMES = [
   "OPENAI_API_KEY",
   "ANTHROPIC_API_KEY",
+  // The kill switch has to reach the distro under its own name. A WSL backend
+  // reads its endpoints from the bootstrap envelope, so without these two the
+  // switch would silence this process while the server it launched kept
+  // exporting to a persisted endpoint, which is the one outcome nobody would
+  // look for.
+  "T3CODE_OTEL_SDK_DISABLED",
+  "OTEL_SDK_DISABLED",
   "T3CODE_OTLP_HEADERS",
   "T3CODE_OTLP_PROTOCOL",
 ] as const;
