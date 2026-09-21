@@ -20,6 +20,11 @@ import * as BrowserTraceCollector from "../BrowserTraceCollector.ts";
 export const ObservabilityLive = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
+
+    for (const warning of config.otelEnvironment.warnings) {
+      yield* Effect.logWarning(warning);
+    }
+
     const traces = config.otlpTracesExport;
     const metrics = config.otlpMetricsExport;
     // The trace serializer stays in the returned context because the browser

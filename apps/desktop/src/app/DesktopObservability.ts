@@ -4,6 +4,7 @@ import {
   makeTraceSink,
   otlpSerializationLayer,
 } from "@t3tools/shared/observability";
+import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import {
   parsePersistedServerObservabilitySettings,
   type PersistedServerObservabilitySettings,
@@ -353,6 +354,14 @@ const readPersistedObservabilitySettings: Effect.Effect<
  * resolve traces against one revision of the file and logs against another.
  */
 const resolveOtlpEndpoints = Effect.gen(function* () {
+  const otel = yield* OtelEnvironment.load;
+  for (const warning of otel.warnings) {
+    yield* Effect.logWarning(warning);
+  }
+  if (otel.disabled) {
+    return { traces: undefined, metrics: undefined, logs: undefined };
+  }
+
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const persisted = yield* readPersistedObservabilitySettings;
   return {

@@ -555,6 +555,25 @@ OTLP export:
 If the OTLP URLs are unset, local tracing still works, metrics stay in-process only, and logs stay
 on stdout only.
 
+### The Kill Switch
+
+`T3CODE_OTEL_SDK_DISABLED` and `OTEL_SDK_DISABLED` turn every OTLP export off, in both the server
+and the desktop main process, regardless of what any endpoint variable or Settings entry says.
+`T3CODE_OTEL_SDK_DISABLED` is read first; `OTEL_SDK_DISABLED` is read only when it is unset, so a
+machine that already exports `OTEL_SDK_DISABLED` for everything else can still opt T3 Code back in
+with `T3CODE_OTEL_SDK_DISABLED=false` without touching the ambient variable everything else depends
+on.
+
+The two names accept different values. `OTEL_SDK_DISABLED` follows the OpenTelemetry specification,
+which recognizes only the case-insensitive string `true`; anything else, including other words that
+read as affirmative, leaves it enabled. `T3CODE_OTEL_SDK_DISABLED` is T3 Code's own name, so it
+accepts the wider set of values used elsewhere in this codebase: `true`, `1`, `yes`, `on` and their
+negations. A value that matches neither is a warning at startup rather than a refusal to start, and
+the switch falls back to whatever the rest of the precedence order says.
+
+An endpoint stored in Settings never overrides the switch: when it is set, the server and desktop
+app report every OTLP endpoint as unset no matter what was persisted.
+
 ### What Is Instrumented Today
 
 Current high-value span and metric boundaries include:
