@@ -66,13 +66,20 @@ describe("OtelEnvironment", () => {
       const off = yield* OtelEnvironment.load.pipe(withEnv({ T3CODE_OTEL_SDK_DISABLED: "off" }));
       assert.isFalse(off.disabled);
 
-      // The same set Config.Boolean accepts, so T3 Code's own variables do not
-      // disagree with each other about what a yes looks like.
+      // Config.Boolean's own literals, so T3 Code's variables do not disagree
+      // with each other about what a yes looks like.
       const shortYes = yield* OtelEnvironment.load.pipe(withEnv({ T3CODE_OTEL_SDK_DISABLED: "y" }));
       assert.isTrue(shortYes.disabled);
 
       const shortNo = yield* OtelEnvironment.load.pipe(withEnv({ T3CODE_OTEL_SDK_DISABLED: "n" }));
       assert.isFalse(shortNo.disabled);
+
+      // The standard name is case-insensitive by specification, so ours cannot
+      // be the stricter of the two.
+      const shouted = yield* OtelEnvironment.load.pipe(
+        withEnv({ T3CODE_OTEL_SDK_DISABLED: "TRUE" }),
+      );
+      assert.isTrue(shouted.disabled);
     }),
   );
 

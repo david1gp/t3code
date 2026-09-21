@@ -90,11 +90,16 @@ const specBoolean = (name: string) =>
   );
 
 /**
- * A `T3CODE_*` name is ours, so it answers to everything the rest of T3 Code's
- * own variables answer to, which is what `Config.Boolean` accepts. `undefined`
- * means the name did not answer, either because it is unset or because its
- * value was unreadable, and the source under it decides instead. A typo
- * therefore costs that variable and nothing else.
+ * A `T3CODE_*` name is ours, so the specification's one-true-spelling rule does
+ * not bind it and it answers to the same values as every other `T3CODE_*`
+ * boolean. Those are `Config.Boolean`'s literals rather than anything
+ * OpenTelemetry defines, listed here because they are matched
+ * case-insensitively: the standard name beside this one accepts `TRUE`, and
+ * our own name being the stricter of the two would be the surprise.
+ *
+ * `undefined` means the name did not answer, either because it is unset or
+ * because its value was unreadable, and the source under it decides instead. A
+ * typo therefore costs that variable and nothing else.
  */
 const T3_AFFIRMATIVE = ["true", "yes", "on", "1", "y"];
 const T3_NEGATIVE = ["false", "no", "off", "0", "n"];
