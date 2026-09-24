@@ -92,7 +92,7 @@ You do not need any extra env vars. Just run the app normally and inspect `serve
 Examples:
 
 ```bash
-npx t3
+npx @adaptive-ds/t3code
 ```
 
 ```bash
@@ -144,7 +144,7 @@ export T3CODE_TRACE_TIMING_ENABLED=true
 CLI:
 
 ```bash
-npx t3
+npx @adaptive-ds/t3code
 ```
 
 Monorepo web/server dev:

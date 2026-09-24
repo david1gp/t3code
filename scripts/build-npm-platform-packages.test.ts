@@ -1,4 +1,5 @@
 import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { CLI_ARCHIVE_PLATFORM_KEYS } from "@t3tools/shared/cliRelease";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -11,6 +12,9 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import {
   buildNpmPlatformPackages,
   NpmPackagesArchivesMissingError,
+  npmLauncherPackageManifest,
+  npmPlatformPackageManifest,
+  npmPlatformPackageName,
 } from "./build-npm-platform-packages.ts";
 
 const VERSION = "1.2.3";
@@ -87,6 +91,28 @@ const makeFakeArchives = Effect.fn("test.makeFakeArchives")(function* () {
 });
 
 it.layer(NodeServices.layer)("build-npm-platform-packages", (it) => {
+  it("declares five public platform packages at the exact launcher version", () => {
+    const launcher = npmLauncherPackageManifest(VERSION, CLI_ARCHIVE_PLATFORM_KEYS);
+    const platformNames = CLI_ARCHIVE_PLATFORM_KEYS.map(npmPlatformPackageName);
+    assert.equal(launcher.name, "@adaptive-ds/t3code");
+    assert.deepStrictEqual(launcher.publishConfig, { access: "public" });
+    assert.isFalse("private" in launcher);
+    assert.deepStrictEqual(launcher.optionalDependencies, {
+      "@adaptive-ds/t3code-darwin-arm64": VERSION,
+      "@adaptive-ds/t3code-linux-arm64": VERSION,
+      "@adaptive-ds/t3code-linux-x64": VERSION,
+      "@adaptive-ds/t3code-win32-arm64": VERSION,
+      "@adaptive-ds/t3code-win32-x64": VERSION,
+    });
+    for (const key of CLI_ARCHIVE_PLATFORM_KEYS) {
+      const platform = npmPlatformPackageManifest(key, VERSION, {});
+      assert.include(platformNames, platform.name);
+      assert.equal(platform.version, launcher.version);
+      assert.deepStrictEqual(platform.publishConfig, { access: "public" });
+      assert.isFalse("private" in platform);
+    }
+  });
+
   it.effect("refuses a partial release unless --allow-missing is passed", () =>
     Effect.gen(function* () {
       const fixture = yield* makeFakeArchives();
@@ -117,18 +143,34 @@ it.layer(NodeServices.layer)("build-npm-platform-packages", (it) => {
       // Platform packages in CLI_ARCHIVE_PLATFORM_KEYS order, launcher last.
       assert.deepStrictEqual(
         outputs.map((output) => output.name),
-        ["@t3code/t3-darwin-arm64", "@t3code/t3-linux-x64", "t3"],
+        [
+          "@adaptive-ds/t3code-darwin-arm64",
+          "@adaptive-ds/t3code-linux-x64",
+          "@adaptive-ds/t3code",
+        ],
       );
       for (const output of outputs) {
         assert.isTrue(yield* fs.exists(output.tarball), output.tarball);
+        const publishDryRun = yield* run(
+          "npm",
+          ["publish", "--dry-run", "--access", "public", output.tarball],
+          { cwd: fixture.outputDir, env: { PATH: process.env.PATH ?? "" } },
+        );
+        assert.equal(publishDryRun.exitCode, 0, publishDryRun.stderr);
       }
 
-      const linuxDir = path.join(fixture.outputDir, "@t3code/t3-linux-x64");
+      const linuxDir = path.join(fixture.outputDir, "@adaptive-ds/t3code-linux-x64");
       const linuxManifest = yield* decodeManifest(
         yield* fs.readFileString(path.join(linuxDir, "package.json")),
       );
-      assert.equal(linuxManifest.name, "@t3code/t3-linux-x64");
+      assert.equal(linuxManifest.name, "@adaptive-ds/t3code-linux-x64");
       assert.equal(linuxManifest.version, VERSION);
+      assert.deepStrictEqual(linuxManifest.publishConfig, { access: "public" });
+      assert.isUndefined(linuxManifest.private);
+      assert.deepStrictEqual(linuxManifest.repository, {
+        type: "git",
+        url: "https://github.com/david1gp/t3code",
+      });
       assert.deepStrictEqual(linuxManifest.os, ["linux"]);
       assert.deepStrictEqual(linuxManifest.cpu, ["x64"]);
       assert.deepStrictEqual(linuxManifest.files, [
@@ -152,44 +194,54 @@ it.layer(NodeServices.layer)("build-npm-platform-packages", (it) => {
       // A root README, or npm would display a bundled dependency's.
       assert.include(
         yield* fs.readFileString(path.join(linuxDir, "README.md")),
-        "# @t3code/t3-linux-x64",
+        "# @adaptive-ds/t3code-linux-x64",
       );
       assert.isTrue(yield* fs.exists(path.join(linuxDir, "node_modules/node-pty")));
       assert.equal(Number((yield* fs.stat(path.join(linuxDir, "t3"))).mode) & 0o111, 0o111);
 
       const darwinManifest = yield* decodeManifest(
         yield* fs.readFileString(
-          path.join(fixture.outputDir, "@t3code/t3-darwin-arm64/package.json"),
+          path.join(fixture.outputDir, "@adaptive-ds/t3code-darwin-arm64/package.json"),
         ),
       );
       assert.deepStrictEqual(darwinManifest.os, ["darwin"]);
       assert.deepStrictEqual(darwinManifest.cpu, ["arm64"]);
 
-      const launcherDir = path.join(fixture.outputDir, "t3");
+      const launcherDir = path.join(fixture.outputDir, "@adaptive-ds/t3code");
       const launcherManifest = yield* decodeManifest(
         yield* fs.readFileString(path.join(launcherDir, "package.json")),
       );
-      assert.equal(launcherManifest.name, "t3");
+      assert.equal(launcherManifest.name, "@adaptive-ds/t3code");
       assert.equal(launcherManifest.version, VERSION);
+      assert.deepStrictEqual(launcherManifest.publishConfig, { access: "public" });
+      assert.isUndefined(launcherManifest.private);
       assert.deepStrictEqual(launcherManifest.bin, { t3: "./bin/t3.js" });
       assert.deepStrictEqual(launcherManifest.files, ["bin", "dist"]);
       assert.deepStrictEqual(launcherManifest.optionalDependencies, {
-        "@t3code/t3-darwin-arm64": VERSION,
-        "@t3code/t3-linux-x64": VERSION,
+        "@adaptive-ds/t3code-darwin-arm64": VERSION,
+        "@adaptive-ds/t3code-linux-x64": VERSION,
       });
       assert.isUndefined(launcherManifest.engines);
       assert.isTrue(yield* fs.exists(path.join(launcherDir, "bin/t3.js")));
 
       // The scratch dirs must not be left behind next to the packages.
       const outputEntries = yield* fs.readDirectory(fixture.outputDir);
-      assert.deepStrictEqual(outputEntries.sort(), ["@t3code", "t3", "t3.tgz"]);
+      assert.deepStrictEqual(outputEntries.sort(), ["@adaptive-ds", "t3code.tgz"]);
+
+      const partialPublish = yield* run(
+        process.execPath,
+        ["apps/server/scripts/cli.ts", "publish", "--packages-dir", fixture.outputDir, "--dry-run"],
+        { cwd: yield* path.fromFileUrl(new URL("..", import.meta.url)) },
+      );
+      assert.notEqual(partialPublish.exitCode, 0);
+      assert.include(partialPublish.stdout + partialPublish.stderr, "t3code-linux-arm64.tgz");
 
       // The tarball is what gets published: it must carry node_modules (which
       // `npm publish <dir>` would strip) under npm's `package/` root, with the
       // executable bit intact.
       const listing = yield* run(
         "tar",
-        ["-tzvf", path.join(fixture.outputDir, "@t3code/t3-linux-x64.tgz")],
+        ["-tzvf", path.join(fixture.outputDir, "@adaptive-ds/t3code-linux-x64.tgz")],
         { cwd: fixture.outputDir },
       );
       assert.equal(listing.exitCode, 0, listing.stderr);
@@ -201,14 +253,38 @@ it.layer(NodeServices.layer)("build-npm-platform-packages", (it) => {
         listing.stdout,
       );
 
-      // NODE_PATH stands in for node_modules: require.resolve finds the
-      // platform package there exactly as it would after `npm install`.
+      // Unpack the published tarballs under node_modules; do not exercise the
+      // staging directories, which npm never installs.
+      const installedNodeModules = path.join(fixture.root, "installed", "node_modules");
+      const scopedDir = path.join(installedNodeModules, "@adaptive-ds");
+      yield* fs.makeDirectory(scopedDir, { recursive: true });
+      for (const output of outputs.slice(0, -1)) {
+        const unpackPlatform = yield* run("tar", ["-xf", output.tarball, "-C", scopedDir], {
+          cwd: fixture.root,
+        });
+        assert.equal(unpackPlatform.exitCode, 0, unpackPlatform.stderr);
+        yield* fs.rename(
+          path.join(scopedDir, "package"),
+          path.join(installedNodeModules, output.name),
+        );
+      }
       const hostPlatform = yield* HostProcessPlatform;
       const hostArch = yield* HostProcessArchitecture;
-      const env = { ...process.env, NODE_PATH: fixture.outputDir } as Record<string, string>;
+      const env = { ...process.env, NODE_PATH: installedNodeModules } as Record<string, string>;
       if (KEYS.some((key) => key === `${hostPlatform}-${hostArch}`)) {
+        // Exercise both entry points from the exact tarball that gets published.
+        const installedLauncher = path.join(fixture.root, "installed-launcher");
+        yield* fs.makeDirectory(installedLauncher);
+        const unpack = yield* run(
+          "tar",
+          ["-xf", path.join(fixture.outputDir, "t3code.tgz"), "-C", installedLauncher],
+          {
+            cwd: fixture.root,
+          },
+        );
+        assert.equal(unpack.exitCode, 0, unpack.stderr);
         const passthrough = yield* run(process.execPath, ["bin/t3.js", "serve", "--port", "1234"], {
-          cwd: launcherDir,
+          cwd: path.join(installedLauncher, "package"),
           env,
         });
         assert.equal(
@@ -217,18 +293,7 @@ it.layer(NodeServices.layer)("build-npm-platform-packages", (it) => {
         );
         assert.equal(passthrough.exitCode, 7);
 
-        // Run the entry point used by already-installed service updaters from
-        // the published tarball, including their preflight arguments.
-        const installedLauncher = path.join(fixture.root, "installed-launcher");
-        yield* fs.makeDirectory(installedLauncher);
-        const unpack = yield* run(
-          "tar",
-          ["-xf", path.join(fixture.outputDir, "t3.tgz"), "-C", installedLauncher],
-          {
-            cwd: fixture.root,
-          },
-        );
-        assert.equal(unpack.exitCode, 0, unpack.stderr);
+        // Already-installed service updaters use the legacy entry point.
         const legacy = yield* run(
           process.execPath,
           [
@@ -255,7 +320,7 @@ it.layer(NodeServices.layer)("build-npm-platform-packages", (it) => {
       assert.equal(unsupported.exitCode, 1);
       assert.include(unsupported.stderr, "linux-x64");
       assert.include(unsupported.stderr, "win32-arm64");
-      assert.include(unsupported.stderr, "https://github.com/pingdotgg/t3code/releases");
+      assert.include(unsupported.stderr, "https://github.com/david1gp/t3code/releases");
     }),
   );
 });

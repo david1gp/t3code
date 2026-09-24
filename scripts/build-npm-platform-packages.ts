@@ -1,18 +1,18 @@
 #!/usr/bin/env node
 /**
  * Turns the per-platform CLI archives of one release into the npm packages
- * behind `npx t3` / `npm i -g t3`: one `@t3code/t3-<platformKey>` package per
- * archive holding the archive's contents verbatim, plus the `t3` launcher
+ * behind `npx @adaptive-ds/t3code`: one `@adaptive-ds/t3code-<platformKey>` package per
+ * archive holding the archive's contents verbatim, plus the `@adaptive-ds/t3code` launcher
  * that lists them as optionalDependencies and execs the one npm installed.
  * The bytes a user gets from npm are therefore the release archive's, and
  * running them needs neither a Node runtime, npm, nor a native build.
  *
  * Output layout under `--output-dir`:
  *
- *   @t3code/t3-<platformKey>/      archive contents flattened + package.json
- *   @t3code/t3-<platformKey>.tgz   the same tree as an npm tarball
- *   t3/                             launcher: package.json, bin/t3.js, README.md
- *   t3.tgz                          the launcher as an npm tarball
+ *   @adaptive-ds/t3code-<platformKey>/      archive contents flattened + package.json
+ *   @adaptive-ds/t3code-<platformKey>.tgz   the same tree as an npm tarball
+ *   @adaptive-ds/t3code/                     launcher: package.json, bin/t3.js, README.md
+ *   t3code.tgz                               the launcher as an npm tarball
  *
  * The tarballs are what gets published. `npm publish <dir>` always drops
  * `node_modules/` (npm-packlist ignores it whatever `files` says, and
@@ -43,8 +43,10 @@ import serverPackageJson from "../apps/server/package.json" with { type: "json" 
 
 import { windowsSystemTar } from "./build-cli-archive.ts";
 
-export const NPM_PLATFORM_PACKAGE_SCOPE = "@t3code";
-export const NPM_LAUNCHER_PACKAGE_NAME = "t3";
+export const NPM_PLATFORM_PACKAGE_SCOPE = "@adaptive-ds";
+export const NPM_LAUNCHER_PACKAGE_NAME = "@adaptive-ds/t3code";
+const NPM_LAUNCHER_TARBALL_NAME = "t3code.tgz";
+const NPM_REPOSITORY = { type: "git", url: "https://github.com/david1gp/t3code" };
 
 const encodePackageJson = Schema.encodeEffect(fromJsonStringPretty(Schema.Unknown));
 
@@ -85,7 +87,7 @@ export class NpmPackagesArchiveLayoutError extends Schema.TaggedError<NpmPackage
 }
 
 export function npmPlatformPackageName(platformKey: CliArchivePlatformKey): string {
-  return `${NPM_PLATFORM_PACKAGE_SCOPE}/t3-${platformKey}`;
+  return `${NPM_PLATFORM_PACKAGE_SCOPE}/t3code-${platformKey}`;
 }
 
 /**
@@ -107,9 +109,10 @@ export function npmPlatformPackageManifest(
   return {
     name: npmPlatformPackageName(platformKey),
     version,
+    publishConfig: { access: "public" },
     description: `T3 Code CLI executable for ${platformKey}`,
     license: serverPackageJson.license,
-    repository: serverPackageJson.repository,
+    repository: NPM_REPOSITORY,
     os: [os],
     cpu: [cpu],
     files: ["t3", "t3.exe", "client", "resource-monitor", "node_modules"],
@@ -163,7 +166,7 @@ export function npmPlatformPackageReadme(platformKey: CliArchivePlatformKey): st
     `npx ${NPM_LAUNCHER_PACKAGE_NAME}@latest`,
     "```",
     "",
-    "Source and documentation: https://github.com/pingdotgg/t3code",
+    "Source and documentation: https://github.com/david1gp/t3code",
     "",
   ].join("\n");
 }
@@ -176,9 +179,10 @@ export function npmLauncherPackageManifest(
   return {
     name: NPM_LAUNCHER_PACKAGE_NAME,
     version,
+    publishConfig: { access: "public" },
     description: "T3 Code CLI. Installs the self-contained executable for this platform.",
     license: serverPackageJson.license,
-    repository: serverPackageJson.repository,
+    repository: NPM_REPOSITORY,
     bin: { t3: "./bin/t3.js" },
     files: ["bin", "dist"],
     optionalDependencies: Object.fromEntries(
@@ -188,7 +192,7 @@ export function npmLauncherPackageManifest(
 }
 
 /**
- * The launcher every `npx t3` runs. Plain CommonJS with no dependencies so it
+ * The launcher every `npx @adaptive-ds/t3code` runs. Plain CommonJS with no dependencies so it
  * loads on any Node that npm itself runs on; the real work happens in the
  * single-executable it execs.
  */
@@ -203,14 +207,14 @@ const key = process.platform + "-" + process.arch;
 
 let packageDir;
 try {
-  packageDir = dirname(require.resolve("${NPM_PLATFORM_PACKAGE_SCOPE}/t3-" + key + "/package.json"));
+  packageDir = dirname(require.resolve("${NPM_PLATFORM_PACKAGE_SCOPE}/t3code-" + key + "/package.json"));
 } catch {
   process.stderr.write(
     [
       "t3: no T3 Code CLI build is available for this platform (" + key + ").",
       "Supported platforms: " + SUPPORTED.join(", ") + ".",
-      "If yours is listed, reinstall t3 so npm fetches its optional dependency.",
-      "The desktop app and release archives are at https://github.com/pingdotgg/t3code/releases",
+      "If yours is listed, reinstall @adaptive-ds/t3code so npm fetches its optional dependency.",
+      "The desktop app and release archives are at https://github.com/david1gp/t3code/releases",
       "",
     ].join("\\n"),
   );
@@ -396,8 +400,8 @@ const stageLauncherPackage = Effect.fn("stageLauncherPackage")(function* (input:
   }
   const output: NpmPackageOutput = {
     name: NPM_LAUNCHER_PACKAGE_NAME,
-    packageDir: path.join(input.outputDir, NPM_LAUNCHER_PACKAGE_NAME),
-    tarball: path.join(input.outputDir, `${NPM_LAUNCHER_PACKAGE_NAME}.tgz`),
+    packageDir: path.join(input.outputDir, NPM_PLATFORM_PACKAGE_SCOPE, "t3code"),
+    tarball: path.join(input.outputDir, NPM_LAUNCHER_TARBALL_NAME),
   };
   yield* packAndPlace({ stageDir: scratch, ...output });
   return output;
@@ -479,7 +483,7 @@ const command = Command.make(
   buildNpmPlatformPackages,
 ).pipe(
   Command.withDescription(
-    "Build the t3 launcher and @t3code/t3-<platform> npm packages from CLI release archives.",
+    "Build @adaptive-ds/t3code and @adaptive-ds/t3code-<platform> npm packages from CLI release archives.",
   ),
 );
 

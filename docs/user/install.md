@@ -35,7 +35,7 @@ line to add. Set `T3CODE_CHANNEL=nightly` to install the nightly train, or
 
 Run `t3 --help` for the full reference.
 
-To try T3 Code once without installing it, run `npx t3@latest` instead (needs
+To try T3 Code once without installing it, run `npx @adaptive-ds/t3code@latest` instead (needs
 Node.js for `npx`).
 
 ### Intel Macs
@@ -55,7 +55,7 @@ update it with `git pull` and a rebuild.
 
 ## Desktop app
 
-Download a release from [GitHub Releases](https://github.com/pingdotgg/t3code/releases),
+Download a release from [GitHub Releases](https://github.com/david1gp/t3code/releases),
 or use a package manager:
 
 | Platform           | Install                         |
