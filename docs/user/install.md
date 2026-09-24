@@ -41,14 +41,15 @@ Node.js for `npx`).
 ### Intel Macs
 
 There is no `t3` executable for Intel Macs (the desktop app is available). To
-run a server there, build it from source with Node.js 24 and `vp`
-([Install vp](https://github.com/pingdotgg/t3code#install-vp)):
+run a server there, build it from source with Node.js 24 and Bun:
 
 ```bash
 git clone https://github.com/pingdotgg/t3code
-cd t3code && vp i && vp run build:desktop
-node apps/server/dist/bin.mjs
+cd t3code && bun install && bun run build:server-web
+node apps/server/dist/bin.mjs serve
 ```
+
+Run the server from the checkout so Node can resolve its native runtime dependencies.
 
 `t3 update` and the background service do not apply to a server run this way;
 update it with `git pull` and a rebuild.
