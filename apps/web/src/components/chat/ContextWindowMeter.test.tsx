@@ -45,7 +45,7 @@ describe("ContextWindowMeter", () => {
     expect(markup).not.toContain("Compact context");
   });
 
-  it("explains why the compact action is disabled", () => {
+  it("shows the unavailable explanation instead of the compact action", () => {
     const markup = renderToStaticMarkup(
       <ContextWindowMeter
         usage={usage}
@@ -55,8 +55,8 @@ describe("ContextWindowMeter", () => {
       />,
     );
 
-    expect(markup).toContain('disabled=""');
     expect(markup).toContain(">Send or clear your draft before compacting<");
+    expect(markup).not.toContain("Compact context");
     expect(markup).not.toContain('aria-label="Send or clear your draft before compacting"');
   });
 });
