@@ -1,7 +1,10 @@
 {
-  "name": "@t3tools/monorepo",
-  "private": true,
+  "name": "@adaptive-ds/t3code",
+  "private": false,
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "prepare": "effect-tsgo patch && vp config --no-agent",
     "dev": "node scripts/dev-runner.ts dev",

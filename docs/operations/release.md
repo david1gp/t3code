@@ -326,10 +326,14 @@ blockmaps, with a 60 MB maximum for a representative sidecar-to-sidecar update.
 
 ## 0) npm OIDC trusted publishing setup (CLI)
 
-The root `package.json` is the private `@t3tools/monorepo` workspace; do not remove `private` or publish
-the repository root. The workflow runs `node scripts/build-npm-platform-packages.ts` on downloaded CLI
-archives, generating the publishable launcher at `npm-packages/@adaptive-ds/t3code` and tarballs under
-`npm-packages`. Then `node apps/server/scripts/cli.ts publish --packages-dir npm-packages` runs
+The root `package.json` uses the public identity `@adaptive-ds/t3code` for npm OIDC setup, but the
+repository root is a workspace, not the publishable CLI artifact. Do not publish the repository root:
+it would package the monorepo, not the launcher. `npm_oidc_setup.sh` attempts a first publish when
+the named package is absent from npm, so do not run its first-publish path from the repository root.
+The supported release workflow runs
+`node scripts/build-npm-platform-packages.ts` on downloaded CLI archives, generating the publishable
+launcher at `npm-packages/@adaptive-ds/t3code` and tarballs under `npm-packages`. Then
+`node apps/server/scripts/cli.ts publish --packages-dir npm-packages` runs
 `npm publish` on each `@adaptive-ds/t3code-<platform>-<arch>.tgz` and finally on `t3code.tgz`, the
 `@adaptive-ds/t3code` launcher. The script publishes
 tarballs it built itself rather than directories: `npm publish <dir>` strips `node_modules/` from the
@@ -337,7 +341,7 @@ tarball no matter what `files` says, and the executable loads its native addons 
 packages are published per release: `@adaptive-ds/t3code`, `@adaptive-ds/t3code-darwin-arm64`,
 `@adaptive-ds/t3code-linux-arm64`, `@adaptive-ds/t3code-linux-x64`,
 `@adaptive-ds/t3code-win32-arm64`, and `@adaptive-ds/t3code-win32-x64`. Every generated manifest has
-`publishConfig.access: "public"`; this applies to the artifacts, not the private monorepo root.
+`publishConfig.access: "public"`; these artifacts, not the repository root, are the supported packages.
 
 Checklist:
 
