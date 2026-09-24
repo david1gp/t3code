@@ -16,7 +16,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
-import { beforeEach, vi } from "vite-plus/test";
+import { beforeEach, describe, vi } from "vite-plus/test";
 import type {
   Event as OpenCodeEvent,
   PermissionRequest,
@@ -47,6 +47,7 @@ import {
   isSameOpenCodeDirectory,
   makeOpenCodeAdapter,
   mergeOpenCodeAssistantText,
+  openCodeContextUsageNormalize,
 } from "./OpenCodeAdapter.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 
@@ -56,6 +57,74 @@ class OpenCodeAdapter extends Context.Service<OpenCodeAdapter, OpenCodeAdapterSh
 ) {}
 
 const asThreadId = (value: string): ThreadId => ThreadId.make(value);
+
+describe("OpenCode context usage", () => {
+  it("uses the latest native response total and reports normalized token breakdown", () => {
+    NodeAssert.deepEqual(
+      openCodeContextUsageNormalize(
+        {
+          time: { completed: 1 },
+          tokens: {
+            input: 120,
+            output: 18,
+            reasoning: 7,
+            total: 180,
+            cache: { read: 30, write: 12 },
+          },
+        },
+        200_000,
+      ),
+      {
+        usedTokens: 180,
+        lastUsedTokens: 180,
+        maxTokens: 200_000,
+        inputTokens: 120,
+        cachedInputTokens: 30,
+        outputTokens: 18,
+        reasoningOutputTokens: 7,
+        lastInputTokens: 120,
+        lastCachedInputTokens: 30,
+        lastOutputTokens: 18,
+        lastReasoningOutputTokens: 7,
+      },
+    );
+  });
+
+  it("falls back to OpenCode's input/output/cache sum and accepts compaction drops", () => {
+    const beforeCompaction = openCodeContextUsageNormalize(
+      { time: { completed: 1 }, tokens: { input: 100, output: 10, cache: { read: 20, write: 5 } } },
+      undefined,
+    );
+    const afterCompaction = openCodeContextUsageNormalize(
+      { time: { completed: 2 }, tokens: { input: 12, output: 2, cache: { read: 3, write: 0 } } },
+      undefined,
+    );
+    NodeAssert.equal(beforeCompaction?.usedTokens, 135);
+    NodeAssert.equal(afterCompaction?.usedTokens, 17);
+    NodeAssert.equal(afterCompaction?.maxTokens, undefined);
+    NodeAssert.equal(
+      openCodeContextUsageNormalize({ tokens: { input: 0, output: 0 } }, 200_000),
+      undefined,
+    );
+    NodeAssert.equal(
+      openCodeContextUsageNormalize({ time: { created: 1 }, tokens: { input: 200 } }, 200_000),
+      undefined,
+    );
+  });
+
+  it("does not add reasoning to OpenCode's net output when total is absent", () => {
+    NodeAssert.equal(
+      openCodeContextUsageNormalize(
+        {
+          time: { completed: 1 },
+          tokens: { input: 10, output: 4, reasoning: 3, cache: { read: 2, write: 1 } },
+        },
+        undefined,
+      )?.usedTokens,
+      17,
+    );
+  });
+});
 
 type MessageEntry = {
   info: {
@@ -135,6 +204,8 @@ const runtimeMock = {
     questionListImplementation: null as (() => Promise<Array<QuestionRequest>>) | null,
     sessionUpdateCalls: [] as Array<{ sessionID: string; permission: unknown }>,
     forkCalls: [] as Array<{ sessionID: string; directory?: string; messageID?: string }>,
+    providerListCalls: 0,
+    modelLimits: new Map<string, number>(),
   },
   reset() {
     this.state.startCalls.length = 0;
@@ -194,6 +265,8 @@ const runtimeMock = {
     this.state.questionListImplementation = null;
     this.state.sessionUpdateCalls.length = 0;
     this.state.forkCalls.length = 0;
+    this.state.providerListCalls = 0;
+    this.state.modelLimits.clear();
   },
 };
 
@@ -443,6 +516,18 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
           }
         },
       },
+      provider: {
+        list: async () => {
+          runtimeMock.state.providerListCalls += 1;
+          const models = Object.fromEntries(
+            [...runtimeMock.state.modelLimits].map(([modelID, context]) => [
+              modelID,
+              { id: modelID, limit: { context, output: 1_000 } },
+            ]),
+          );
+          return { data: { all: [{ id: "test-provider", models }], connected: [], default: {} } };
+        },
+      },
       event: {
         subscribe: async (
           _input: unknown,
@@ -667,6 +752,172 @@ const questionRequest = (id: string, sessionID: string): QuestionRequest => ({
 });
 
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
+  it.effect(
+    "emits owned latest context snapshots with current capacity and preserves deduplicated turn totals",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-opencode-context-events");
+        const sessionID = "http://127.0.0.1:9999/session";
+        const enqueue = makeOpenCodeEventQueue();
+        runtimeMock.state.modelLimits.set("model-a", 1_000);
+        const firstCompletion = yield* Deferred.make<void>();
+        const eventsFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId),
+          Stream.tap((event) =>
+            event.type === "turn.completed" && event.turnId === firstTurnId
+              ? Deferred.succeed(firstCompletion, undefined)
+              : Effect.void,
+          ),
+          Stream.takeUntil(
+            (event) => event.type === "turn.completed" && event.turnId !== firstTurnId,
+          ),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+
+        const firstTurn = yield* adapter.sendTurn({
+          threadId,
+          input: "first",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "test-provider/model-a",
+          ),
+        });
+        const firstTurnId = firstTurn.turnId;
+        const firstPromptId = (runtimeMock.state.promptCalls.at(-1) as { messageID: string })
+          .messageID;
+        const completedInfo = {
+          id: "assistant-owned",
+          role: "assistant",
+          parentID: firstPromptId,
+          time: { created: 1, completed: 2 },
+          tokens: {
+            total: 180,
+            input: 120,
+            output: 18,
+            reasoning: 7,
+            cache: { read: 30, write: 12 },
+          },
+        };
+        enqueue({
+          type: "message.updated",
+          properties: {
+            sessionID,
+            info: { ...completedInfo, id: "assistant-unrelated", parentID: "another-prompt" },
+          },
+        });
+        enqueue({
+          type: "message.updated",
+          properties: {
+            sessionID,
+            info: { ...completedInfo, id: "assistant-no-parent", parentID: undefined },
+          },
+        });
+        enqueue({
+          type: "message.updated",
+          properties: { sessionID, info: { ...completedInfo, time: { created: 1 } } },
+        });
+        enqueue({ type: "message.updated", properties: { sessionID, info: completedInfo } });
+        enqueue({ type: "message.updated", properties: { sessionID, info: completedInfo } });
+        enqueue({ type: "session.compacted", properties: { sessionID } });
+        enqueue({
+          type: "message.updated",
+          properties: {
+            sessionID,
+            info: {
+              ...completedInfo,
+              time: { created: 1, completed: 3 },
+              tokens: {
+                total: 25,
+                input: 12,
+                output: 2,
+                reasoning: 1,
+                cache: { read: 8, write: 3 },
+              },
+            },
+          },
+        });
+        const step = {
+          id: "step-one",
+          messageID: "assistant-owned",
+          sessionID,
+          type: "step-finish",
+          reason: "stop",
+          cost: 0,
+          tokens: { input: 40, output: 10, reasoning: 2, cache: { read: 5, write: 1 } },
+        };
+        enqueue({ type: "message.part.updated", properties: { sessionID, part: step } });
+        enqueue({ type: "message.part.updated", properties: { sessionID, part: step } });
+        enqueue({ type: "session.status", properties: { sessionID, status: { type: "idle" } } });
+        yield* Deferred.await(firstCompletion);
+
+        const secondTurn = yield* adapter.sendTurn({
+          threadId,
+          input: "second",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "test-provider/model-b",
+          ),
+        });
+        const secondPromptId = (runtimeMock.state.promptCalls.at(-1) as { messageID: string })
+          .messageID;
+        enqueue({
+          type: "message.updated",
+          properties: {
+            sessionID,
+            info: {
+              id: "assistant-second",
+              role: "assistant",
+              parentID: secondPromptId,
+              time: { created: 4, completed: 5 },
+              tokens: { input: 8, output: 2, reasoning: 1, cache: { read: 4, write: 3 } },
+            },
+          },
+        });
+        enqueue({ type: "session.status", properties: { sessionID, status: { type: "idle" } } });
+        const events = yield* Fiber.join(eventsFiber);
+        const snapshots = events.filter((event) => event.type === "thread.token-usage.updated");
+        NodeAssert.equal(snapshots.length, 3);
+        if (snapshots[0]?.type === "thread.token-usage.updated") {
+          NodeAssert.equal(snapshots[0].payload.usage.usedTokens, 180);
+          NodeAssert.equal(snapshots[0].payload.usage.maxTokens, 1_000);
+        }
+        if (snapshots[1]?.type === "thread.token-usage.updated") {
+          NodeAssert.equal(snapshots[1].payload.usage.usedTokens, 25);
+          NodeAssert.equal(snapshots[1].payload.usage.maxTokens, 1_000);
+        }
+        if (snapshots[2]?.type === "thread.token-usage.updated") {
+          NodeAssert.equal(snapshots[2].payload.usage.usedTokens, 17);
+          NodeAssert.equal(snapshots[2].payload.usage.maxTokens, undefined);
+        }
+        const completions = events.filter((event) => event.type === "turn.completed");
+        NodeAssert.equal(completions.length, 2);
+        const firstCompleted = completions.find((event) => event.turnId === firstTurnId);
+        NodeAssert.equal(firstCompleted?.type, "turn.completed");
+        if (firstCompleted?.type === "turn.completed") {
+          NodeAssert.deepEqual(firstCompleted.payload.tokenUsage, {
+            usageStatus: "complete",
+            usageScope: "main_agent",
+            inputTokens: 46,
+            cachedInputTokens: 5,
+            cacheCreationTokens: 1,
+            outputTokens: 12,
+            reasoningTokens: 2,
+            hasSubagents: false,
+          });
+        }
+        NodeAssert.equal(runtimeMock.state.providerListCalls, 2);
+        NodeAssert.equal(secondTurn.turnId, completions[1]?.turnId);
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
   it.effect("reuses a configured OpenCode server URL instead of spawning a local server", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

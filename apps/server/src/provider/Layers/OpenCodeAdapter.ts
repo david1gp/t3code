@@ -4,6 +4,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderRuntimeEvent,
+  type ThreadTokenUsageSnapshot,
   type ProviderSendTurnInput,
   type ProviderSession,
   RuntimeItemId,
@@ -342,6 +343,8 @@ interface OpenCodeSessionContext {
   readonly server: OpenCodeServerConnection;
   readonly directory: string;
   openCodeSessionId: string;
+  modelContextWindow: number | undefined;
+  modelLimitModel: string | undefined;
   readonly relatedSessionIds: Set<string>;
   readonly resolvedRequestIds: Set<string>;
   readonly autoRepliedRequestIds: Set<string>;
@@ -350,6 +353,7 @@ interface OpenCodeSessionContext {
   readonly pendingPermissions: Map<string, PermissionRequest>;
   readonly pendingQuestions: Map<string, QuestionRequest>;
   readonly messageRoleById: Map<string, "user" | "assistant">;
+  readonly contextUsageByMessageId: Map<string, ThreadTokenUsageSnapshot>;
   // OpenCode permits edits to completed parts. Keep text for snapshot comparison
   // until native removal or session teardown, but do not retain other part payloads.
   readonly textPartsByMessageId: Map<string, Map<string, OpenCodeTextPartState>>;
@@ -455,6 +459,76 @@ function takeOpenCodeTurnTokenUsage(
     reasoningTokens: Math.min(usage.outputTokens, usage.reasoningTokens),
     hasSubagents: usage.hasSubagents,
   };
+}
+
+export function openCodeContextUsageNormalize(
+  info: unknown,
+  maxTokens: number | undefined,
+): ThreadTokenUsageSnapshot | undefined {
+  if (typeof info !== "object" || info === null || !Object.hasOwn(info, "tokens")) {
+    return undefined;
+  }
+  const message = info as { readonly tokens?: unknown; readonly time?: unknown };
+  if (
+    typeof message.time !== "object" ||
+    message.time === null ||
+    typeof (message.time as { readonly completed?: unknown }).completed !== "number"
+  )
+    return undefined;
+  const tokens = message.tokens;
+  if (typeof tokens !== "object" || tokens === null) return undefined;
+  const value = tokens as {
+    readonly input?: unknown;
+    readonly output?: unknown;
+    readonly reasoning?: unknown;
+    readonly total?: unknown;
+    readonly cache?: { readonly read?: unknown; readonly write?: unknown };
+  };
+  const finiteCount = (count: unknown) =>
+    typeof count === "number" && Number.isSafeInteger(count) && count >= 0 ? count : undefined;
+  const inputTokens = finiteCount(value.input);
+  const outputTokens = finiteCount(value.output);
+  const reasoningOutputTokens = finiteCount(value.reasoning);
+  const cachedInputTokens = finiteCount(value.cache?.read);
+  const cacheCreationTokens = finiteCount(value.cache?.write);
+  const total = finiteCount(value.total);
+  // Match OpenCode's overflow check: total first, else adjusted input + output + cache.
+  // Message usage normalizes output without reasoning and input without cache, so do not add reasoning again.
+  const usedTokens =
+    total && total > 0
+      ? total
+      : (inputTokens ?? 0) +
+        (outputTokens ?? 0) +
+        (cachedInputTokens ?? 0) +
+        (cacheCreationTokens ?? 0);
+  if (usedTokens <= 0) return undefined;
+  return {
+    usedTokens,
+    lastUsedTokens: usedTokens,
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
+    ...(cachedInputTokens !== undefined ? { lastCachedInputTokens: cachedInputTokens } : {}),
+    ...(inputTokens !== undefined ? { lastInputTokens: inputTokens } : {}),
+    ...(outputTokens !== undefined ? { lastOutputTokens: outputTokens } : {}),
+    ...(reasoningOutputTokens !== undefined
+      ? { lastReasoningOutputTokens: reasoningOutputTokens }
+      : {}),
+  };
+}
+
+function sameOpenCodeContextUsage(
+  left: ThreadTokenUsageSnapshot | undefined,
+  right: ThreadTokenUsageSnapshot,
+): boolean {
+  if (!left) return false;
+  const leftEntries = Object.entries(left);
+  return (
+    leftEntries.length === Object.keys(right).length &&
+    leftEntries.every(([key, value]) => right[key as keyof ThreadTokenUsageSnapshot] === value)
+  );
 }
 
 export interface OpenCodeAdapterLiveOptions {
@@ -2371,6 +2445,27 @@ export function makeOpenCodeAdapter(
               priorOwnership === undefined || priorOwnership === "unknown"
                 ? observedOwnership
                 : priorOwnership;
+            if (ownership === "owned" && turnId && context.activeTurnId === turnId) {
+              const contextUsage = openCodeContextUsageNormalize(
+                event.properties.info,
+                context.modelContextWindow,
+              );
+              const previousContextUsage = context.contextUsageByMessageId.get(
+                event.properties.info.id,
+              );
+              if (contextUsage && !sameOpenCodeContextUsage(previousContextUsage, contextUsage)) {
+                context.contextUsageByMessageId.set(event.properties.info.id, contextUsage);
+                yield* emit({
+                  ...(yield* buildEventBase({
+                    threadId: context.session.threadId,
+                    turnId,
+                    raw: event,
+                  })),
+                  type: "thread.token-usage.updated",
+                  payload: { usage: contextUsage },
+                });
+              }
+            }
             if (usage) {
               usage.assistantOwnershipByMessageId.set(event.properties.info.id, ownership);
               if (ownership !== "unknown") {
@@ -2394,6 +2489,7 @@ export function makeOpenCodeAdapter(
 
         case "message.removed": {
           context.messageRoleById.delete(event.properties.messageID);
+          context.contextUsageByMessageId.delete(event.properties.messageID);
           context.textPartsByMessageId.delete(event.properties.messageID);
           break;
         }
@@ -3008,6 +3104,8 @@ export function makeOpenCodeAdapter(
           server: started.server,
           directory,
           openCodeSessionId: started.openCodeSession.id,
+          modelContextWindow: undefined,
+          modelLimitModel: undefined,
           relatedSessionIds: new Set([started.openCodeSession.id]),
           resolvedRequestIds: new Set(),
           autoRepliedRequestIds: new Set(),
@@ -3017,6 +3115,7 @@ export function makeOpenCodeAdapter(
           pendingQuestions: new Map(),
           textPartsByMessageId: new Map(),
           messageRoleById: new Map(),
+          contextUsageByMessageId: new Map(),
           turnTokenUsage: undefined,
           activeTurnId: undefined,
           activeAgent: undefined,
@@ -3206,6 +3305,27 @@ export function makeOpenCodeAdapter(
           context.turnTokenUsage?.promptMessageIds.add(messageId);
           context.activeAgent = agent ?? (input.interactionMode === "plan" ? "plan" : undefined);
           context.activeVariant = variant;
+          const selectedModel = modelSelection?.model;
+          if (selectedModel !== context.modelLimitModel) {
+            context.modelLimitModel = selectedModel;
+            context.modelContextWindow = undefined;
+            if (selectedModel) {
+              const modelLookup = yield* Effect.exit(
+                runOpenCodeSdk("provider.list", (signal) =>
+                  context.client.provider.list(undefined, { signal }),
+                ),
+              );
+              if (Exit.isSuccess(modelLookup)) {
+                const provider = modelLookup.value.data?.all.find(
+                  (candidate) => candidate.id === parsedModel.providerID,
+                );
+                const limit = provider?.models[parsedModel.modelID]?.limit.context;
+                if (typeof limit === "number" && Number.isFinite(limit) && limit > 0) {
+                  context.modelContextWindow = Math.floor(limit);
+                }
+              }
+            }
+          }
           if (steeringTurnId === undefined) {
             context.awaitingBusyAfterInterruption = context.interruptedTurnId !== undefined;
           }
