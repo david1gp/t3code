@@ -171,6 +171,7 @@ import {
 import { searchableSetting } from "./settingsSearch";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { PanelAnimationsPreview } from "./PanelAnimationsPreview";
+import { useUiStateStore } from "~/uiStateStore";
 
 const ENVIRONMENT_IDENTIFICATION_LABELS: Record<EnvironmentIdentificationMode, string> = {
   artwork: "Artwork",
@@ -1153,6 +1154,8 @@ export function AppearanceSettingsPanel() {
   const [isImportThemeOpen, setIsImportThemeOpen] = useState(false);
   const settings = useScopedSettings();
   const updateSettings = useUpdateScopedSettings();
+  const showThreadHeaderActions = useUiStateStore((state) => state.showThreadHeaderActions);
+  const setShowThreadHeaderActions = useUiStateStore((state) => state.setShowThreadHeaderActions);
   const environmentStageLabel = useEnvironmentStageLabel();
   const showEnvironmentIdentification =
     resolveEnvironmentIdentificationPillLabel(environmentStageLabel) !== null;
@@ -1198,6 +1201,17 @@ export function AppearanceSettingsPanel() {
       </SettingsSection>
 
       <SettingsSection id="appearance-interface" title="Interface">
+        <SettingsRow
+          {...searchableSetting("setting-thread-header-actions")}
+          description="Show Add action, Open, Commit, and other actions in the thread header."
+          control={
+            <Switch
+              aria-label="Show thread header actions"
+              checked={showThreadHeaderActions}
+              onCheckedChange={(checked) => setShowThreadHeaderActions(Boolean(checked))}
+            />
+          }
+        />
         <SettingsRow
           {...searchableSetting("setting-appearance-contrast")}
           description="Adjust the contrast of colors and borders across the interface."

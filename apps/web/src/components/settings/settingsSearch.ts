@@ -204,6 +204,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["transparent transparency solid menus dialogs composer"],
   },
   {
+    id: "setting-thread-header-actions",
+    title: "Thread header actions",
+    to: "/settings/appearance",
+    searchTerms: ["hide add action open commit options navbar"],
+  },
+  {
     id: "diff-color-scheme",
     title: "Diff colors",
     to: "/settings/appearance",

@@ -13,6 +13,7 @@ import {
   resolveProjectExpanded,
   setDefaultAdvertisedEndpointKey,
   setProjectExpanded,
+  setShowThreadHeaderActions,
   setSidebarProjectScopeKey,
   setThreadChangedFilesExpanded,
   type UiState,
@@ -27,6 +28,7 @@ function makeUiState(overrides: Partial<UiState> = {}): UiState {
     threadChangedFilesExpandedById: {},
     defaultAdvertisedEndpointKey: null,
     pullRequestMergeMethod: "merge",
+    showThreadHeaderActions: true,
     ...overrides,
   };
 }
@@ -156,6 +158,15 @@ describe("uiStateStore pure functions", () => {
     expect(setSidebarProjectScopeKey(scoped, null).sidebarProjectScopeKey).toBeNull();
     expect(setSidebarProjectScopeKey(scoped, "").sidebarProjectScopeKey).toBeNull();
   });
+
+  it("updates whether thread header actions are shown", () => {
+    const initialState = makeUiState();
+    const hidden = setShowThreadHeaderActions(initialState, false);
+
+    expect(hidden.showThreadHeaderActions).toBe(false);
+    expect(setShowThreadHeaderActions(hidden, false)).toBe(hidden);
+    expect(setShowThreadHeaderActions(hidden, true).showThreadHeaderActions).toBe(true);
+  });
 });
 
 describe("parsePersistedState", () => {
@@ -169,6 +180,17 @@ describe("parsePersistedState", () => {
 
     expect(parsed.pullRequestMergeMethod).toBe("squash");
     expect(invalid.pullRequestMergeMethod).toBe("merge");
+  });
+
+  it("hydrates the thread header action preference with a visible default", () => {
+    expect(parsePersistedState({}).showThreadHeaderActions).toBe(true);
+    expect(parsePersistedState({ showThreadHeaderActions: false }).showThreadHeaderActions).toBe(
+      false,
+    );
+    expect(
+      parsePersistedState({ showThreadHeaderActions: "false" as unknown as boolean })
+        .showThreadHeaderActions,
+    ).toBe(true);
   });
 
   it("hydrates raw UI-owned state without server entities", () => {
@@ -203,6 +225,7 @@ describe("parsePersistedState", () => {
       defaultAdvertisedEndpointKey: "desktop-core:lan:http",
       sidebarProjectScopeKey: null,
       pullRequestMergeMethod: "merge",
+      showThreadHeaderActions: true,
       threadChangedFilesExpandedById: {
         "environment:thread-1": {
           "turn-1": false,
@@ -307,6 +330,7 @@ describe("uiStateStore persistence", () => {
         },
       },
       defaultAdvertisedEndpointKey: "desktop-core:lan:http",
+      showThreadHeaderActions: false,
     });
 
     persistState(state);
@@ -332,6 +356,7 @@ describe("uiStateStore persistence", () => {
         },
       },
       pullRequestMergeMethod: "merge",
+      showThreadHeaderActions: false,
     });
     expect(parsePersistedState(persisted)).toEqual({
       ...state,

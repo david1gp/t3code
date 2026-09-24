@@ -31,6 +31,7 @@ export interface PersistedUiState {
   threadChangedFilesExpansionVersion?: number;
   threadChangedFilesExpandedById?: Record<string, Record<string, boolean>>;
   pullRequestMergeMethod?: string;
+  showThreadHeaderActions?: boolean;
 }
 
 export interface UiProjectState {
@@ -55,8 +56,12 @@ export interface UiPullRequestState {
   pullRequestMergeMethod: PullRequestMergeMethod;
 }
 
+export interface UiAppearanceState {
+  showThreadHeaderActions: boolean;
+}
+
 export interface UiState
-  extends UiProjectState, UiThreadState, UiEndpointState, UiPullRequestState {}
+  extends UiProjectState, UiThreadState, UiEndpointState, UiPullRequestState, UiAppearanceState {}
 
 const initialState: UiState = {
   projectExpandedById: {},
@@ -66,6 +71,7 @@ const initialState: UiState = {
   threadChangedFilesExpandedById: {},
   defaultAdvertisedEndpointKey: null,
   pullRequestMergeMethod: "merge",
+  showThreadHeaderActions: true,
 };
 
 const LEGACY_PROJECT_CWD_PREFERENCE_PREFIX = "legacy-project-cwd:";
@@ -158,6 +164,10 @@ export function parsePersistedState(parsed: PersistedUiState): UiState {
     pullRequestMergeMethod: isPullRequestMergeMethod(parsed.pullRequestMergeMethod)
       ? parsed.pullRequestMergeMethod
       : initialState.pullRequestMergeMethod,
+    showThreadHeaderActions:
+      typeof parsed.showThreadHeaderActions === "boolean"
+        ? parsed.showThreadHeaderActions
+        : initialState.showThreadHeaderActions,
   };
 }
 
@@ -232,6 +242,7 @@ export function persistState(state: UiState): void {
         threadChangedFilesExpansionVersion: THREAD_CHANGED_FILES_EXPANSION_VERSION,
         threadChangedFilesExpandedById: state.threadChangedFilesExpandedById,
         pullRequestMergeMethod: state.pullRequestMergeMethod,
+        showThreadHeaderActions: state.showThreadHeaderActions,
       } satisfies PersistedUiState),
     );
     if (!legacyKeysCleanedUp) {
@@ -346,6 +357,12 @@ function setPullRequestMergeMethod(state: UiState, method: PullRequestMergeMetho
     : { ...state, pullRequestMergeMethod: method };
 }
 
+export function setShowThreadHeaderActions(state: UiState, show: boolean): UiState {
+  return state.showThreadHeaderActions === show
+    ? state
+    : { ...state, showThreadHeaderActions: show };
+}
+
 export function resolveProjectExpanded(
   projectExpandedById: Readonly<Record<string, boolean>>,
   preferenceKeys: readonly string[],
@@ -430,6 +447,7 @@ interface UiStateStore extends UiState {
   setDefaultAdvertisedEndpointKey: (key: string | null) => void;
   setSidebarProjectScopeKey: (projectKey: string | null) => void;
   setPullRequestMergeMethod: (method: PullRequestMergeMethod) => void;
+  setShowThreadHeaderActions: (show: boolean) => void;
   setProjectExpanded: (projectIds: string | readonly string[], expanded: boolean) => void;
   reorderProjects: (
     currentProjectOrder: readonly string[],
@@ -451,6 +469,7 @@ export const useUiStateStore = create<UiStateStore>((set) => ({
   setSidebarProjectScopeKey: (projectKey) =>
     set((state) => setSidebarProjectScopeKey(state, projectKey)),
   setPullRequestMergeMethod: (method) => set((state) => setPullRequestMergeMethod(state, method)),
+  setShowThreadHeaderActions: (show) => set((state) => setShowThreadHeaderActions(state, show)),
   setProjectExpanded: (projectIds, expanded) =>
     set((state) => setProjectExpanded(state, projectIds, expanded)),
   reorderProjects: (currentProjectOrder, draggedProjectIds, targetProjectIds) =>

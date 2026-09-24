@@ -52,6 +52,7 @@ import { cn } from "~/lib/utils";
 import { useIsMobile } from "~/hooks/useMediaQuery";
 import { Button } from "../ui/button";
 import { Menu, MenuPopup, MenuSeparator, MenuTrigger } from "../ui/menu";
+import { useUiStateStore } from "~/uiStateStore";
 
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
@@ -145,6 +146,7 @@ export const ChatHeader = memo(function ChatHeader({
   onUpdateProjectScript,
   onDeleteProjectScript,
 }: ChatHeaderProps) {
+  const showThreadHeaderActions = useUiStateStore((state) => state.showThreadHeaderActions);
   const { active: panelAnimationsActive, durationMs: panelAnimationDurationMs } =
     usePanelAnimationSettings();
   const headerActionsRef = useRef<HTMLDivElement | null>(null);
@@ -487,42 +489,46 @@ export const ChatHeader = memo(function ChatHeader({
           )}
         </WorkspaceBreadcrumbItem>
       </WorkspaceBreadcrumb>
-      <div
-        ref={headerActionsRef}
-        data-chat-header-actions
-        className={cn(
-          "flex shrink-0 items-center justify-end gap-2 @3xl/header-actions:gap-3",
-          // Reserve two panel toggles plus their 4px gaps and 1px edge inset.
-          // The page header adds 8px more right padding at sm.
-          rightPanelOpen ? "pr-0" : "pr-[calc(--spacing(18)+1px)] sm:pr-[calc(--spacing(14)+1px)]",
-          "[[data-panel-animations=true]_&]:motion-safe:transition-[padding-right] [[data-panel-animations=true]_&]:motion-safe:[transition-duration:var(--panel-animation-duration)] [[data-panel-animations=true]_&]:motion-safe:ease-out",
-        )}
-      >
-        <Menu open={actionsCollapsed && actionsOpen} onOpenChange={setActionsOpen}>
-          <MenuTrigger
-            className={
-              actionsCollapsed &&
-              (activeProjectScripts || showOpenInPicker || (activeProjectName && gitCwd))
-                ? undefined
-                : "hidden"
-            }
-            render={<Button size="icon-sm" variant="ghost" aria-label="More header actions" />}
-          >
-            <EllipsisIcon className="size-4" />
-          </MenuTrigger>
-          <div ref={mountInlineActions} className="contents" />
-          <MenuPopup
-            data-chat-header-actions
-            keepMounted
-            aria-label="Header actions"
-            align="end"
-            finalFocus={actionsCollapsed ? undefined : false}
-          >
-            <div ref={mountMenuActions} className="contents" />
-            {createPortal(headerActions, actionsContainer)}
-          </MenuPopup>
-        </Menu>
-      </div>
+      {showThreadHeaderActions ? (
+        <div
+          ref={headerActionsRef}
+          data-chat-header-actions
+          className={cn(
+            "flex shrink-0 items-center justify-end gap-2 @3xl/header-actions:gap-3",
+            // Reserve two panel toggles plus their 4px gaps and 1px edge inset.
+            // The page header adds 8px more right padding at sm.
+            rightPanelOpen
+              ? "pr-0"
+              : "pr-[calc(--spacing(18)+1px)] sm:pr-[calc(--spacing(14)+1px)]",
+            "[[data-panel-animations=true]_&]:motion-safe:transition-[padding-right] [[data-panel-animations=true]_&]:motion-safe:[transition-duration:var(--panel-animation-duration)] [[data-panel-animations=true]_&]:motion-safe:ease-out",
+          )}
+        >
+          <Menu open={actionsCollapsed && actionsOpen} onOpenChange={setActionsOpen}>
+            <MenuTrigger
+              className={
+                actionsCollapsed &&
+                (activeProjectScripts || showOpenInPicker || (activeProjectName && gitCwd))
+                  ? undefined
+                  : "hidden"
+              }
+              render={<Button size="icon-sm" variant="ghost" aria-label="More header actions" />}
+            >
+              <EllipsisIcon className="size-4" />
+            </MenuTrigger>
+            <div ref={mountInlineActions} className="contents" />
+            <MenuPopup
+              data-chat-header-actions
+              keepMounted
+              aria-label="Header actions"
+              align="end"
+              finalFocus={actionsCollapsed ? undefined : false}
+            >
+              <div ref={mountMenuActions} className="contents" />
+              {createPortal(headerActions, actionsContainer)}
+            </MenuPopup>
+          </Menu>
+        </div>
+      ) : null}
     </div>
   );
 });
