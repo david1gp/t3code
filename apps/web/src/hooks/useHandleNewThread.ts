@@ -33,6 +33,7 @@ import { readT3ProjectFile } from "../lib/t3ProjectFileDefaults";
 import { environmentServerConfigsAtom } from "../state/server";
 import { resolveThreadRouteTarget } from "../threadRoutes";
 import { legacyProjectCwdPreferenceKey, useUiStateStore } from "../uiStateStore";
+import { sidebarCreatedThreadReveal } from "../sidebarCreatedThreadReveal";
 import { useClientSettings } from "./useSettings";
 
 interface NewThreadWorkspaceOptions {
@@ -57,6 +58,9 @@ function pickExplicitWorkspaceOptions(options: NewThreadWorkspaceOptions | undef
 export function useNewThreadHandler() {
   const environmentServerConfigs = useAtomValue(environmentServerConfigsAtom);
   const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
+  const groupThreadsByProject = useClientSettings(
+    (settings) => settings.sidebarGroupThreadsByProject,
+  );
   const router = useRouter();
   const getCurrentRouteTarget = useCallback(() => {
     const currentRouteParams = router.state.matches[router.state.matches.length - 1]?.params ?? {};
@@ -164,6 +168,15 @@ export function useNewThreadHandler() {
       const logicalProjectKey = project
         ? deriveLogicalProjectKeyFromSettings(project, projectGroupingSettings)
         : scopedProjectKey(projectRef);
+      // Every creation surface converges here, including landing and palette.
+      // Opening a new or reusable draft should reveal its logical owner.
+      const expandOwner = () => {
+        sidebarCreatedThreadReveal({
+          grouped: groupThreadsByProject,
+          logicalProjectKey,
+          project: project ?? null,
+        });
+      };
       const hasBranchOption = options?.branch !== undefined;
       const hasWorktreePathOption = options?.worktreePath !== undefined;
       const hasEnvModeOption = options?.envMode !== undefined;
@@ -315,6 +328,7 @@ export function useNewThreadHandler() {
             routeTargetAfterWrites?.kind === "draft" &&
             routeTargetAfterWrites.draftId === emptyStoredDraftThread.draftId
           ) {
+            expandOwner();
             return opened;
           }
           await router.navigate({
@@ -322,6 +336,7 @@ export function useNewThreadHandler() {
             params: { draftId: emptyStoredDraftThread.draftId },
             replace: options?.replace ?? false,
           });
+          expandOwner();
           return opened;
         })();
       }
@@ -350,6 +365,7 @@ export function useNewThreadHandler() {
           interactionMode: latestActiveDraftThread.interactionMode,
           ...pickExplicitWorkspaceOptions(options),
         });
+        expandOwner();
         return Promise.resolve({
           draftId: currentRouteTarget.draftId,
           threadId: latestActiveDraftThread.threadId,
@@ -398,6 +414,7 @@ export function useNewThreadHandler() {
             params: { draftId: racedDraft.draftId },
             replace: options?.replace ?? false,
           });
+          expandOwner();
           return { draftId: racedDraft.draftId, threadId: racedDraft.threadId };
         }
         setLogicalProjectDraftThreadId(logicalProjectKey, projectRef, draftId, {
@@ -427,10 +444,17 @@ export function useNewThreadHandler() {
           params: { draftId },
           replace: options?.replace ?? false,
         });
+        expandOwner();
         return { draftId, threadId };
       })();
     },
-    [environmentServerConfigs, getCurrentRouteTarget, projectGroupingSettings, router],
+    [
+      environmentServerConfigs,
+      getCurrentRouteTarget,
+      groupThreadsByProject,
+      projectGroupingSettings,
+      router,
+    ],
   );
 }
 

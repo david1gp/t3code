@@ -4,6 +4,7 @@ import type { RuntimeMode } from "@t3tools/contracts";
 const testState = vi.hoisted(() => {
   let completeProjectFileRead: (value: null) => void = () => undefined;
   let projectFileRead = Promise.resolve<null>(null);
+  let groupThreadsByProject = true;
   let targetSettings = {
     defaultThreadEnvMode: "local" as "local" | "worktree",
     newWorktreesStartFromOrigin: false,
@@ -35,12 +36,29 @@ const testState = vi.hoisted(() => {
     setLogicalProjectDraftThreadId: vi.fn(),
     setModelSelection: vi.fn(),
   };
+  const setProjectExpanded = vi.fn();
+  const setSidebarProjectScopeKey = vi.fn();
+  let sidebarProjectScopeKey: string | null = null;
 
   return {
     completeProjectFileRead: (value: null) => completeProjectFileRead(value),
     draftStore,
+    setProjectExpanded,
+    setSidebarProjectScopeKey,
+    get sidebarProjectScopeKey() {
+      return sidebarProjectScopeKey;
+    },
+    set sidebarProjectScopeKey(value: string | null) {
+      sidebarProjectScopeKey = value;
+    },
     get projectFileRead() {
       return projectFileRead;
+    },
+    get groupThreadsByProject() {
+      return groupThreadsByProject;
+    },
+    set groupThreadsByProject(value: boolean) {
+      groupThreadsByProject = value;
     },
     get targetSettings() {
       return targetSettings;
@@ -53,6 +71,7 @@ const testState = vi.hoisted(() => {
       },
     ) {
       storedDraft = nextStoredDraft;
+      groupThreadsByProject = true;
       targetSettings = {
         defaultThreadEnvMode: workspaceDefaults.envMode,
         newWorktreesStartFromOrigin: workspaceDefaults.startFromOrigin,
@@ -63,6 +82,9 @@ const testState = vi.hoisted(() => {
       router.navigate.mockClear();
       draftStore.setDraftThreadContext.mockClear();
       draftStore.setLogicalProjectDraftThreadId.mockClear();
+      setProjectExpanded.mockClear();
+      setSidebarProjectScopeKey.mockClear();
+      sidebarProjectScopeKey = null;
       projectFileRead = new Promise<null>((resolve) => {
         completeProjectFileRead = resolve;
       });
@@ -176,9 +198,18 @@ vi.mock("../state/server", () => ({
 vi.mock("../threadRoutes", () => ({ resolveThreadRouteTarget: () => null }));
 vi.mock("../uiStateStore", () => ({
   legacyProjectCwdPreferenceKey: () => "remote-project",
-  useUiStateStore: () => [],
+  useUiStateStore: Object.assign(() => [], {
+    getState: () => ({
+      sidebarProjectScopeKey: testState.sidebarProjectScopeKey,
+      setProjectExpanded: testState.setProjectExpanded,
+      setSidebarProjectScopeKey: testState.setSidebarProjectScopeKey,
+    }),
+  }),
 }));
-vi.mock("./useSettings", () => ({ useClientSettings: () => ({}) }));
+vi.mock("./useSettings", () => ({
+  useClientSettings: (select: (settings: { sidebarGroupThreadsByProject: boolean }) => unknown) =>
+    select({ sidebarGroupThreadsByProject: testState.groupThreadsByProject }),
+}));
 
 import { useNewThreadHandler } from "./useHandleNewThread";
 
@@ -194,6 +225,34 @@ describe.each([
     },
   ],
 ])("useNewThreadHandler with a %s draft", (_, draft) => {
+  it("does not change project expansion when grouping is off", async () => {
+    testState.reset(draft);
+    testState.groupThreadsByProject = false;
+    const pendingOpen = useNewThreadHandler()({
+      environmentId: "environment-ssh",
+      projectId: "project-remote",
+    } as never);
+    testState.completeProjectFileRead(null);
+    await pendingOpen;
+    expect(testState.setProjectExpanded).not.toHaveBeenCalled();
+    expect(testState.setSidebarProjectScopeKey).not.toHaveBeenCalled();
+  });
+
+  it("reveals a newly opened draft when a different project is scoped", async () => {
+    testState.reset(draft);
+    testState.sidebarProjectScopeKey = "another-project";
+    const pendingOpen = useNewThreadHandler()({
+      environmentId: "environment-ssh",
+      projectId: "project-remote",
+    } as never);
+    testState.completeProjectFileRead(null);
+    await pendingOpen;
+    expect(testState.setSidebarProjectScopeKey).toHaveBeenCalledWith("remote-project");
+    expect(testState.setProjectExpanded).toHaveBeenCalledWith(
+      ["remote-project", "remote-project", "remote-project"],
+      true,
+    );
+  });
   it.each(["approval-required", "auto-accept-edits", "auto", "full-access"] as const)(
     "uses the target environment's %s permissions for new threads",
     async (runtimeMode) => {
@@ -213,6 +272,10 @@ describe.each([
         opened!.draftId,
         expect.objectContaining({ runtimeMode }),
       );
+      expect(testState.setProjectExpanded).toHaveBeenCalledWith(
+        ["remote-project", "remote-project", "remote-project"],
+        true,
+      );
     },
   );
 
@@ -231,6 +294,7 @@ describe.each([
     expect(testState.router.state.location.href).toBe("/usage");
     expect(testState.router.navigate).not.toHaveBeenCalled();
     expect(testState.draftStore.setLogicalProjectDraftThreadId).not.toHaveBeenCalled();
+    expect(testState.setProjectExpanded).not.toHaveBeenCalled();
   });
 
   it.each([true, false])(

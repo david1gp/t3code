@@ -552,6 +552,16 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.sidebarThreadPreviewCount !== DEFAULT_UNIFIED_SETTINGS.sidebarThreadPreviewCount
         ? ["Visible threads"]
         : []),
+      ...(settings.sidebarGroupThreadsByProject !==
+      DEFAULT_UNIFIED_SETTINGS.sidebarGroupThreadsByProject
+        ? ["Group threads by project"]
+        : []),
+      ...(settings.sidebarShowProviderLogos !== DEFAULT_UNIFIED_SETTINGS.sidebarShowProviderLogos
+        ? ["Provider logos"]
+        : []),
+      ...(settings.sidebarShowBranchLabels !== DEFAULT_UNIFIED_SETTINGS.sidebarShowBranchLabels
+        ? ["Branch labels"]
+        : []),
       ...(settings.sidebarProjectGroupingMode !==
       DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode
         ? ["Project Grouping"]
@@ -677,6 +687,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.sidebarAutoSettleOnMerge,
       settings.sidebarProjectGroupingMode,
       settings.sidebarThreadPreviewCount,
+      settings.sidebarGroupThreadsByProject,
+      settings.sidebarShowProviderLogos,
+      settings.sidebarShowBranchLabels,
       settings.showSkillsInSlashMenu,
       settings.timestampFormat,
       settings.notificationMode,
@@ -771,6 +784,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
       panelAnimationDurationMs: DEFAULT_UNIFIED_SETTINGS.panelAnimationDurationMs,
       sidebarThreadPreviewCount: DEFAULT_UNIFIED_SETTINGS.sidebarThreadPreviewCount,
+      sidebarGroupThreadsByProject: DEFAULT_UNIFIED_SETTINGS.sidebarGroupThreadsByProject,
+      sidebarShowProviderLogos: DEFAULT_UNIFIED_SETTINGS.sidebarShowProviderLogos,
+      sidebarShowBranchLabels: DEFAULT_UNIFIED_SETTINGS.sidebarShowBranchLabels,
       sidebarProjectGroupingMode: DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode,
       sidebarAutoSettleAfterDays: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleAfterDays,
       sidebarAutoSettleOnMerge: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge,
@@ -2237,6 +2253,88 @@ export function GeneralSettingsPanel() {
                 });
               }}
               aria-label="Project grouping"
+            />
+          }
+        />
+
+        <SettingsRow
+          title="Group threads by project"
+          description="Show each project's threads together under a collapsible heading."
+          resetAction={
+            settings.sidebarGroupThreadsByProject !==
+            DEFAULT_UNIFIED_SETTINGS.sidebarGroupThreadsByProject ? (
+              <SettingResetButton
+                label="thread grouping"
+                onClick={() =>
+                  updateSettings({
+                    sidebarGroupThreadsByProject:
+                      DEFAULT_UNIFIED_SETTINGS.sidebarGroupThreadsByProject,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.sidebarGroupThreadsByProject}
+              onCheckedChange={(checked) =>
+                updateSettings({ sidebarGroupThreadsByProject: Boolean(checked) })
+              }
+              aria-label="Group threads by project"
+            />
+          }
+        />
+
+        <SettingsRow
+          title="Show provider logos"
+          description="Display the agent provider's logo beside each thread."
+          resetAction={
+            settings.sidebarShowProviderLogos !==
+            DEFAULT_UNIFIED_SETTINGS.sidebarShowProviderLogos ? (
+              <SettingResetButton
+                label="provider logos"
+                onClick={() =>
+                  updateSettings({
+                    sidebarShowProviderLogos: DEFAULT_UNIFIED_SETTINGS.sidebarShowProviderLogos,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.sidebarShowProviderLogos}
+              onCheckedChange={(checked) =>
+                updateSettings({ sidebarShowProviderLogos: Boolean(checked) })
+              }
+              aria-label="Show provider logos"
+            />
+          }
+        />
+
+        <SettingsRow
+          title="Show branch labels"
+          description="Display each thread's branch name in the sidebar."
+          resetAction={
+            settings.sidebarShowBranchLabels !==
+            DEFAULT_UNIFIED_SETTINGS.sidebarShowBranchLabels ? (
+              <SettingResetButton
+                label="branch labels"
+                onClick={() =>
+                  updateSettings({
+                    sidebarShowBranchLabels: DEFAULT_UNIFIED_SETTINGS.sidebarShowBranchLabels,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.sidebarShowBranchLabels}
+              onCheckedChange={(checked) =>
+                updateSettings({ sidebarShowBranchLabels: Boolean(checked) })
+              }
+              aria-label="Show branch labels"
             />
           }
         />

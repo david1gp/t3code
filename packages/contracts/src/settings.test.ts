@@ -589,6 +589,26 @@ describe("ClientSettings sidebar", () => {
     expect(decodeClientSettingsPatch({ confirmThreadUnpin: true }).confirmThreadUnpin).toBe(true);
     expect(() => decodeClientSettingsPatch({ confirmThreadUnpin: "yes" })).toThrow();
   });
+
+  it("defaults compact sidebar preferences to the current ungrouped appearance", () => {
+    expect(decodeClientSettings({})).toMatchObject({
+      sidebarGroupThreadsByProject: false,
+      sidebarShowProviderLogos: true,
+      sidebarShowBranchLabels: true,
+    });
+  });
+
+  it("preserves explicit compact sidebar preferences in settings and patches", () => {
+    const preferences = {
+      sidebarGroupThreadsByProject: true,
+      sidebarShowProviderLogos: false,
+      sidebarShowBranchLabels: false,
+    };
+
+    expect(encodeClientSettings(decodeClientSettings(preferences))).toMatchObject(preferences);
+    expect(decodeClientSettingsPatch(preferences)).toEqual(preferences);
+    expect(() => decodeClientSettingsPatch({ sidebarGroupThreadsByProject: "yes" })).toThrow();
+  });
 });
 
 describe("ClientSettings context window meter", () => {

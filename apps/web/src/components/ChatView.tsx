@@ -291,6 +291,7 @@ import {
   selectProjectGroupingSettings,
 } from "../logicalProject";
 import { buildPhysicalToLogicalProjectKeyMap } from "../sidebarProjectGrouping";
+import { sidebarCreatedThreadReveal } from "../sidebarCreatedThreadReveal";
 import { buildDraftThreadRouteParams, buildThreadRouteParams } from "../threadRoutes";
 import {
   beginBackgroundDraftSubmissionByRef,
@@ -2270,6 +2271,9 @@ export default function ChatView(props: ChatViewProps) {
     startNewThreadForProject(activeProjectRef, handleNewThread);
   }, [activeProjectRef, handleNewThread]);
   const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
+  const groupThreadsByProject = useClientSettings(
+    (settings) => settings.sidebarGroupThreadsByProject,
+  );
   const activeDraftLogicalProjectKey =
     !isServerThread && activeProject
       ? deriveLogicalProjectKeyFromSettings(activeProject, projectGroupingSettings)
@@ -9233,6 +9237,17 @@ export default function ChatView(props: ChatViewProps) {
       failure = navigateResult._tag === "Failure" ? navigateResult : null;
     }
 
+    if (failure === null) {
+      sidebarCreatedThreadReveal({
+        grouped: groupThreadsByProject,
+        logicalProjectKey: deriveLogicalProjectKeyFromSettings(
+          activeProject,
+          projectGroupingSettings,
+        ),
+        project: activeProject,
+      });
+    }
+
     if (failure !== null) {
       const cleanupResult = await deleteThread({
         environmentId,
@@ -9279,6 +9294,8 @@ export default function ChatView(props: ChatViewProps) {
     startThreadTurn,
     environmentId,
     composerRef,
+    groupThreadsByProject,
+    projectGroupingSettings,
   ]);
 
   const getModelDisabledReason = useCallback(
