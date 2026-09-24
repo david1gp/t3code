@@ -963,9 +963,6 @@ describe("DesktopBackendConfiguration", () => {
           const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
           const config = yield* configuration.resolveWsl({ port: 5050, distro: null });
 
-          // Nothing crosses wsl.exe that WSLENV does not declare, and the
-          // endpoints reach the backend through the bootstrap regardless, so
-          // the switch has to travel or the server keeps exporting.
           assert.equal(config.env.OTEL_SDK_DISABLED, "true");
           assert.include((config.env.WSLENV ?? "").split(":"), "OTEL_SDK_DISABLED");
         }).pipe(
