@@ -2756,6 +2756,374 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect(
+    "normalizes nested child sessions without mixing their transcript or usage into the parent",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-opencode-child-task-lifecycle");
+        const rootSessionId = "http://127.0.0.1:9999/session";
+        runtimeMock.state.sessionParentById.set("ses_late_child", rootSessionId);
+        runtimeMock.state.sessionParentById.set("ses_nested_child", "ses_late_child");
+        const enqueue = makeOpenCodeEventQueue();
+        const eventsFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.threadId === threadId &&
+              (event.type.startsWith("task.") ||
+                event.type === "tool.progress" ||
+                event.type === "content.delta" ||
+                event.type === "thread.token-usage.updated" ||
+                event.type === "turn.completed"),
+          ),
+          Stream.takeUntil((event) => event.type === "turn.completed"),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const turn = yield* adapter.sendTurn({
+          threadId,
+          input: "Use nested child sessions",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "opencode/kimi-k3",
+          ),
+        });
+        const promptMessageId = (runtimeMock.state.promptCalls[0] as { messageID: string })
+          .messageID;
+        enqueue({
+          id: "evt-child-tool-before-message-usage",
+          type: "message.part.updated",
+          properties: {
+            sessionID: "ses_late_child",
+            part: {
+              id: "part-child-tool-early",
+              sessionID: "ses_late_child",
+              messageID: "child-assistant-message",
+              type: "tool",
+              callID: "call-child-tool",
+              tool: "bash",
+              state: {
+                status: "running",
+                input: { command: "pwd" },
+                time: { start: 30 },
+                title: "Inspect working directory",
+              },
+            } satisfies ToolPart,
+          },
+        });
+        enqueue({
+          id: "evt-child-first-without-session-created",
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_late_child",
+            info: {
+              id: "child-assistant-message",
+              role: "assistant",
+              parentID: "child-user-message",
+              agent: "researcher",
+              modelID: "model-child",
+              providerID: "provider-child",
+              time: { created: 10, completed: 30 },
+              tokens: {
+                total: 12,
+                input: 8,
+                output: 2,
+                reasoning: 1,
+                cache: { read: 1, write: 0 },
+              },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-child-metadata-late",
+          type: "session.updated",
+          properties: {
+            info: {
+              id: "ses_late_child",
+              parentID: rootSessionId,
+              title: "Research child",
+              agent: "researcher",
+              model: { id: "model-child", providerID: "provider-child" },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-nested-child-created",
+          type: "session.created",
+          properties: {
+            info: {
+              id: "ses_nested_child",
+              parentID: "ses_late_child",
+              title: "Nested child",
+              agent: "explorer",
+              model: { id: "model-nested", providerID: "provider-child" },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-nested-child-idle",
+          type: "session.status",
+          properties: { sessionID: "ses_nested_child", status: { type: "idle" } },
+        });
+        enqueue({
+          id: "evt-child-tool-progress",
+          type: "message.part.updated",
+          properties: {
+            sessionID: "ses_late_child",
+            part: {
+              id: "part-child-tool",
+              sessionID: "ses_late_child",
+              messageID: "child-assistant-message",
+              type: "tool",
+              callID: "call-child-tool",
+              tool: "bash",
+              state: {
+                status: "running",
+                input: { command: "pwd" },
+                time: { start: 31 },
+                title: "Inspect working directory",
+              },
+            } satisfies ToolPart,
+          },
+        });
+        enqueue({
+          id: "evt-child-error",
+          type: "session.error",
+          properties: {
+            sessionID: "ses_late_child",
+            error: { name: "UnknownError", data: { message: "Child failed" } },
+          },
+        });
+        enqueue({
+          id: "evt-child-idle-after-error",
+          type: "session.status",
+          properties: { sessionID: "ses_late_child", status: { type: "idle" } },
+        });
+        enqueue({
+          id: "evt-child-error-message-after-terminal",
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_late_child",
+            info: {
+              id: "child-assistant-message",
+              role: "assistant",
+              parentID: "child-user-message",
+              error: { name: "UnknownError", data: { message: "Child failed" } },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-child-metadata-after-terminal",
+          type: "session.updated",
+          properties: {
+            info: {
+              id: "ses_late_child",
+              parentID: rootSessionId,
+              title: "Research child after failure",
+              agent: "researcher",
+              model: { id: "model-child", providerID: "provider-child" },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-child-restarted",
+          type: "session.status",
+          properties: { sessionID: "ses_late_child", status: { type: "busy" } },
+        });
+        enqueue({
+          id: "evt-child-idle-after-restart",
+          type: "session.status",
+          properties: { sessionID: "ses_late_child", status: { type: "idle" } },
+        });
+        enqueue({
+          id: "evt-child-metadata-after-completion",
+          type: "session.updated",
+          properties: {
+            info: {
+              id: "ses_late_child",
+              parentID: rootSessionId,
+              title: "Research child after completion",
+              agent: "researcher",
+              model: { id: "model-child", providerID: "provider-child" },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-parent-assistant",
+          type: "message.updated",
+          properties: {
+            sessionID: rootSessionId,
+            info: {
+              id: "parent-assistant-message",
+              role: "assistant",
+              parentID: promptMessageId,
+              time: { created: 40, completed: 50 },
+              tokens: {
+                total: 9,
+                input: 6,
+                output: 2,
+                reasoning: 1,
+                cache: { read: 1, write: 0 },
+              },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-parent-text",
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootSessionId,
+            part: {
+              id: "part-parent-text",
+              sessionID: rootSessionId,
+              messageID: "parent-assistant-message",
+              type: "text",
+              text: "Parent only",
+              time: { start: 41, end: 50 },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-parent-step-usage",
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootSessionId,
+            part: {
+              id: "step-parent-usage",
+              sessionID: rootSessionId,
+              messageID: "parent-assistant-message",
+              type: "step-finish",
+              reason: "stop",
+              cost: 0,
+              tokens: { input: 7, output: 2, reasoning: 1, cache: { read: 1, write: 0 } },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-parent-idle",
+          type: "session.status",
+          properties: { sessionID: rootSessionId, status: { type: "idle" } },
+        });
+
+        const events = yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second"));
+        const starts = events.filter((event) => event.type === "task.started");
+        NodeAssert.deepEqual(
+          starts.map((event) => event.payload.taskId),
+          ["ses_late_child", "ses_nested_child"],
+        );
+        const childStart = starts.find(
+          (event) => event.type === "task.started" && event.payload.taskId === "ses_late_child",
+        );
+        NodeAssert.equal(childStart?.type, "task.started");
+        if (childStart?.type === "task.started") {
+          NodeAssert.equal(childStart.payload.parentAgentId, undefined);
+          NodeAssert.equal(childStart.turnId, turn.turnId);
+        }
+        const metadataProgress = events.find(
+          (event) =>
+            event.type === "task.progress" &&
+            event.payload.taskId === "ses_late_child" &&
+            event.payload.title === "Research child",
+        );
+        NodeAssert.equal(metadataProgress?.type, "task.progress");
+        if (metadataProgress?.type === "task.progress") {
+          NodeAssert.equal(metadataProgress.payload.title, "Research child");
+          NodeAssert.equal(metadataProgress.payload.role, "researcher");
+          NodeAssert.equal(metadataProgress.payload.model, "provider-child/model-child");
+          NodeAssert.equal(metadataProgress.turnId, turn.turnId);
+        }
+        const nestedStart = starts.find(
+          (event) => event.type === "task.started" && event.payload.taskId === "ses_nested_child",
+        );
+        NodeAssert.equal(nestedStart?.type, "task.started");
+        if (nestedStart?.type === "task.started") {
+          NodeAssert.equal(nestedStart.payload.parentAgentId, "ses_late_child");
+          NodeAssert.equal(nestedStart.turnId, turn.turnId);
+        }
+        const toolProgress = events.find((event) => event.type === "tool.progress");
+        NodeAssert.equal(toolProgress?.type, "tool.progress");
+        if (toolProgress?.type === "tool.progress") {
+          NodeAssert.equal(toolProgress.payload.taskId, "ses_late_child");
+          NodeAssert.equal(toolProgress.payload.toolName, "bash");
+          NodeAssert.equal(toolProgress.payload.summary, "Inspect working directory");
+          NodeAssert.equal(toolProgress.turnId, turn.turnId);
+        }
+        const childTerminals = events.filter(
+          (event) => event.type === "task.completed" && event.payload.taskId === "ses_late_child",
+        );
+        NodeAssert.deepEqual(
+          childTerminals.map((event) =>
+            event.type === "task.completed" ? event.payload.status : "",
+          ),
+          ["failed", "completed"],
+        );
+        NodeAssert.ok(
+          events.some(
+            (event) =>
+              event.type === "task.progress" &&
+              event.payload.taskId === "ses_late_child" &&
+              event.payload.typedUsage?.totalTokens === 0 &&
+              event.payload.typedUsage.toolUses === 1,
+          ),
+        );
+        NodeAssert.equal(
+          events.filter(
+            (event) =>
+              event.type === "task.completed" &&
+              event.payload.taskId === "ses_late_child" &&
+              event.payload.status === "failed",
+          ).length,
+          1,
+        );
+        NodeAssert.ok(
+          events.some(
+            (event) =>
+              event.type === "task.progress" &&
+              event.payload.taskId === "ses_late_child" &&
+              event.payload.status === "completed" &&
+              event.payload.title === "Research child after completion",
+          ),
+        );
+        if (childTerminals[0]?.type === "task.completed") {
+          NodeAssert.equal(childTerminals[0].payload.typedUsage?.totalTokens, 12);
+          NodeAssert.equal(childTerminals[0].payload.typedUsage?.toolUses, 1);
+        }
+        const nestedTerminal = events.find(
+          (event) => event.type === "task.completed" && event.payload.taskId === "ses_nested_child",
+        );
+        NodeAssert.equal(nestedTerminal?.type, "task.completed");
+        if (nestedTerminal?.type === "task.completed") {
+          NodeAssert.equal(nestedTerminal.payload.status, "completed");
+        }
+        const textDeltas = events.filter((event) => event.type === "content.delta");
+        NodeAssert.equal(textDeltas.length, 1);
+        if (textDeltas[0]?.type === "content.delta") {
+          NodeAssert.equal(textDeltas[0].payload.delta, "Parent only");
+        }
+        const turnCompleted = events.find((event) => event.type === "turn.completed");
+        NodeAssert.equal(turnCompleted?.type, "turn.completed");
+        if (turnCompleted?.type === "turn.completed") {
+          NodeAssert.deepEqual(turnCompleted.payload.tokenUsage, {
+            usageStatus: "complete",
+            usageScope: "main_agent",
+            inputTokens: 8,
+            cachedInputTokens: 1,
+            cacheCreationTokens: 0,
+            outputTokens: 3,
+            reasoningTokens: 1,
+            hasSubagents: true,
+          });
+        }
+        NodeAssert.equal(turn.turnId, turnCompleted?.turnId);
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
   it.effect("sums owned OpenCode step usage and marks unresolved usage partial", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
@@ -4418,8 +4786,8 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       ];
 
       const openedEventsFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter((event) => event.threadId === threadId),
-        Stream.take(3),
+        Stream.filter((event) => event.threadId === threadId && event.type === "request.opened"),
+        Stream.take(1),
         Stream.runCollect,
         Effect.forkChild,
       );
@@ -4718,8 +5086,10 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       ];
 
       const requestedEventsFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter((event) => event.threadId === threadId),
-        Stream.take(3),
+        Stream.filter(
+          (event) => event.threadId === threadId && event.type === "user-input.requested",
+        ),
+        Stream.take(1),
         Stream.runCollect,
         Effect.forkChild,
       );
