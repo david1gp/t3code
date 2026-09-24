@@ -351,6 +351,9 @@ const TurnCompletedPayload = Schema.Struct({
   usage: Schema.optional(Schema.Unknown),
   modelUsage: Schema.optional(UnknownRecordSchema),
   totalCostUsd: Schema.optional(Schema.Number),
+  /** Identity at the time of the turn, rather than the thread's mutable selection. */
+  costModel: Schema.optional(Schema.String),
+  costSessionId: Schema.optional(Schema.String),
   errorMessage: Schema.optional(TrimmedNonEmptyStringSchema),
   tokenUsage: Schema.optional(TurnTokenUsage),
 });

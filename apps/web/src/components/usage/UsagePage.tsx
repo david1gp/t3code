@@ -147,6 +147,19 @@ export function UsagePage() {
     [breakdown, merged.models, metric],
   );
   const activeProviders = useMemo(() => providersWithUsage(merged.providers), [merged.providers]);
+  const sourceDescriptions = useMemo(
+    () => [
+      ...new Set(
+        selectedEnvironments.flatMap(
+          (environment) =>
+            environment.summary?.sources.flatMap((source) =>
+              source.description ? [source.description] : [],
+            ) ?? [],
+        ),
+      ),
+    ],
+    [selectedEnvironments],
+  );
   const timeValueColumnWidth = `${60 / (activeProviders.length + 2)}%`;
 
   const selectWindow = (days: number) => {
@@ -396,13 +409,25 @@ export function UsagePage() {
                       <span className="text-xs text-muted-foreground">
                         {metric !== "cost"
                           ? `${formatCount(merged.sessions)} sessions`
-                          : merged.costQuality.unpricedShare > 0
-                            ? `${formatCount(merged.sessions)} sessions · API estimate excludes ${formatPercent(
-                                merged.costQuality.unpricedShare,
-                              )} unpriced records`
-                            : `${formatCount(merged.sessions)} sessions · API estimate`}
+                          : `${formatCount(merged.sessions)} sessions · API-equivalent cost, not subscription spend`}
                       </span>
+                      {metric === "cost" ? (
+                        <span className="text-xs text-muted-foreground">
+                          Records: {formatPercent(merged.costQuality.providerReportedShare)}{" "}
+                          provider-reported · {formatPercent(merged.costQuality.modelPricedShare)}{" "}
+                          model-priced
+                          {merged.costQuality.unpricedShare > 0
+                            ? ` · excludes ${formatPercent(merged.costQuality.unpricedShare)} unpriced records`
+                            : ""}
+                        </span>
+                      ) : null}
                     </div>
+
+                    {sourceDescriptions.map((description) => (
+                      <p key={description} className="text-xs text-muted-foreground">
+                        {description}
+                      </p>
+                    ))}
 
                     {activeProviders.map((provider) => {
                       const totals = merged.providers.find((entry) => entry.provider === provider);

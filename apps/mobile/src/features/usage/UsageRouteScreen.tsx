@@ -95,6 +95,19 @@ export function UsageRouteScreen() {
     window,
     selectedEnvironmentIds,
   );
+  const sourceDescriptions = useMemo(
+    () => [
+      ...new Set(
+        selectedEnvironments.flatMap(
+          (environment) =>
+            environment.summary?.sources.flatMap((source) =>
+              source.description ? [source.description] : [],
+            ) ?? [],
+        ),
+      ),
+    ],
+    [selectedEnvironments],
+  );
   const isFocused = useIsFocused();
   const limits = useRefreshLimits(selectedEnvironmentIds, isFocused && tab === "limits");
 
@@ -289,6 +302,11 @@ export function UsageRouteScreen() {
                   {merged.duplicateSources.join(", ")}
                 </Text>
               ) : null}
+              {sourceDescriptions.map((description) => (
+                <Text key={description} className="text-sm text-foreground-muted">
+                  {description}
+                </Text>
+              ))}
               {isPending ? (
                 <Text className="py-16 text-center text-base text-foreground-muted">
                   Scanning provider transcripts…
@@ -337,25 +355,25 @@ function ChartCard(props: {
 }) {
   const { merged, metric } = props;
   const colors = useProviderColors();
-  const hasActivity = props.daily.some((period) => period.totalTokens > 0);
+  const hasRecords = merged.records > 0;
 
   return (
     <View className="gap-4 rounded-[24px] border-continuous bg-card p-4">
       <View className="gap-0.5">
         <Text className="text-sm text-foreground-muted">
-          {metric === "cost" ? "Raw token cost" : "Processed tokens"}
+          {metric === "cost" ? "API-equivalent cost" : "Processed tokens"}
         </Text>
         <Text className="text-4xl font-t3-bold tabular-nums text-foreground">
-          {metric === "cost" ? `${formatUsd(merged.costUsd)}*` : formatTokens(merged.totalTokens)}
+          {metric === "cost" ? formatUsd(merged.costUsd) : formatTokens(merged.totalTokens)}
         </Text>
         <Text className="text-sm text-foreground-muted">
           {metric === "cost"
-            ? "* if billed at full API rate"
+            ? `Records: ${formatPercent(merged.costQuality.providerReportedShare)} provider-reported · ${formatPercent(merged.costQuality.modelPricedShare)} model-priced${merged.costQuality.unpricedShare > 0 ? ` · excludes ${formatPercent(merged.costQuality.unpricedShare)} unpriced records` : ""} · not subscription spend`
             : `Across ${formatCount(merged.sessions)} sessions`}
         </Text>
       </View>
 
-      {hasActivity ? (
+      {hasRecords ? (
         <UsageDailyChart
           days={props.days}
           daily={props.daily}

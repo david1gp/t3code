@@ -4,8 +4,9 @@
  * Each environment scans the provider CLIs' own on-disk session transcripts
  * (`~/.claude/projects/**\/*.jsonl`, `~/.codex/sessions/**\/*.jsonl`,
  * `~/.grok/sessions/**\/updates.jsonl`) rather than relying on T3 Code's own
- * orchestration projections, so usage stays complete even for turns that were
- * never driven through T3 Code. This mirrors the approach `ccusage` takes.
+ * orchestration projections, so transcript sources cover turns that were
+ * never driven through T3 Code. OpenCode reported cost is the exception: it is
+ * available only for turns recorded by T3 Code and persisted in projections.
  *
  * Environments return pre-aggregated `(day, hourStart?, provider, model)`
  * buckets. Raw transcript records never cross the wire.
@@ -17,22 +18,21 @@ import * as Schema from "effect/Schema";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 /**
- * Bumped whenever the shape of {@link UsageSummary} changes incompatibly. The
- * client renders partial coverage when an environment reports an older version
- * rather than failing the whole page.
+ * Bumped whenever the shape or coverage of {@link UsageSummary} changes. The
+ * client merges compatible older versions and flags incompatible ones as
+ * partial coverage instead of failing the whole page.
  */
-export const USAGE_CONTRACT_VERSION = 5 as const;
+export const USAGE_CONTRACT_VERSION = 6 as const;
 
 /**
  * Oldest {@link UsageSummary} version a current client will still merge.
  *
- * v5 only adds `grok` to {@link UsageProviderKind}; v4 Claude/Codex buckets
- * remain valid, so mixed-version environments keep those totals instead of
- * treating every older server as stale.
+ * v6 adds OpenCode reported costs and source descriptions; v4+ transcript
+ * buckets remain valid, so mixed-version environments keep available totals.
  */
 export const USAGE_MERGE_COMPATIBLE_SINCE = 4 as const;
 
-export const UsageProviderKind = Schema.Literals(["claude", "codex", "grok"]);
+export const UsageProviderKind = Schema.Literals(["claude", "codex", "grok", "opencode"]);
 export type UsageProviderKind = typeof UsageProviderKind.Type;
 
 /**
@@ -54,7 +54,8 @@ export type UsageResolution = typeof UsageResolution.Type;
 /**
  * Why a bucket's cost is what it is.
  *
- * - `providerReported` - the transcript carried an explicit cost figure.
+ * - `providerReported` - the provider supplied an explicit cost figure, in a
+ *   transcript or a T3-recorded usage activity.
  * - `modelPriced` - we used a custom price override or the LiteLLM rate table.
  * - `unpriced` - tokens are known, rates are not. Counted in totals, excluded
  *   from cost.
@@ -111,7 +112,8 @@ export const UsageBucket = Schema.Struct({
 export type UsageBucket = typeof UsageBucket.Type;
 
 /**
- * Identifies the physical transcript directory a source read from.
+ * Identifies the physical usage source an environment read from. Transcript
+ * sources use their directory; projection-backed sources use a stable label.
  *
  * Two environments on the same machine (worktree servers, for example) resolve
  * the same provider home and would otherwise double count. The client drops
@@ -151,6 +153,8 @@ export const UsageSource = Schema.Struct({
    */
   distinctSessions: NonNegativeInt,
   message: Schema.NullOr(TrimmedNonEmptyString),
+  /** Explains partial coverage or a provider-specific source limitation. */
+  description: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
 });
 export type UsageSource = typeof UsageSource.Type;
 

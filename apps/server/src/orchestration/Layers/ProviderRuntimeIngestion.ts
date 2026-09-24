@@ -477,6 +477,32 @@ export function runtimeEventToActivities(
       : {};
   })();
   switch (event.type) {
+    case "turn.completed": {
+      if (event.provider !== "opencode") return [];
+      const totalCostUsd = event.payload.totalCostUsd;
+      if (totalCostUsd === undefined || !Number.isFinite(totalCostUsd) || totalCostUsd < 0) {
+        return [];
+      }
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: "info",
+          kind: "usage.cost",
+          summary: "Provider reported turn cost",
+          payload: {
+            totalCostUsd,
+            ...(event.payload.costModel ? { model: event.payload.costModel } : {}),
+            ...(event.payload.costSessionId
+              ? { providerSessionId: event.payload.costSessionId }
+              : {}),
+          },
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
     case "request.opened": {
       if (event.payload.requestType === "tool_user_input") {
         return [];

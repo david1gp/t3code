@@ -13,9 +13,18 @@ const CURRENCY = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
 });
 
+const SMALL_CURRENCY = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 6,
+});
+
 const INTEGER = new Intl.NumberFormat("en-US");
 
 export function formatUsd(value: number): string {
+  if (value > 0 && value < 0.000001) return "<$0.000001";
+  if (value > 0 && value < 0.01) return SMALL_CURRENCY.format(value);
   return CURRENCY.format(value);
 }
 

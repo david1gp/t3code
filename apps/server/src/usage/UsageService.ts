@@ -47,6 +47,7 @@ import { expandHomePath } from "../pathExpansion.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { mergeProviderInstanceEnvironment } from "../provider/ProviderInstanceEnvironment.ts";
+import { ProjectionThreadActivityRepository } from "../persistence/Services/ProjectionThreadActivities.ts";
 import { UsageAggregator } from "./usageAggregation.ts";
 import { createOverrideRateTable, parseRateTable, type RateTable } from "./usagePricing.ts";
 import {
@@ -150,6 +151,7 @@ export const make = Effect.gen(function* () {
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const httpClient = yield* HttpClient.HttpClient;
   const hostEnvironment = yield* HostProcessEnvironment;
+  const threadActivities = yield* ProjectionThreadActivityRepository;
 
   const fileCache: ScanCache = new Map();
   const sourceCache = new Map<string, typeof CachedSource.Type>();
@@ -543,6 +545,27 @@ export const make = Effect.gen(function* () {
       { concurrency: 2 },
     );
 
+    const activitySince =
+      hourlyWindow?.sinceTimeMs ?? Date.parse(`${input.sinceDay}T00:00:00.000Z`);
+    const activityUntil =
+      hourlyWindow?.untilTimeMs ??
+      Date.parse(`${input.untilDay}T00:00:00.000Z`) + 24 * 60 * 60 * 1000;
+    const openCodeCosts = yield* threadActivities
+      .listUsageCostActivities({
+        since: DateTime.formatIso(DateTime.makeUnsafe(activitySince - MTIME_SLACK_MS)),
+        until: DateTime.formatIso(DateTime.makeUnsafe(activityUntil + MTIME_SLACK_MS)),
+      })
+      .pipe(
+        Effect.mapError(
+          (cause) =>
+            new UsageReadError({
+              reason: "scanFailed",
+              detail: "OpenCode reported usage could not be read.",
+              cause,
+            }),
+        ),
+      );
+
     const aggregator = new UsageAggregator({
       timeZone: input.timeZone,
       sinceDay: input.sinceDay,
@@ -618,6 +641,45 @@ export const make = Effect.gen(function* () {
         message: files === null ? "No transcript directory on this environment." : null,
       });
     }
+
+    const openCodeSessions = new Set<string>();
+    for (const activity of openCodeCosts) {
+      const timestampMs = Date.parse(activity.createdAt);
+      if (!Number.isFinite(timestampMs)) continue;
+      const sessionId = activity.providerSessionId ?? activity.threadId;
+      const contributed = aggregator.add({
+        provider: "opencode",
+        timestampMs,
+        model: activity.model,
+        sessionId,
+        totals: {
+          uncachedInputTokens: 0,
+          cachedInputTokens: 0,
+          cacheCreationTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+        },
+        reportedCostUsd: activity.totalCostUsd,
+        dedupeKey: `opencode:${activity.threadId}:${activity.turnId}`,
+      });
+      if (contributed && sessionId.length > 0) openCodeSessions.add(sessionId);
+    }
+    sources.push({
+      fingerprint: {
+        hostId,
+        provider: "opencode",
+        resolvedHomePath: config.dbPath,
+        volumeId: "",
+      },
+      status: "ok",
+      scannedFiles: 0,
+      skippedFiles: 0,
+      malformedRecords: 0,
+      distinctSessions: openCodeSessions.size,
+      message: null,
+      description:
+        "OpenCode costs are reported for T3 Code turns with complete main-agent step data, without token totals. Excludes turns with subagents or incomplete cost data, subscription spend, and turns run outside T3 Code.",
+    });
 
     const pruned = pruneScanCache(fileCache, retentionCutoffMs);
     if (pruned > 0) cacheDirty = true;

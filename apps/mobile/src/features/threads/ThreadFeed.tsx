@@ -44,6 +44,18 @@ import {
 import { CHAT_LIST_ANCHOR_OFFSET, resolveChatListAnchoredEndSpace } from "@t3tools/shared/chatList";
 import { imageMimeType } from "@t3tools/shared/image";
 import { videoMimeType } from "@t3tools/shared/video";
+
+const REPORTED_COST_FORMAT = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 6,
+});
+
+function formatReportedCost(value: number): string {
+  if (value > 0 && value < 0.000001) return "<$0.000001";
+  return REPORTED_COST_FORMAT.format(value);
+}
 import { SymbolView, type AppSymbolName } from "../../components/AppSymbol";
 import { HeaderHeightContext } from "@react-navigation/elements";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
@@ -257,6 +269,8 @@ export interface ThreadFeedProps {
   readonly contentPresentation: ThreadContentPresentation;
   readonly agentLabel: string;
   readonly latestTurn: ThreadFeedLatestTurn | null;
+  readonly reportedCostByTurn: ReadonlyMap<TurnId, number>;
+  readonly reportedThreadCostUsd: number | null;
   readonly activeWorkStartedAt: string | null;
   readonly listRef: RefObject<LegendListRef | null>;
   readonly freeze: SharedValue<boolean>;
@@ -1359,6 +1373,7 @@ function renderFeedEntry(
     | "skills"
     | "dispatchingMessageId"
     | "onEditPendingMessage"
+    | "reportedCostByTurn"
   > & {
     readonly copiedRowId: string | null;
     readonly expandedWorkRows: Record<string, boolean>;
@@ -1535,6 +1550,9 @@ function renderFeedEntry(
       props.terminalAssistantMessageIds.has(message.id) &&
       !assistantTurnStillInProgress &&
       !message.streaming;
+    const reportedTurnCost = message.turnId
+      ? props.reportedCostByTurn.get(message.turnId)
+      : undefined;
 
     if (isUser) {
       const referenceIds = new Set(
@@ -1742,6 +1760,14 @@ function renderFeedEntry(
             <Text className="font-t3-medium text-xs tabular-nums text-foreground-secondary">
               {timestampLabel}
             </Text>
+            {reportedTurnCost !== undefined ? (
+              <Text
+                accessibilityLabel={`Reported turn cost: ${formatReportedCost(reportedTurnCost)}`}
+                className="font-t3-medium text-xs tabular-nums text-foreground-secondary"
+              >
+                · Reported turn cost: {formatReportedCost(reportedTurnCost)}
+              </Text>
+            ) : null}
           </View>
         ) : null}
       </Animated.View>
@@ -2752,6 +2778,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         <ThreadMediaVisibility>
           {renderFeedEntry(info, {
             environmentId: props.environmentId,
+            reportedCostByTurn: props.reportedCostByTurn,
             dispatchingMessageId: props.dispatchingMessageId,
             onEditPendingMessage: props.onEditPendingMessage,
             copiedRowId,
@@ -2826,6 +2853,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       onToggleWorkGroup,
       onToggleWorkRow,
       props.environmentId,
+      props.reportedCostByTurn,
       props.onUseArtifactTemplate,
       props.skills,
       renderMarkdownImage,
@@ -2972,6 +3000,14 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
             ListHeaderComponent={
               <>
                 {usesNativeAutomaticInsets ? null : <View style={{ height: topContentInset }} />}
+                {props.reportedThreadCostUsd !== null ? (
+                  <View className="items-center py-3">
+                    <Text className="font-t3-medium text-xs tabular-nums text-foreground-secondary">
+                      Reported costs (available turns):{" "}
+                      {formatReportedCost(props.reportedThreadCostUsd)}
+                    </Text>
+                  </View>
+                ) : null}
                 {setupAnchorIndex < 0 && props.worktreeSetup ? (
                   <WorktreeSetupCard key={props.threadId} {...props.worktreeSetup} />
                 ) : null}

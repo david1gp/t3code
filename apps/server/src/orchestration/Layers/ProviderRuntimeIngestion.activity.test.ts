@@ -3,6 +3,7 @@ import {
   ProviderDriverKind,
   RuntimeTaskId,
   ThreadId,
+  TurnId,
   type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
@@ -82,6 +83,52 @@ describe("runtimeEventToActivities task progress", () => {
     expect(usagePayload).not.toHaveProperty("status");
   });
 });
+
+describe("runtimeEventToActivities reported turn cost", () => {
+  const completed = (totalCostUsd?: number) =>
+    ({
+      ...base,
+      provider: ProviderDriverKind.make("opencode"),
+      type: "turn.completed",
+      eventId: EventId.make(`evt-cost-${String(totalCostUsd)}`),
+      turnId: TurnId.make("turn-1"),
+      payload: {
+        state: "completed",
+        costModel: "provider/model-at-turn",
+        costSessionId: "session-at-turn",
+        ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
+      },
+    }) satisfies ProviderRuntimeEvent;
+
+  it("persists a reported zero as a turn activity and omits a missing amount", () => {
+    const zeroCost = runtimeEventToActivities(completed(0));
+    const missingCost = runtimeEventToActivities(completed());
+
+    expect(zeroCost).toHaveLength(1);
+    expect(zeroCost[0]).toMatchObject({
+      kind: "usage.cost",
+      turnId: "turn-1",
+      payload: {
+        totalCostUsd: 0,
+        model: "provider/model-at-turn",
+        providerSessionId: "session-at-turn",
+      },
+    });
+    expect(missingCost).toEqual([]);
+  });
+
+  it("does not persist invalid reported amounts", () => {
+    expect(runtimeEventToActivities(completed(-1))).toEqual([]);
+    expect(runtimeEventToActivities(completed(Number.NaN))).toEqual([]);
+  });
+
+  it("does not create an OpenCode usage activity for another provider's completion", () => {
+    expect(
+      runtimeEventToActivities({ ...completed(1), provider: ProviderDriverKind.make("claude") }),
+    ).toEqual([]);
+  });
+});
+
 describe("runtimeEventToActivities tool streaming persistence", () => {
   const accumulatedStdout = [
     "first line of output",

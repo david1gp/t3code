@@ -45,6 +45,24 @@ export const GetLatestProjectionThreadTaskActivityInput = Schema.Struct({
   threadId: ThreadId,
   taskId: Schema.String,
 });
+
+export const ListProjectionUsageCostActivitiesInput = Schema.Struct({
+  since: IsoDateTime,
+  until: IsoDateTime,
+});
+export type ListProjectionUsageCostActivitiesInput =
+  typeof ListProjectionUsageCostActivitiesInput.Type;
+
+export const ProjectionUsageCostActivity = Schema.Struct({
+  threadId: ThreadId,
+  turnId: TurnId,
+  providerName: Schema.String,
+  providerSessionId: Schema.NullOr(Schema.String),
+  model: Schema.String,
+  createdAt: IsoDateTime,
+  totalCostUsd: Schema.Finite,
+});
+export type ProjectionUsageCostActivity = typeof ProjectionUsageCostActivity.Type;
 export type GetLatestProjectionThreadTaskActivityInput =
   typeof GetLatestProjectionThreadTaskActivityInput.Type;
 
@@ -76,6 +94,11 @@ export interface ProjectionThreadActivityRepositoryShape {
   readonly listByThreadId: (
     input: ListProjectionThreadActivitiesInput,
   ) => Effect.Effect<ReadonlyArray<ProjectionThreadActivity>, ProjectionRepositoryError>;
+
+  /** Read the latest valid reported cost per OpenCode turn in an instant window. */
+  readonly listUsageCostActivities: (
+    input: ListProjectionUsageCostActivitiesInput,
+  ) => Effect.Effect<ReadonlyArray<ProjectionUsageCostActivity>, ProjectionRepositoryError>;
 
   /**
    * List activity rows used to derive pending user-input state.

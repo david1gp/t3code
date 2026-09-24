@@ -89,6 +89,7 @@ describe("buildPeriodColumns", () => {
       { provider: "codex", value: 10 },
       { provider: "claude", value: 20 },
       { provider: "grok", value: 0 },
+      { provider: "opencode", value: 0 },
     ]);
   });
 
@@ -101,13 +102,25 @@ describe("buildPeriodColumns", () => {
 });
 
 describe("providersWithUsage", () => {
-  it("omits providers with no cost or tokens", () => {
+  it("omits providers with no records", () => {
     expect(
       providersWithUsage([
-        { provider: "codex", costUsd: 0, totalTokens: 0 },
-        { provider: "claude", costUsd: 0, totalTokens: 200 },
+        { provider: "codex", costUsd: 0, totalTokens: 0, records: 0 },
+        { provider: "claude", costUsd: 0, totalTokens: 200, records: 1 },
       ]),
     ).toEqual(["claude"]);
+  });
+
+  it("includes OpenCode when it reports cost without token totals", () => {
+    expect(
+      providersWithUsage([{ provider: "opencode", costUsd: 0.25, totalTokens: 0, records: 1 }]),
+    ).toEqual(["opencode"]);
+  });
+
+  it("includes a reported OpenCode zero cost without claiming it is missing", () => {
+    expect(
+      providersWithUsage([{ provider: "opencode", costUsd: 0, totalTokens: 0, records: 1 }]),
+    ).toEqual(["opencode"]);
   });
 });
 

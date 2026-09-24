@@ -335,7 +335,9 @@ type OpenCodeTextPartState = Pick<OpenCodeTextPart, "id" | "messageID" | "type" 
   completed: boolean;
 };
 
-type OpenCodeStepUsage = Pick<Extract<Part, { readonly type: "step-finish" }>, "id" | "tokens">;
+type OpenCodeStepUsage = Pick<Extract<Part, { readonly type: "step-finish" }>, "id" | "tokens"> & {
+  readonly cost: number;
+};
 
 interface OpenCodeSessionContext {
   session: ProviderSession;
@@ -391,6 +393,8 @@ interface OpenCodeSessionContext {
 
 interface OpenCodeTurnTokenUsageAccumulator {
   readonly partIds: Set<string>;
+  readonly costPartIds: Set<string>;
+  costIncomplete: boolean;
   readonly promptMessageIds: Set<string>;
   readonly assistantOwnershipByMessageId: Map<string, "owned" | "other" | "unknown">;
   // Native removal does not undo usage. Keep unresolved counts until this turn settles.
@@ -400,6 +404,7 @@ interface OpenCodeTurnTokenUsageAccumulator {
   cacheCreationTokens: number;
   outputTokens: number;
   reasoningTokens: number;
+  totalCostUsd: number | undefined;
   complete: boolean;
   hasSubagents: boolean;
 }
@@ -407,6 +412,8 @@ interface OpenCodeTurnTokenUsageAccumulator {
 function makeOpenCodeTurnTokenUsageAccumulator(): OpenCodeTurnTokenUsageAccumulator {
   return {
     partIds: new Set(),
+    costPartIds: new Set(),
+    costIncomplete: false,
     promptMessageIds: new Set(),
     assistantOwnershipByMessageId: new Map(),
     unresolvedStepsByMessageId: new Map(),
@@ -415,6 +422,7 @@ function makeOpenCodeTurnTokenUsageAccumulator(): OpenCodeTurnTokenUsageAccumula
     cacheCreationTokens: 0,
     outputTokens: 0,
     reasoningTokens: 0,
+    totalCostUsd: undefined,
     complete: true,
     hasSubagents: false,
   };
@@ -431,6 +439,40 @@ function accumulateOpenCodeStepUsage(
   accumulator.cacheCreationTokens += part.tokens.cache.write;
   accumulator.outputTokens += part.tokens.output + part.tokens.reasoning;
   accumulator.reasoningTokens += part.tokens.reasoning;
+}
+
+function accumulateOpenCodeStepCost(
+  accumulator: OpenCodeTurnTokenUsageAccumulator,
+  part: OpenCodeStepUsage,
+): void {
+  if (accumulator.costPartIds.has(part.id)) return;
+  if (!Number.isFinite(part.cost) || part.cost < 0) {
+    accumulator.costIncomplete = true;
+    return;
+  }
+  const nextCost = (accumulator.totalCostUsd ?? 0) + part.cost;
+  if (!Number.isFinite(nextCost)) {
+    accumulator.costIncomplete = true;
+    return;
+  }
+  accumulator.costPartIds.add(part.id);
+  accumulator.totalCostUsd = nextCost;
+}
+
+function takeOpenCodeTurnCostUsd(context: OpenCodeSessionContext): number | undefined {
+  const usage = context.turnTokenUsage;
+  if (!usage) return undefined;
+  const totalCostUsd =
+    usage.costIncomplete ||
+    !usage.complete ||
+    usage.hasSubagents ||
+    usage.unresolvedStepsByMessageId.size > 0
+      ? undefined
+      : usage.totalCostUsd;
+  usage.totalCostUsd = undefined;
+  usage.costIncomplete = false;
+  usage.costPartIds.clear();
+  return totalCostUsd;
 }
 
 function takeOpenCodeTurnTokenUsage(
@@ -1206,6 +1248,7 @@ export function makeOpenCodeAdapter(
       ) {
         context.pendingIdleReconciliation = undefined;
       }
+      const totalCostUsd = takeOpenCodeTurnCostUsd(context);
       const tokenUsage = takeOpenCodeTurnTokenUsage(context, true);
       context.activeTurnId = undefined;
       context.activeAgent = undefined;
@@ -1237,6 +1280,13 @@ export function makeOpenCodeAdapter(
         payload: {
           state: "completed",
           tokenUsage,
+          ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
+          ...(totalCostUsd !== undefined
+            ? {
+                costModel: context.session.model,
+                costSessionId: context.openCodeSessionId,
+              }
+            : {}),
         },
       });
     });
@@ -1374,6 +1424,7 @@ export function makeOpenCodeAdapter(
         deleteContextIfCurrent(context);
         return;
       }
+      const totalCostUsd = takeOpenCodeTurnCostUsd(context);
       const tokenUsage = takeOpenCodeTurnTokenUsage(context, false);
       context.promptAdmission = undefined;
       context.activeTurnId = undefined;
@@ -1397,6 +1448,13 @@ export function makeOpenCodeAdapter(
           state: "failed",
           errorMessage: detail,
           tokenUsage,
+          ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
+          ...(totalCostUsd !== undefined
+            ? {
+                costModel: context.session.model,
+                costSessionId: context.openCodeSessionId,
+              }
+            : {}),
         },
       });
       yield* emit({
@@ -1599,6 +1657,7 @@ export function makeOpenCodeAdapter(
         hasSubagents: false,
       };
       if (context.activeTurnId === turnId) {
+        takeOpenCodeTurnCostUsd(context);
         tokenUsage = takeOpenCodeTurnTokenUsage(context, false);
         context.activeTurnId = undefined;
         context.activeAgent = undefined;
@@ -2473,6 +2532,7 @@ export function makeOpenCodeAdapter(
                 if (ownership === "owned" && steps) {
                   for (const step of steps.values()) {
                     accumulateOpenCodeStepUsage(usage, step);
+                    accumulateOpenCodeStepCost(usage, step);
                   }
                 }
                 usage.unresolvedStepsByMessageId.delete(event.properties.info.id);
@@ -2551,6 +2611,7 @@ export function makeOpenCodeAdapter(
             const ownership = usage.assistantOwnershipByMessageId.get(part.messageID);
             if (ownership === "owned") {
               accumulateOpenCodeStepUsage(usage, part);
+              accumulateOpenCodeStepCost(usage, part);
             } else if (
               ownership === "unknown" ||
               (ownership === undefined &&
@@ -2559,7 +2620,7 @@ export function makeOpenCodeAdapter(
               const steps =
                 usage.unresolvedStepsByMessageId.get(part.messageID) ??
                 new Map<string, OpenCodeStepUsage>();
-              steps.set(part.id, { id: part.id, tokens: part.tokens });
+              steps.set(part.id, { id: part.id, tokens: part.tokens, cost: part.cost });
               usage.unresolvedStepsByMessageId.set(part.messageID, steps);
             }
           }
@@ -2767,6 +2828,7 @@ export function makeOpenCodeAdapter(
             terminalCancellation.turnSettled = true;
             terminalCancellation.acknowledged = true;
           }
+          const totalCostUsd = activeTurnId ? takeOpenCodeTurnCostUsd(context) : undefined;
           const tokenUsage = activeTurnId ? takeOpenCodeTurnTokenUsage(context, false) : undefined;
           context.activeTurnId = undefined;
           context.activeAgent = undefined;
@@ -2793,6 +2855,13 @@ export function makeOpenCodeAdapter(
                 state: "failed",
                 errorMessage: message,
                 tokenUsage,
+                ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
+                ...(totalCostUsd !== undefined
+                  ? {
+                      costModel: context.session.model,
+                      costSessionId: context.openCodeSessionId,
+                    }
+                  : {}),
               },
             });
           }
@@ -3471,6 +3540,7 @@ export function makeOpenCodeAdapter(
                         }
                         return;
                       }
+                      takeOpenCodeTurnCostUsd(context);
                       const tokenUsage = takeOpenCodeTurnTokenUsage(context, false);
                       context.promptAdmission = undefined;
                       context.activeTurnId = undefined;
@@ -3519,6 +3589,7 @@ export function makeOpenCodeAdapter(
                       });
                       return;
                     }
+                    takeOpenCodeTurnCostUsd(context);
                     const tokenUsage = takeOpenCodeTurnTokenUsage(context, false);
                     context.promptAdmission = undefined;
                     context.activeTurnId = undefined;

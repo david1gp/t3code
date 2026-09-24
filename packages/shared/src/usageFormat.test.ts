@@ -6,8 +6,17 @@ import {
   formatDateTimeShort,
   formatHourShort,
   formatRelativeHourShort,
+  formatUsd,
   makeWindow,
 } from "./usageFormat.ts";
+
+describe("usage cost formatting", () => {
+  it("does not display small positive reported amounts as zero", () => {
+    expect(formatUsd(0)).toBe("$0.00");
+    expect(formatUsd(0.000123)).toBe("$0.000123");
+    expect(formatUsd(0.0000001)).toBe("<$0.000001");
+  });
+});
 
 describe("hourly usage formatting", () => {
   it("keeps requested zones separate when formatting repeated calls", () => {

@@ -2824,7 +2824,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         messageID: "assistant-step-usage-1",
         type: "step-finish",
         reason: "tool-calls",
-        cost: 0,
+        cost: 0.1,
         tokens: {
           input: 100,
           output: 20,
@@ -2868,6 +2868,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           part: {
             ...stepPart,
             id: "step-usage-2",
+            cost: 0.25,
             tokens: {
               input: 50,
               output: 10,
@@ -2896,6 +2897,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           part: {
             ...stepPart,
             id: "step-usage-unresolved",
+            cost: 0.5,
             messageID: "assistant-step-usage-without-parent",
             tokens: {
               input: 1_000,
@@ -2914,6 +2916,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           part: {
             ...stepPart,
             id: "step-usage-recovered",
+            cost: 0.4,
             messageID: "assistant-step-usage-recovered",
             tokens: {
               input: 30,
@@ -2970,6 +2973,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const completed = yield* Fiber.join(completedFiber).pipe(Effect.timeout("1 second"));
       NodeAssert.equal(completed._tag, "Some");
       if (completed._tag === "Some" && completed.value.type === "turn.completed") {
+        NodeAssert.equal(completed.value.payload.totalCostUsd, undefined);
         NodeAssert.deepStrictEqual(completed.value.payload.tokenUsage, {
           usageStatus: "partial",
           usageScope: "main_agent",
@@ -3458,7 +3462,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
             messageID: "assistant-token-late-first",
             type: "step-finish",
             reason: "stop",
-            cost: 0,
+            cost: 0.9,
             tokens: {
               input: 1_000,
               output: 1_000,
@@ -3479,7 +3483,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
             messageID: "assistant-token-late-second",
             type: "step-finish",
             reason: "stop",
-            cost: 0,
+            cost: 0.25,
             tokens: {
               input: 40,
               output: 10,
@@ -3504,6 +3508,8 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const secondCompleted = terminals.find((event) => event.type === "turn.completed");
       NodeAssert.equal(secondCompleted?.type, "turn.completed");
       if (secondCompleted?.type === "turn.completed") {
+        NodeAssert.equal(secondCompleted.payload.totalCostUsd, 0.25);
+        NodeAssert.equal(secondCompleted.payload.costModel, "opencode/kimi-k3");
         NodeAssert.deepStrictEqual(secondCompleted.payload.tokenUsage, {
           usageStatus: "complete",
           usageScope: "main_agent",

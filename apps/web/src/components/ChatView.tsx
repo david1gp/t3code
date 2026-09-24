@@ -350,6 +350,7 @@ import {
   threadHasOlderTurns,
 } from "@t3tools/client-runtime/state/threads";
 import { resolveProviderSkillsForCwd } from "@t3tools/client-runtime/providerSkills";
+import { deriveReportedThreadCosts, formatReportedCostUsd } from "../lib/reportedThreadCosts";
 import { vcsEnvironment } from "../state/vcs";
 import { sourceControlEnvironment } from "../state/sourceControl";
 import { useProjectClone } from "../state/projectClones";
@@ -2887,6 +2888,10 @@ export default function ChatView(props: ChatViewProps) {
     ],
   );
   const selectedProvider = selectedProviderEntry?.driverKind ?? requestedDriverKind;
+  const reportedThreadCosts = useMemo(
+    () => deriveReportedThreadCosts(activeThread?.activities ?? EMPTY_ACTIVITIES),
+    [activeThread?.activities],
+  );
   const activeProviderInstanceId = selectedProviderEntry?.instanceId ?? null;
   const activeProviderStatus = selectedProviderEntry?.snapshot ?? null;
   const { enabled: interactionModeEnabled, interactionMode } = resolveComposerInteractionMode({
@@ -9892,6 +9897,12 @@ export default function ChatView(props: ChatViewProps) {
             </div>
             {/* Messages Wrapper */}
             <div className="relative flex min-h-0 flex-1 flex-col bg-background">
+              {reportedThreadCosts.totalUsd !== null ? (
+                <div className="flex shrink-0 justify-end px-4 pt-2 text-xs text-muted-foreground">
+                  Reported costs (available turns):{" "}
+                  {formatReportedCostUsd(reportedThreadCosts.totalUsd)}
+                </div>
+              ) : null}
               {/* Messages — LegendList handles virtualization and scrolling internally */}
               <MessagesTimeline
                 citationRequest={paintOnlyDisplayedTimeline ? null : citationRequest}
@@ -9914,6 +9925,7 @@ export default function ChatView(props: ChatViewProps) {
                 {...(onOpenWorktreeSetupTerminal ? { onOpenWorktreeSetupTerminal } : {})}
                 listRef={legendListRef}
                 timelineEntries={displayedTimeline.entries}
+                reportedTurnCosts={reportedThreadCosts.byTurnId}
                 latestTurn={paintOnlyDisplayedTimeline ? null : activeLatestTurn}
                 runningTurnId={paintOnlyDisplayedTimeline ? null : activeRunningTurnId}
                 turnDiffSummaries={

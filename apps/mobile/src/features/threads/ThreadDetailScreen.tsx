@@ -19,6 +19,7 @@ import type {
   EnvironmentId,
   MessageId,
   ModelSelection,
+  OrchestrationThreadActivity,
   OrchestrationThreadShell,
   ProviderApprovalDecision,
   ProviderInteractionMode,
@@ -108,6 +109,7 @@ import {
   ThreadComposer,
 } from "./ThreadComposer";
 import { ThreadFeed } from "./ThreadFeed";
+import { threadReportedCosts } from "../../lib/threadReportedCosts";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { resolveThreadFeedSubmissionAnchor } from "./thread-feed-live-follow";
 
@@ -122,6 +124,7 @@ export interface ThreadDetailScreenProps {
   readonly feedbackSubmissions: ReadonlyArray<CodexFeedbackSubmission>;
   readonly onDismissFeedback: (id: MessageId) => void;
   readonly selectedThreadFeed: ReadonlyArray<ThreadFeedEntry>;
+  readonly threadActivities: ReadonlyArray<OrchestrationThreadActivity>;
   readonly activeWorkStartedAt: string | null;
   readonly isCompacting: boolean;
   /**
@@ -681,6 +684,10 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
       : { width: undefined, right: 0 },
   );
   const selectedInstanceId = props.selectedThread.modelSelection.instanceId;
+  const reportedCosts = useMemo(
+    () => threadReportedCosts(props.threadActivities),
+    [props.threadActivities],
+  );
   useStreamingHaptics(props.selectedThread.id, props.selectedThreadFeed);
   const selectedProviderSkills = useMemo(() => {
     const provider = props.serverConfig?.providers.find(
@@ -917,6 +924,8 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               contentPresentation={props.contentPresentation}
               agentLabel={agentLabel}
               latestTurn={props.selectedThread.latestTurn}
+              reportedCostByTurn={reportedCosts.byTurnId}
+              reportedThreadCostUsd={reportedCosts.totalUsd}
               activeWorkStartedAt={props.activeWorkStartedAt}
               listRef={listRef}
               freeze={freeze}

@@ -246,6 +246,7 @@ import { cn } from "~/lib/utils";
 import { useUiStateStore } from "~/uiStateStore";
 import { type TimestampFormat } from "@t3tools/contracts/settings";
 import { formatChatTimestampTooltip, formatDayAwareTimestamp } from "../../timestampFormat";
+import { formatReportedCostUsd } from "../../lib/reportedThreadCosts";
 
 import { SkillChipIcon, SkillInlineText } from "./SkillInlineText";
 import { deriveAgentSpawnSummary } from "./agentSpawnSummary";
@@ -266,6 +267,7 @@ import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
 
 interface TimelineRowSharedState {
   citationRequest: AssistantCitationTarget | null;
+  reportedTurnCosts: ReadonlyMap<TurnId, number>;
   listRef: React.RefObject<LegendListRef | null>;
   timestampFormat: TimestampFormat;
   routeThreadKey: string;
@@ -367,6 +369,7 @@ function TimelineListFooter({ composerInset }: { readonly composerInset: number 
   );
 }
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
+const EMPTY_REPORTED_TURN_COSTS: ReadonlyMap<TurnId, number> = new Map();
 const TIMELINE_MAINTAIN_SCROLL_AT_END = {
   animated: false,
   on: {
@@ -411,6 +414,7 @@ interface MessagesTimelineProps {
   onOpenWorktreeSetupTerminal?: (terminalId: string) => void;
   listRef: React.RefObject<LegendListRef | null>;
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
+  reportedTurnCosts?: ReadonlyMap<TurnId, number>;
   latestTurn: TimelineLatestTurn | null;
   runningTurnId: TurnId | null;
   turnDiffSummaries: ReadonlyArray<TurnDiffSummary>;
@@ -485,6 +489,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onOpenAgents = NOOP_OPEN_AGENTS,
   listRef,
   timelineEntries,
+  reportedTurnCosts = EMPTY_REPORTED_TURN_COSTS,
   latestTurn,
   runningTurnId,
   turnDiffSummaries,
@@ -1126,6 +1131,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const sharedState = useMemo<TimelineRowSharedState>(
     () => ({
       citationRequest: readyCitationRequest,
+      reportedTurnCosts,
       listRef,
       timestampFormat,
       routeThreadKey,
@@ -1162,6 +1168,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     }),
     [
       readyCitationRequest,
+      reportedTurnCosts,
       listRef,
       timestampFormat,
       routeThreadKey,
@@ -2387,6 +2394,9 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
             message={row.message}
             showCopyButton={row.showAssistantCopyButton}
             copyStreaming={row.assistantCopyStreaming}
+            reportedCostUsd={
+              row.message.turnId ? ctx.reportedTurnCosts.get(row.message.turnId) : undefined
+            }
           />
         ) : null}
       </div>
@@ -2399,6 +2409,7 @@ function AssistantMetaTimelineRow({
 }: {
   row: Extract<TimelineRow, { kind: "assistant-meta" }>;
 }) {
+  const ctx = use(TimelineRowCtx);
   return (
     <div className="px-1">
       <AssistantMessageMeta
@@ -2407,6 +2418,9 @@ function AssistantMetaTimelineRow({
         showCopyButton={row.showAssistantCopyButton}
         copyStreaming={row.assistantCopyStreaming}
         alwaysVisible
+        reportedCostUsd={
+          row.message.turnId ? ctx.reportedTurnCosts.get(row.message.turnId) : undefined
+        }
       />
     </div>
   );
@@ -2417,12 +2431,14 @@ function AssistantMessageMeta({
   message,
   showCopyButton,
   copyStreaming,
+  reportedCostUsd,
   alwaysVisible = false,
 }: {
   className?: string;
   message: ChatMessage;
   showCopyButton: boolean;
   copyStreaming: boolean;
+  reportedCostUsd?: number | undefined;
   alwaysVisible?: boolean;
 }) {
   const ctx = use(TimelineRowCtx);
@@ -2431,7 +2447,7 @@ function AssistantMessageMeta({
     <div
       className={cn(
         "flex items-center gap-2 text-xs tabular-nums transition-opacity duration-200",
-        alwaysVisible
+        alwaysVisible || reportedCostUsd !== undefined
           ? "opacity-100"
           : "opacity-0 pointer-coarse:opacity-100 focus-within:opacity-100 group-hover/assistant:opacity-100",
         className,
@@ -2452,6 +2468,11 @@ function AssistantMessageMeta({
           </TooltipPopup>
         </Tooltip>
       )}
+      {reportedCostUsd !== undefined ? (
+        <span className="text-muted-foreground text-xs tabular-nums">
+          Reported cost: {formatReportedCostUsd(reportedCostUsd)}
+        </span>
+      ) : null}
     </div>
   );
 }

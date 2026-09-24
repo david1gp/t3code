@@ -12,6 +12,8 @@ import {
   EnvironmentId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ThreadId,
+  TurnId,
   UsageDay,
   type UsageSummaryInput,
 } from "@t3tools/contracts";
@@ -22,6 +24,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Scheduler from "effect/Scheduler";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
@@ -29,6 +32,10 @@ import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import {
+  ProjectionThreadActivityRepository,
+  type ProjectionUsageCostActivity,
+} from "../persistence/Services/ProjectionThreadActivities.ts";
 import * as UsageService from "./UsageService.ts";
 
 const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -82,6 +89,7 @@ const serviceLayers = (input: {
   /** Defaults to an unparsable document so every scan retries the fetch. */
   readonly ratesDocument?: unknown;
   readonly environment?: NodeJS.ProcessEnv;
+  readonly usageCostActivities?: readonly ProjectionUsageCostActivity[];
 }) =>
   ServerConfig.layerTest(process.cwd(), { prefix: input.prefix }).pipe(
     Layer.provideMerge(NodeServices.layer),
@@ -105,6 +113,19 @@ const serviceLayers = (input: {
         ...input.environment,
       }),
     ),
+    Layer.provideMerge(
+      Layer.succeed(
+        ProjectionThreadActivityRepository,
+        ProjectionThreadActivityRepository.of({
+          upsert: () => Effect.void,
+          listByThreadId: () => Effect.succeed([]),
+          listUsageCostActivities: () => Effect.succeed(input.usageCostActivities ?? []),
+          listUserInputLifecycleByThreadId: () => Effect.succeed([]),
+          getLatestTaskActivity: () => Effect.succeed(Option.none()),
+          deleteByThreadId: () => Effect.void,
+        }),
+      ),
+    ),
   );
 
 function totalOutputTokens(summary: { buckets: readonly { totals: { outputTokens: number } }[] }) {
@@ -112,6 +133,67 @@ function totalOutputTokens(summary: { buckets: readonly { totals: { outputTokens
 }
 
 describe("UsageService", () => {
+  it.live(
+    "merges T3-recorded OpenCode reported costs into timezone buckets and source diagnostics",
+    () =>
+      Effect.gen(function* () {
+        const { settings, home } = yield* setup;
+        const service = yield* UsageService.make.pipe(
+          Effect.provide(
+            serviceLayers({
+              prefix: "usage-service-opencode-test",
+              home,
+              settings,
+              usageCostActivities: [
+                {
+                  threadId: ThreadId.make("thread-usage"),
+                  turnId: TurnId.make("turn-usage"),
+                  providerName: "opencode",
+                  providerSessionId: "session-usage",
+                  model: "open-code-model",
+                  createdAt: "2026-08-07T04:05:00.000Z",
+                  totalCostUsd: 0,
+                },
+              ],
+            }),
+          ),
+        );
+        const summary = yield* service.readSummary({
+          ...WINDOW,
+          timeZone: "America/Los_Angeles",
+          sinceDay: UsageDay.make("2026-08-06"),
+          untilDay: UsageDay.make("2026-08-06"),
+        });
+
+        assert.deepStrictEqual(summary.buckets, [
+          {
+            day: UsageDay.make("2026-08-06"),
+            provider: "opencode",
+            model: "open-code-model",
+            totals: {
+              uncachedInputTokens: 0,
+              cachedInputTokens: 0,
+              cacheCreationTokens: 0,
+              outputTokens: 0,
+              reasoningTokens: 0,
+            },
+            costUsd: 0,
+            cacheSavingsUsd: 0,
+            costSource: "providerReported",
+            records: 1,
+            unpricedRecords: 0,
+            sessions: 1,
+          },
+        ]);
+        const source = summary.sources.find(
+          (candidate) => candidate.fingerprint.provider === "opencode",
+        );
+        assert.strictEqual(source?.distinctSessions, 1);
+        assert.match(source?.description ?? "", /T3 Code turns/);
+        assert.strictEqual(source?.status, "ok");
+      }).pipe(Effect.scoped),
+  );
+
   it.live("reads configured and disabled accounts once across shared and aliased homes", () =>
     Effect.gen(function* () {
       const { transcript, settings, home } = yield* setup;
@@ -217,7 +299,7 @@ describe("UsageService", () => {
       assert.deepStrictEqual(removed.buckets, summary.buckets);
 
       const sources = summary.sources.filter((source) => source.status === "ok");
-      assert.strictEqual(sources.length, 4);
+      assert.strictEqual(sources.length, 5);
       assert.strictEqual(
         sources.reduce((sum, source) => sum + source.scannedFiles, 0),
         4,

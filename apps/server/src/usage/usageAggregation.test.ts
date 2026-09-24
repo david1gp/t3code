@@ -172,6 +172,34 @@ describe("UsageAggregator", () => {
     expect(result.buckets[0]?.costSource).toBe("providerReported");
   });
 
+  it("keeps reported OpenCode zero cost distinct from absent pricing and counts its session", () => {
+    const result = aggregate([
+      record({
+        provider: "opencode",
+        model: "model-with-known-rates",
+        totals: {
+          uncachedInputTokens: 0,
+          cachedInputTokens: 0,
+          cacheCreationTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+        },
+        reportedCostUsd: 0,
+        dedupeKey: "opencode:thread:turn",
+      }),
+    ]);
+
+    expect(result.buckets).toHaveLength(1);
+    expect(result.buckets[0]).toMatchObject({
+      provider: "opencode",
+      costUsd: 0,
+      costSource: "providerReported",
+      records: 1,
+      sessions: 1,
+      unpricedRecords: 0,
+    });
+  });
+
   it("drops records outside the window", () => {
     const result = aggregate([record({ timestampMs: Date.parse("2026-07-01T12:00:00Z") })]);
 

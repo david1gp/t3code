@@ -13,8 +13,10 @@ import {
   DeleteProjectionThreadActivitiesInput,
   ListProjectionThreadActivitiesInput,
   GetLatestProjectionThreadTaskActivityInput,
+  ListProjectionUsageCostActivitiesInput,
   ProjectionThreadActivity,
   ProjectionThreadActivityRepository,
+  ProjectionUsageCostActivity,
   type ProjectionThreadActivityRepositoryShape,
 } from "../Services/ProjectionThreadActivities.ts";
 
@@ -125,6 +127,52 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
       `,
   });
 
+  const listProjectionUsageCostActivityRows = SqlSchema.findAll({
+    Request: ListProjectionUsageCostActivitiesInput,
+    Result: ProjectionUsageCostActivity,
+    execute: ({ since, until }) => sql`
+      WITH ranked_costs AS (
+        SELECT
+          activity.thread_id AS "threadId",
+          activity.turn_id AS "turnId",
+          'opencode' AS "providerName",
+          CASE WHEN json_valid(activity.payload_json) THEN
+            CASE WHEN json_type(activity.payload_json, '$.providerSessionId') = 'text'
+              THEN json_extract(activity.payload_json, '$.providerSessionId') END END AS "providerSessionId",
+          CASE WHEN json_valid(activity.payload_json) THEN
+            CASE WHEN json_type(activity.payload_json, '$.model') = 'text'
+              THEN json_extract(activity.payload_json, '$.model') END END AS model,
+          activity.created_at AS "createdAt",
+          CASE WHEN json_valid(activity.payload_json)
+            THEN json_extract(activity.payload_json, '$.totalCostUsd') END AS "totalCostUsd",
+          ROW_NUMBER() OVER (
+            PARTITION BY activity.thread_id, activity.turn_id
+            ORDER BY activity.sequence DESC, activity.created_at DESC, activity.activity_id DESC
+          ) AS turn_rank
+        FROM projection_thread_activities AS activity
+        WHERE activity.kind = 'usage.cost'
+          AND activity.turn_id IS NOT NULL
+          AND activity.created_at >= ${since}
+          AND json_valid(activity.payload_json)
+          AND CASE WHEN json_valid(activity.payload_json)
+            THEN json_type(activity.payload_json, '$.model') = 'text'
+            ELSE 0 END
+          AND CASE WHEN json_valid(activity.payload_json)
+            THEN json_type(activity.payload_json, '$.totalCostUsd') IN ('integer', 'real')
+            ELSE 0 END
+          AND CASE WHEN json_valid(activity.payload_json)
+            THEN json_extract(activity.payload_json, '$.totalCostUsd') >= 0
+              AND json_extract(activity.payload_json, '$.totalCostUsd') < 1e300
+            ELSE 0 END
+      )
+      SELECT "threadId", "turnId", "providerName", "providerSessionId", model,
+        "createdAt", "totalCostUsd"
+      FROM ranked_costs
+      WHERE turn_rank = 1 AND "createdAt" < ${until} AND model <> ''
+      ORDER BY "createdAt", "threadId", "turnId"
+    `,
+  });
+
   const listUserInputLifecycleActivityRows = SqlSchema.findAll({
     Request: ListProjectionThreadActivitiesInput,
     Result: ProjectionThreadActivityDbRowSchema,
@@ -219,6 +267,17 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
       Effect.map((rows) => rows.map(toProjectionThreadActivity)),
     );
 
+  const listUsageCostActivities: ProjectionThreadActivityRepositoryShape["listUsageCostActivities"] =
+    (input) =>
+      listProjectionUsageCostActivityRows(input).pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionThreadActivityRepository.listUsageCostActivities:query",
+            "ProjectionThreadActivityRepository.listUsageCostActivities:decodeRows",
+          ),
+        ),
+      );
+
   const listUserInputLifecycleByThreadId: ProjectionThreadActivityRepositoryShape["listUserInputLifecycleByThreadId"] =
     (input) =>
       listUserInputLifecycleActivityRows(input).pipe(
@@ -254,6 +313,7 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
   return {
     upsert,
     listByThreadId,
+    listUsageCostActivities,
     listUserInputLifecycleByThreadId,
     getLatestTaskActivity,
     deleteByThreadId,

@@ -166,7 +166,7 @@ export class UsageAggregator {
       record.model,
       record.totals,
       record.reportedCostUsd,
-      this.#options.priceOverrides,
+      record.provider === "opencode" ? undefined : this.#options.priceOverrides,
     );
 
     bucket.totals = addTotals(bucket.totals, record.totals);
