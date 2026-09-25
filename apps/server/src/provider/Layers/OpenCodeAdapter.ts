@@ -488,6 +488,7 @@ interface OpenCodeSessionContext {
 type OpenCodeChildSessionInfo = {
   readonly id: string;
   readonly parentID?: string;
+  readonly directory?: string;
   readonly title?: string;
   readonly agent?: string;
   readonly model?: { readonly id?: string; readonly providerID?: string };
@@ -2417,9 +2418,15 @@ export function makeOpenCodeAdapter(
     const childTaskLinkage = (context: OpenCodeSessionContext, sessionId: string) => {
       const info = context.childSessionInfoById.get(sessionId);
       const parentId = context.childParentBySessionId.get(sessionId);
+      const serverUrl = new URL(context.server.url);
+      const directory = info?.directory ?? context.directory;
+      const encodedDirectory = Buffer.from(directory, "utf8").toString("base64url");
+      const sessionPath = `${encodedDirectory}/session/${encodeURIComponent(sessionId)}`;
+      serverUrl.pathname = `${serverUrl.pathname.replace(/\/+$/, "")}/${sessionPath}`;
       return {
         taskType: "subagent",
         agentKind: "agent" as const,
+        runHandles: { sessionUrl: serverUrl.toString() },
         ...(info?.title ? { title: info.title } : {}),
         ...(info?.agent ? { role: info.agent } : {}),
         ...(info?.model?.id

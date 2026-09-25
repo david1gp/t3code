@@ -21,13 +21,15 @@ import {
   formatSubagentTokenCount,
 } from "@t3tools/client-runtime/state/subagentRuntime";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import { Bot, Braces, Check, ChevronDown, ChevronRight, X } from "lucide-react";
+import { Bot, Braces, Check, ChevronDown, ChevronRight, ExternalLink, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { cn } from "~/lib/utils";
+import { readLocalApi } from "~/localApi";
 import { orchestrationEnvironment } from "~/state/orchestration";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { Button } from "~/components/ui/button";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 
 /**
  * In-flight states all present as Working (one steady state, per the
@@ -153,6 +155,14 @@ function AgentRow({ agent }: { agent: RuntimeSubagent }) {
     agent.usage?.toolUses !== undefined ? `${agent.usage.toolUses} tools` : null,
     agent.activationCount > 1 ? `run ${agent.activationCount}` : null,
   ].filter((value): value is string => value !== null);
+  const sessionUrl = agent.runHandles?.sessionUrl;
+  // Claude workflows can also carry session URLs; only OpenCode child URLs use this route.
+  const linkLabel =
+    sessionUrl &&
+    agent.kind === "subagent" &&
+    /\/[A-Za-z0-9_-]+\/session\/[^/]+$/.test(new URL(sessionUrl).pathname)
+      ? "Open in OpenCode"
+      : "Open agent session";
 
   return (
     <div className="grid h-[3.875rem] grid-cols-[0.375rem_minmax(0,1fr)_auto] grid-rows-[1.25rem_1.125rem_1rem] items-center gap-x-2 rounded-md px-1.5 py-1">
@@ -175,9 +185,29 @@ function AgentRow({ agent }: { agent: RuntimeSubagent }) {
           ) : null}
         </span>
       </span>
+      {sessionUrl ? (
+        <span className="col-start-3 row-start-2 justify-self-end">
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  size="icon-tiny"
+                  variant="ghost-muted"
+                  aria-label={linkLabel}
+                  onClick={() => void readLocalApi()?.shell.openExternal(sessionUrl)}
+                />
+              }
+            >
+              <ExternalLink aria-hidden className="size-3" />
+            </TooltipTrigger>
+            <TooltipPopup>{linkLabel}</TooltipPopup>
+          </Tooltip>
+        </span>
+      ) : null}
       <span
         className={cn(
-          "col-start-2 col-end-4 row-start-2 block truncate text-xs",
+          "col-start-2 row-start-2 block truncate text-xs",
+          !sessionUrl && "col-end-4",
           agent.status === "failed" ? "text-destructive-foreground" : "text-muted-foreground",
         )}
       >

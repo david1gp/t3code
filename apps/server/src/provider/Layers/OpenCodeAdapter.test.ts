@@ -2859,6 +2859,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
             info: {
               id: "ses_nested_child",
               parentID: "ses_late_child",
+              directory: "/workspace/子/📁",
               title: "Nested child",
               agent: "explorer",
               model: { id: "model-nested", providerID: "provider-child" },
@@ -3023,6 +3024,10 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         if (childStart?.type === "task.started") {
           NodeAssert.equal(childStart.payload.parentAgentId, undefined);
           NodeAssert.equal(childStart.turnId, turn.turnId);
+          NodeAssert.equal(
+            childStart.payload.runHandles?.sessionUrl,
+            `http://127.0.0.1:9999/${Buffer.from(process.cwd(), "utf8").toString("base64url")}/session/ses_late_child`,
+          );
         }
         const metadataProgress = events.find(
           (event) =>
@@ -3044,6 +3049,10 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         if (nestedStart?.type === "task.started") {
           NodeAssert.equal(nestedStart.payload.parentAgentId, "ses_late_child");
           NodeAssert.equal(nestedStart.turnId, turn.turnId);
+          NodeAssert.equal(
+            nestedStart.payload.runHandles?.sessionUrl,
+            `http://127.0.0.1:9999/${Buffer.from("/workspace/子/📁", "utf8").toString("base64url")}/session/ses_nested_child`,
+          );
         }
         const toolProgress = events.find((event) => event.type === "tool.progress");
         NodeAssert.equal(toolProgress?.type, "tool.progress");
