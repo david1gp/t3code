@@ -221,6 +221,43 @@ describe("foldSubagentActivities", () => {
     expect(agents[0]!.usage).toEqual({ totalTokens: 900, inputTokens: 700 });
   });
 
+  it("normalizes optional cumulative cost and max-merges without inventing unavailable values", () => {
+    const agents = fold([
+      activity("task.started", { taskId: "cost-agent", taskType: "local_agent" }),
+      activity("task.progress", {
+        taskId: "cost-agent",
+        typedUsage: { totalTokens: 100, costUsd: 0.12 },
+      }),
+      activity("task.progress", {
+        taskId: "cost-agent",
+        typedUsage: { totalTokens: 120, costUsd: 0.08 },
+      }),
+      activity("task.progress", {
+        taskId: "cost-agent",
+        typedUsage: { totalTokens: 140, costUsd: Number.NaN },
+      }),
+      activity("task.completed", {
+        taskId: "cost-agent",
+        status: "completed",
+        typedUsage: { totalTokens: 140 },
+      }),
+    ]);
+
+    expect(agents[0]!.usage).toEqual({ totalTokens: 140, costUsd: 0.12 });
+  });
+
+  it("leaves absent or invalid cost unavailable", () => {
+    const agents = fold([
+      activity("task.started", { taskId: "no-cost-agent", taskType: "local_agent" }),
+      activity("task.progress", {
+        taskId: "no-cost-agent",
+        typedUsage: { totalTokens: 10, costUsd: -1 },
+      }),
+    ]);
+
+    expect(agents[0]!.usage).toEqual({ totalTokens: 10 });
+  });
+
   it("usage snapshots enrich an existing agent without changing its status", () => {
     const [agent] = fold([
       activity("task.started", { taskId: "usage-waiting", taskType: "local_agent" }),

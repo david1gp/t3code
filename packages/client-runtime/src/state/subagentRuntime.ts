@@ -37,6 +37,7 @@ export interface SubagentUsage {
   readonly reasoningOutputTokens?: number;
   readonly toolUses?: number;
   readonly durationMs?: number;
+  readonly costUsd?: number;
 }
 
 export interface SubagentActivityEntry {
@@ -163,6 +164,7 @@ function asUsage(value: unknown): SubagentUsage | undefined {
     reasoningOutputTokens?: number;
     toolUses?: number;
     durationMs?: number;
+    costUsd?: number;
   } = { totalTokens };
   const inputTokens = asCount(record.inputTokens);
   if (inputTokens !== undefined) usage.inputTokens = inputTokens;
@@ -176,6 +178,8 @@ function asUsage(value: unknown): SubagentUsage | undefined {
   if (toolUses !== undefined) usage.toolUses = toolUses;
   const durationMs = asCount(record.durationMs);
   if (durationMs !== undefined) usage.durationMs = durationMs;
+  const costUsd = asCount(record.costUsd);
+  if (costUsd !== undefined) usage.costUsd = costUsd;
   return usage;
 }
 
@@ -209,6 +213,7 @@ function mergeUsageMax(
     reasoningOutputTokens?: number;
     toolUses?: number;
     durationMs?: number;
+    costUsd?: number;
   } = { totalTokens: Math.max(current.totalTokens, incoming.totalTokens) };
   const inputTokens = pick(current.inputTokens, incoming.inputTokens);
   if (inputTokens !== undefined) merged.inputTokens = inputTokens;
@@ -222,6 +227,8 @@ function mergeUsageMax(
   if (toolUses !== undefined) merged.toolUses = toolUses;
   const durationMs = pick(current.durationMs, incoming.durationMs);
   if (durationMs !== undefined) merged.durationMs = durationMs;
+  const costUsd = pick(current.costUsd, incoming.costUsd);
+  if (costUsd !== undefined) merged.costUsd = costUsd;
   return merged;
 }
 
