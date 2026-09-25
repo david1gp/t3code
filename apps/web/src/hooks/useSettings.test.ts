@@ -45,6 +45,105 @@ describe("client settings hydration", () => {
   const onboardingCompletedAt = "2026-09-05T12:00:00.000Z";
   const complete = (current: ClientSettings) => ({ ...current, onboardingCompletedAt });
 
+  it("keeps the saved meter opt-in when changing and reloading the display mode", async () => {
+    let storedSettings: ClientSettings = {
+      ...DEFAULT_CLIENT_SETTINGS,
+      contextWindowMeterEnabled: true,
+    };
+    persistenceMocks.getClientSettings.mockImplementation(async () => storedSettings);
+    persistenceMocks.setClientSettings.mockImplementation(async (settings) => {
+      storedSettings = settings;
+    });
+
+    await ensureClientSettingsHydrated();
+    expect(getClientSettings().contextWindowDisplayMode).toBe("detailed");
+    await persistClientSettingsPatch({ contextWindowDisplayMode: "simple" });
+    expect(storedSettings.contextWindowMeterEnabled).toBe(true);
+    expect(storedSettings.contextWindowDisplayMode).toBe("simple");
+
+    __resetClientSettingsPersistenceForTests();
+    await ensureClientSettingsHydrated();
+    expect(getClientSettings().contextWindowMeterEnabled).toBe(true);
+    expect(getClientSettings().contextWindowDisplayMode).toBe("simple");
+  });
+
+  it("does not write a migration when persisted settings are absent", async () => {
+    await ensureClientSettingsHydrated();
+
+    expect(getClientSettings().legacySidebarEnabled).toBe(false);
+    expect(persistenceMocks.setClientSettings).not.toHaveBeenCalled();
+  });
+
+  it("does not migrate an explicit legacy-sidebar opt-out", async () => {
+    persistenceMocks.getClientSettings.mockResolvedValue({
+      ...DEFAULT_CLIENT_SETTINGS,
+      legacySidebarEnabled: false,
+      sidebarGroupThreadsByProject: false,
+    });
+
+    await ensureClientSettingsHydrated();
+
+    expect(getClientSettings().sidebarGroupThreadsByProject).toBe(false);
+    expect(persistenceMocks.setClientSettings).not.toHaveBeenCalled();
+  });
+
+  it("migrates a legacy opt-in once and preserves a later grouping disable", async () => {
+    let storedSettings: ClientSettings = {
+      ...DEFAULT_CLIENT_SETTINGS,
+      legacySidebarEnabled: true,
+      sidebarGroupThreadsByProject: false,
+      timestampFormat: "12-hour",
+    };
+    persistenceMocks.getClientSettings.mockImplementation(async () => storedSettings);
+    persistenceMocks.setClientSettings.mockImplementation(async (settings) => {
+      storedSettings = settings;
+    });
+
+    await ensureClientSettingsHydrated();
+
+    expect(storedSettings).toMatchObject({
+      legacySidebarEnabled: false,
+      sidebarGroupThreadsByProject: true,
+      timestampFormat: "12-hour",
+    });
+    expect(persistenceMocks.setClientSettings).toHaveBeenCalledExactlyOnceWith(storedSettings);
+
+    __resetClientSettingsPersistenceForTests();
+    await ensureClientSettingsHydrated();
+    expect(persistenceMocks.setClientSettings).toHaveBeenCalledOnce();
+
+    await persistClientSettingsPatch({ sidebarGroupThreadsByProject: false });
+    expect(storedSettings.legacySidebarEnabled).toBe(false);
+    expect(storedSettings.sidebarGroupThreadsByProject).toBe(false);
+
+    __resetClientSettingsPersistenceForTests();
+    await ensureClientSettingsHydrated();
+    expect(getClientSettings().sidebarGroupThreadsByProject).toBe(false);
+    expect(persistenceMocks.setClientSettings).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not publish an unpersisted migration and retries after a failed write", async () => {
+    const failure = new Error("storage unavailable");
+    const persisted = {
+      ...DEFAULT_CLIENT_SETTINGS,
+      legacySidebarEnabled: true,
+      sidebarGroupThreadsByProject: false,
+    };
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    persistenceMocks.getClientSettings.mockResolvedValue(persisted);
+    persistenceMocks.setClientSettings.mockRejectedValueOnce(failure);
+
+    await expect(ensureClientSettingsHydrated()).rejects.toBe(failure);
+    expect(getClientSettings()).toBe(DEFAULT_CLIENT_SETTINGS);
+
+    await ensureClientSettingsHydrated();
+    expect(getClientSettings()).toMatchObject({
+      legacySidebarEnabled: false,
+      sidebarGroupThreadsByProject: true,
+    });
+    expect(persistenceMocks.setClientSettings).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects completion after a failed read and preserves saved preferences on retry", async () => {
     const failure = new Error("storage unavailable");
     vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -160,6 +259,26 @@ describe("client settings hydration", () => {
 });
 
 describe("persistClientSettingsPatch", () => {
+  it("defaults sidebar shortcuts on and persists their visibility independently", async () => {
+    expect(DEFAULT_CLIENT_SETTINGS.sidebarShowPullRequests).toBe(true);
+    expect(DEFAULT_CLIENT_SETTINGS.sidebarShowUsage).toBe(true);
+    __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
+
+    await persistClientSettingsPatch({ sidebarShowPullRequests: false });
+    const hiddenPullRequests = getClientSettings();
+
+    expect(hiddenPullRequests.sidebarShowPullRequests).toBe(false);
+    expect(hiddenPullRequests.sidebarShowUsage).toBe(true);
+    expect(persistenceMocks.setClientSettings).toHaveBeenLastCalledWith(hiddenPullRequests);
+
+    await persistClientSettingsPatch({ sidebarShowUsage: false });
+    const hiddenUsage = getClientSettings();
+
+    expect(hiddenUsage.sidebarShowPullRequests).toBe(false);
+    expect(hiddenUsage.sidebarShowUsage).toBe(false);
+    expect(persistenceMocks.setClientSettings).toHaveBeenLastCalledWith(hiddenUsage);
+  });
+
   it("waits for settings writes in request order", async () => {
     __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
     let finishFirst!: () => void;

@@ -43,10 +43,17 @@ import {
   type ScopedThreadRef,
   type ThreadId,
 } from "@t3tools/contracts";
-import type { TimestampFormat } from "@t3tools/contracts/settings";
+import {
+  MAX_SIDEBAR_THREAD_PREVIEW_COUNT,
+  MIN_SIDEBAR_THREAD_PREVIEW_COUNT,
+  type SidebarThreadPreviewCount,
+  type SidebarThreadSortOrder,
+  type TimestampFormat,
+} from "@t3tools/contracts/settings";
 import {
   AlarmClockIcon,
   AlarmClockOffIcon,
+  ArrowUpDownIcon,
   CheckIcon,
   ChevronDownIcon,
   CircleAlertIcon,
@@ -206,6 +213,7 @@ import {
 import { SidebarDragLifecycle, SidebarPointerSensor } from "./Sidebar.pointer";
 import { createSidebarListMotion } from "./Sidebar.motion";
 import { sidebarGroupedListsCreate } from "./Sidebar.grouped";
+import { sidebarGroupedActiveSort } from "./sidebarGroupedActiveSort";
 import { sidebarGroupedDropResolve } from "./sidebarGroupedDropResolve";
 import { sidebarGroupedDragId } from "./sidebarGroupedDragId";
 import { sidebarGroupedProjectCollisionDetect } from "./sidebarGroupedProjectCollisionDetect";
@@ -247,7 +255,24 @@ import {
 import { SidebarContent, SidebarGroup, useSidebar } from "./ui/sidebar";
 import { SidebarChromeFooter, SidebarChromeHeader } from "./sidebar/SidebarChrome";
 import { SidebarHeaderIconButton, SidebarThreadHeader } from "./sidebar/SidebarThreadHeader";
-import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuShortcut, MenuTrigger } from "./ui/menu";
+import {
+  Menu,
+  MenuGroup,
+  MenuItem,
+  MenuPopup,
+  MenuRadioGroup,
+  MenuRadioItem,
+  MenuSeparator,
+  MenuShortcut,
+  MenuTrigger,
+} from "./ui/menu";
+import {
+  NumberField,
+  NumberFieldDecrement,
+  NumberFieldGroup,
+  NumberFieldIncrement,
+  NumberFieldInput,
+} from "./ui/number-field";
 import { Tooltip, TooltipPopup, TooltipProvider, TooltipTrigger } from "./ui/tooltip";
 import { MiddleTruncate } from "./ui/middle-truncate";
 import {
@@ -2226,11 +2251,16 @@ export default function Sidebar() {
   const confirmThreadDelete = useClientSettings((s) => s.confirmThreadDelete);
   const confirmThreadArchive = useClientSettings((s) => s.confirmThreadArchive);
   const sidebarProjectSortOrder = useClientSettings((s) => s.sidebarProjectSortOrder);
+  const sidebarThreadSortOrder = useClientSettings((s) => s.sidebarThreadSortOrder);
+  const sidebarThreadPreviewCount = useClientSettings((s) => s.sidebarThreadPreviewCount);
   const groupThreadsByProject = useClientSettings((s) => s.sidebarGroupThreadsByProject);
   const showProviderLogos = useClientSettings((s) => s.sidebarShowProviderLogos);
   const showBranchLabels = useClientSettings((s) => s.sidebarShowBranchLabels);
   const timestampFormat = useClientSettings((s) => s.timestampFormat);
   const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
+  const [expandedGroupedThreads, setExpandedGroupedThreads] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const {
     settleThread,
     unsettleThread,
@@ -2856,9 +2886,11 @@ export default function Sidebar() {
         ? sidebarGroupedListsCreate({
             groups: projectGroups,
             scopeKey: scopedProjectGroup === null ? null : projectScopeKey,
+            previewLimit: sidebarThreadPreviewCount,
+            expandedPreviewProjects: expandedGroupedThreads,
             sections: {
               pinned: pinnedThreads,
-              active: activeThreads,
+              active: sidebarGroupedActiveSort(activeThreads, sidebarThreadSortOrder),
               snoozed: visibleSnoozedThreads,
               settled: renderedSettledThreads,
             },
@@ -2867,6 +2899,9 @@ export default function Sidebar() {
         : [],
     [
       groupThreadsByProject,
+      sidebarThreadSortOrder,
+      sidebarThreadPreviewCount,
+      expandedGroupedThreads,
       projectGroups,
       projectScopeKey,
       scopedProjectGroup,
@@ -3600,7 +3635,7 @@ export default function Sidebar() {
     const owners = new Map<string, { projectKey: string; keys: ReadonlySet<string> }>();
     for (const group of groupedLists) {
       const keys = new Set(
-        group.items.map((item) =>
+        group.dragItems.map((item) =>
           sidebarGroupedDragId(
             item.kind === "thread" ? "thread" : "marker",
             group.project.projectKey,
@@ -3608,7 +3643,7 @@ export default function Sidebar() {
           ),
         ),
       );
-      for (const item of group.items) {
+      for (const item of group.dragItems) {
         if (item.kind === "thread")
           owners.set(sidebarGroupedDragId("thread", group.project.projectKey, item.key), {
             projectKey: group.project.projectKey,
@@ -4697,6 +4732,70 @@ export default function Sidebar() {
             <SidebarThreadHeader
               searchFieldRef={headerSearchRef}
               hasProjects={projectGroups.length > 0}
+              sidebarOptions={
+                <Menu>
+                  <MenuTrigger
+                    render={
+                      <SidebarHeaderIconButton label="Sidebar options">
+                        <ArrowUpDownIcon />
+                      </SidebarHeaderIconButton>
+                    }
+                  />
+                  <MenuPopup align="end" side="bottom">
+                    <MenuGroup>
+                      <div className="px-2 py-1 text-xs font-medium text-muted-foreground">
+                        Sort threads
+                      </div>
+                      <MenuRadioGroup
+                        value={sidebarThreadSortOrder}
+                        onValueChange={(value) =>
+                          updateClientSettings({
+                            sidebarThreadSortOrder: value as SidebarThreadSortOrder,
+                          })
+                        }
+                      >
+                        <MenuRadioItem value="updated_at">Last user message</MenuRadioItem>
+                        <MenuRadioItem value="created_at">Created at</MenuRadioItem>
+                      </MenuRadioGroup>
+                    </MenuGroup>
+                    <MenuGroup>
+                      <div className="px-2 pt-2 pb-1 text-xs font-medium text-muted-foreground">
+                        Visible threads per project
+                      </div>
+                      <div className="px-2 py-1">
+                        <NumberField
+                          aria-label="Visible thread count"
+                          className="w-28"
+                          max={MAX_SIDEBAR_THREAD_PREVIEW_COUNT}
+                          min={MIN_SIDEBAR_THREAD_PREVIEW_COUNT}
+                          onValueChange={(value) => {
+                            if (value === null) return;
+                            const count = Math.min(
+                              MAX_SIDEBAR_THREAD_PREVIEW_COUNT,
+                              Math.max(MIN_SIDEBAR_THREAD_PREVIEW_COUNT, value),
+                            ) as SidebarThreadPreviewCount;
+                            if (count !== sidebarThreadPreviewCount) {
+                              updateClientSettings({ sidebarThreadPreviewCount: count });
+                            }
+                          }}
+                          size="sm"
+                          step={1}
+                          value={sidebarThreadPreviewCount}
+                        >
+                          <NumberFieldGroup>
+                            <NumberFieldDecrement aria-label="Decrease visible thread count" />
+                            <NumberFieldInput
+                              inputMode="numeric"
+                              onKeyDownCapture={(event) => event.stopPropagation()}
+                            />
+                            <NumberFieldIncrement aria-label="Increase visible thread count" />
+                          </NumberFieldGroup>
+                        </NumberField>
+                      </div>
+                    </MenuGroup>
+                  </MenuPopup>
+                </Menu>
+              }
               projectScope={
                 <Combobox
                   items={projectScopeItems}
@@ -5103,6 +5202,8 @@ export default function Sidebar() {
                       if (groupThreadsByProject) {
                         for (const group of groupedLists) {
                           const project = group.project;
+                          const previewExpanded = expandedGroupedThreads.has(project.projectKey);
+                          const preview = group.preview;
                           const expanded = resolveProjectExpanded(
                             projectExpandedById,
                             groupPreferenceKeys(project),
@@ -5146,7 +5247,7 @@ export default function Sidebar() {
                                 onNavigateToDraft={navigateToDraft}
                               />
                               <SortableContext
-                                items={group.items.flatMap((item) =>
+                                items={group.dragItems.flatMap((item) =>
                                   item.kind === "thread"
                                     ? [sidebarGroupedDragId("thread", project.projectKey, item.key)]
                                     : [],
@@ -5154,7 +5255,7 @@ export default function Sidebar() {
                                 strategy={verticalListSortingStrategy}
                               >
                                 {(["pinned", "active", "snoozed"] as const).map((section) => {
-                                  const list = group.sections[section];
+                                  const list = preview[section];
                                   if (section === "snoozed" && group.totalBySection.snoozed === 0)
                                     return null;
                                   const label =
@@ -5207,6 +5308,25 @@ export default function Sidebar() {
                                     </li>
                                   );
                                 })}
+                                {preview.hasMore ? (
+                                  <li className="list-none">
+                                    <button
+                                      type="button"
+                                      data-thread-selection-safe
+                                      className="w-full cursor-pointer px-2 py-1 text-left text-xs text-sidebar-muted-foreground hover:text-sidebar-foreground"
+                                      onClick={() =>
+                                        setExpandedGroupedThreads((current) => {
+                                          const next = new Set(current);
+                                          if (previewExpanded) next.delete(project.projectKey);
+                                          else next.add(project.projectKey);
+                                          return next;
+                                        })
+                                      }
+                                    >
+                                      {previewExpanded ? "Show less" : "Show more"}
+                                    </button>
+                                  </li>
+                                ) : null}
                                 <ul role="list">
                                   <SidebarGroupedSectionTarget
                                     id={sidebarGroupedDragId(

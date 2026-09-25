@@ -8,6 +8,7 @@ import {
   type ProviderInstanceEntry,
 } from "../../providerInstances";
 import { getTriggerDisplayModelName, type ModelEsque } from "./providerIconUtils";
+import { type ContextWindowSnapshot, formatContextWindowTokens } from "../../lib/contextWindow";
 
 const CLAUDE_RESUME_COMPACTION_MINUTES = 70;
 const CLAUDE_RESUME_COMPACTION_TOKENS = 100_000;
@@ -109,29 +110,18 @@ export function formatContextWindowCompactionMessage(
     : "Context compacts automatically when needed.";
 }
 
-/**
- * Whether the footer should hold the meter's slot before a snapshot exists.
- *
- * The snapshot comes from thread activities, which load after the shell.
- * Reserving the slot while the detail loads, for a started thread, keeps the
- * attach button still until the meter mounts. Once the detail is in, a
- * missing snapshot means there is no usage to show and nothing is reserved.
- *
- * The meter renders from stored activities whatever the provider's state, so
- * only a provider known not to stream usage skips the reservation. An unknown
- * provider (catalog still loading, or the thread's provider disabled) reserves.
- */
-export function shouldReserveContextWindowMeter(input: {
-  readonly meterEnabled: boolean;
-  readonly detailLoading: boolean;
-  readonly threadStarted: boolean;
-  /** `null` while the thread's provider is not in the catalog. */
-  readonly providerReportsContextWindow: boolean | null;
-}): boolean {
-  return (
-    input.meterEnabled &&
-    input.detailLoading &&
-    input.threadStarted &&
-    input.providerReportsContextWindow !== false
-  );
+export function formatContextWindowMeterLabel(
+  usage: ContextWindowSnapshot,
+  displayMode: "simple" | "detailed",
+): string {
+  const used = formatContextWindowTokens(usage.usedTokens);
+  if (displayMode === "simple" || usage.maxTokens == null || usage.usedPercentage === null) {
+    return used;
+  }
+
+  const percentage =
+    usage.usedPercentage < 10
+      ? `${usage.usedPercentage.toFixed(1).replace(/\.0$/, "")}%`
+      : `${Math.round(usage.usedPercentage)}%`;
+  return `${percentage} · ${used}/${formatContextWindowTokens(usage.maxTokens)}`;
 }

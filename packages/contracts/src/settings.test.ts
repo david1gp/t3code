@@ -609,6 +609,15 @@ describe("ClientSettings sidebar", () => {
     expect(decodeClientSettingsPatch(preferences)).toEqual(preferences);
     expect(() => decodeClientSettingsPatch({ sidebarGroupThreadsByProject: "yes" })).toThrow();
   });
+
+  it("preserves each hidden sidebar item preference independently in patches", () => {
+    expect(decodeClientSettingsPatch({ sidebarShowPullRequests: false })).toEqual({
+      sidebarShowPullRequests: false,
+    });
+    expect(decodeClientSettingsPatch({ sidebarShowUsage: false })).toEqual({
+      sidebarShowUsage: false,
+    });
+  });
 });
 
 describe("ClientSettings context window meter", () => {
@@ -619,6 +628,22 @@ describe("ClientSettings context window meter", () => {
     ).toBe(true);
     expect(
       decodeClientSettingsPatch({ contextWindowMeterEnabled: true }).contextWindowMeterEnabled,
+    ).toBe(true);
+  });
+
+  it("defaults display mode to detailed and validates persisted preferences and patches", () => {
+    expect(decodeClientSettings({}).contextWindowDisplayMode).toBe("detailed");
+    for (const contextWindowDisplayMode of ["simple", "detailed"] as const) {
+      expect(decodeClientSettings({ contextWindowDisplayMode }).contextWindowDisplayMode).toBe(
+        contextWindowDisplayMode,
+      );
+      expect(decodeClientSettingsPatch({ contextWindowDisplayMode })).toEqual({
+        contextWindowDisplayMode,
+      });
+    }
+    expect(() => decodeClientSettingsPatch({ contextWindowDisplayMode: "compact" })).toThrow();
+    expect(
+      decodeClientSettings({ contextWindowMeterEnabled: true }).contextWindowMeterEnabled,
     ).toBe(true);
   });
 });

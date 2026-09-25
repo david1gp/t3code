@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { memo, useCallback } from "react";
 import { Link, useCanGoBack, useLocation, useNavigate } from "@tanstack/react-router";
 
-import { useEnvironmentIdentificationMode } from "../../hooks/useSettings";
+import { useClientSettings, useEnvironmentIdentificationMode } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { useEnvironments } from "../../state/environments";
 import { T3Wordmark } from "../T3Wordmark";
@@ -134,6 +134,8 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
   const navigate = useNavigate();
   const canGoBack = useCanGoBack();
   const { isMobile, setOpenMobile } = useSidebar();
+  const showPullRequests = useClientSettings((settings) => settings.sidebarShowPullRequests);
+  const showUsage = useClientSettings((settings) => settings.sidebarShowUsage);
   const currentFooterPage = useLocation({
     select: (location) =>
       /^\/settings(?:\/|$)/.test(location.pathname)
@@ -201,18 +203,20 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
             label="Settings"
             onClick={handleSettingsClick}
           />
-          {pullRequestsSupported ? (
+          {pullRequestsSupported && showPullRequests ? (
             <SidebarUtilityItem
               icon={<PullRequestGlyph.pullRequest />}
               label="Pull Requests"
               onClick={handlePullRequestsClick}
             />
           ) : null}
-          <SidebarUtilityItem
-            icon={<ChartNoAxesColumnIcon />}
-            label="Usage"
-            onClick={handleUsageClick}
-          />
+          {showUsage ? (
+            <SidebarUtilityItem
+              icon={<ChartNoAxesColumnIcon />}
+              label="Usage"
+              onClick={handleUsageClick}
+            />
+          ) : null}
         </>
       )}
       <SidebarUpdatePill />

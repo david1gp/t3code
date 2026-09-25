@@ -2,7 +2,11 @@ import { resolveSidebarDropTarget, type SidebarListItem } from "./Sidebar.logic"
 import { sidebarGroupedDragId } from "./sidebarGroupedDragId";
 
 export function sidebarGroupedDropResolve(input: {
-  groups: readonly { project: { projectKey: string }; items: readonly SidebarListItem[] }[];
+  groups: readonly {
+    project: { projectKey: string };
+    items: readonly SidebarListItem[];
+    dragItems?: readonly SidebarListItem[];
+  }[];
   activeId: string;
   overId: string;
   flatActive?: { key: string; groupKey: string };
@@ -18,6 +22,18 @@ export function sidebarGroupedDropResolve(input: {
         ),
       );
   if (!group) return null;
+  if (
+    group.dragItems &&
+    !group.dragItems.some(
+      (item) =>
+        sidebarGroupedDragId(
+          item.kind === "thread" ? "thread" : "marker",
+          group.project.projectKey,
+          item.kind === "thread" ? item.key : item.marker,
+        ) === input.overId,
+    )
+  )
+    return null;
   const activeKey = input.flatActive
     ? input.flatActive.key
     : group.items.find(

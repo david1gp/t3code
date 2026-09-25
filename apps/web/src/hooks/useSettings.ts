@@ -134,7 +134,21 @@ async function hydrateClientSettings(): Promise<void> {
         return;
       }
       if (persistedSettings) {
-        replaceClientSettingsSnapshot({ ...DEFAULT_CLIENT_SETTINGS, ...persistedSettings });
+        const hydratedSettings = { ...DEFAULT_CLIENT_SETTINGS, ...persistedSettings };
+        if (hydratedSettings.legacySidebarEnabled) {
+          const migratedSettings = {
+            ...hydratedSettings,
+            legacySidebarEnabled: false,
+            sidebarGroupThreadsByProject: true,
+          };
+          await ensureLocalApi().persistence.setClientSettings(migratedSettings);
+          if (hydrationGeneration !== clientSettingsHydrationGeneration) {
+            return;
+          }
+          replaceClientSettingsSnapshot(migratedSettings);
+        } else {
+          replaceClientSettingsSnapshot(hydratedSettings);
+        }
       }
       setClientSettingsHydrationStatus("ready");
     } catch (error) {
@@ -362,21 +376,6 @@ export function useEnvironmentIdentificationMode(): EnvironmentIdentificationMod
     paletteThemeActive: previewSidebarArtwork !== null || activeThemeDefinition !== null,
     paletteThemeAllowsArtwork: previewSidebarArtwork ?? themeAllowsSidebarArtwork(activeTheme),
   });
-}
-
-/**
- * Whether the legacy sidebar (Settings → General → Legacy features) replaces
- * the default one.
- *
- * Held at the default sidebar until client settings hydrate: the pre-hydration
- * snapshot is just the schema defaults, so resolving against it could mount one
- * sidebar and then swap it out once persisted settings land — remounting the
- * whole tree for everyone instead of only for legacy opt-ins.
- */
-export function useLegacySidebarEnabled(): boolean {
-  const settingsHydrated = useClientSettingsHydrated();
-  const legacySidebarEnabled = useClientSettingsValue().legacySidebarEnabled;
-  return settingsHydrated && legacySidebarEnabled;
 }
 
 /** Read current settings for one environment, merged with client-local preferences. */

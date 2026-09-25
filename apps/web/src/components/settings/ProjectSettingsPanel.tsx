@@ -7,10 +7,14 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { AsyncResult } from "effect/unstable/reactivity";
-import { type EnvironmentId, type ProjectIconOverride } from "@t3tools/contracts";
+import {
+  type EnvironmentId,
+  type ProjectIconOverride,
+  type SidebarProjectGroupingMode,
+} from "@t3tools/contracts";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import * as Cause from "effect/Cause";
-import { InfoIcon, Trash2Icon } from "lucide-react";
+import { ClipboardIcon, InfoIcon, Trash2Icon } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useComposerDraftStore } from "../../composerDraftStore";
@@ -43,6 +47,19 @@ import { ProjectActionsSettings } from "./ProjectActionsSettings";
 import { ProjectDefaultsSettings } from "./ProjectDefaultsSettings";
 import { projectGroupTitleNeedsUpdate } from "./ProjectSettingsPanel.logic";
 import { useSettingsProjectGroups } from "./useSettingsProjectGroups";
+import { useClientSettings, useUpdateClientSettings } from "../../hooks/useSettings";
+import {
+  deriveProjectGroupingOverrideKey,
+  selectProjectGroupingSettings,
+} from "../../logicalProject";
+import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
+
+const GROUPING_MODE_LABELS: Record<SidebarProjectGroupingMode, string> = {
+  repository: "By repository",
+  repository_path: "By repository path",
+  separate: "Keep separate",
+};
 
 const ProjectIconPickerDialog = lazy(() =>
   import("./ProjectIconPickerDialog").then((module) => ({
@@ -178,6 +195,20 @@ function ProjectDetail({
   const threads = useThreadShells();
   const updateProject = useAtomCommand(projectEnvironment.update, { reportFailure: false });
   const deleteProject = useAtomCommand(projectEnvironment.delete, { reportFailure: false });
+  const updateSettings = useUpdateClientSettings();
+  const groupingSettings = useClientSettings(selectProjectGroupingSettings);
+  const { copyToClipboard } = useCopyToClipboard<{ path: string }>({
+    onCopy: ({ path }) =>
+      toastManager.add({ type: "success", title: "Path copied", description: path }),
+    onError: (error) =>
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Failed to copy path",
+          description: error instanceof Error ? error.message : "An error occurred.",
+        }),
+      ),
+  });
   const projectNameEditedRef = useRef(false);
 
   const faviconPath = representative.faviconPath ?? null;
@@ -273,6 +304,44 @@ function ProjectDetail({
     [group.memberProjects, updateAllMembers],
   );
 
+  const renameMember = useCallback(
+    async (member: SidebarProjectGroupMember, nextTitle: string) => {
+      const title = nextTitle.trim();
+      if (!title) {
+        toastManager.add({ type: "warning", title: "Project title cannot be empty" });
+        return;
+      }
+      if (title === member.title) return;
+      const result = mapAtomCommandResult(
+        await updateProject({
+          environmentId: member.environmentId,
+          input: { projectId: member.id, title },
+        }),
+        () => undefined,
+      );
+      if (result._tag === "Failure") reportFailure("Failed to rename project", result);
+    },
+    [reportFailure, updateProject],
+  );
+
+  const setMemberGrouping = useCallback(
+    (member: SidebarProjectGroupMember, value: string) => {
+      if (
+        value !== "inherit" &&
+        value !== "repository" &&
+        value !== "repository_path" &&
+        value !== "separate"
+      )
+        return;
+      const key = deriveProjectGroupingOverrideKey(member);
+      const overrides = { ...groupingSettings.sidebarProjectGroupingOverrides };
+      if (value === "inherit") delete overrides[key];
+      else overrides[key] = value;
+      updateSettings({ sidebarProjectGroupingOverrides: overrides });
+    },
+    [groupingSettings.sidebarProjectGroupingOverrides, updateSettings],
+  );
+
   // ----- project icon -----
   const [faviconPickerOpen, setFaviconPickerOpen] = useState(false);
   const [iconPickerOpen, setIconPickerOpen] = useState(false);
@@ -292,8 +361,6 @@ function ProjectDetail({
     },
     [updateAllMembers],
   );
-
-  const hasMultipleCheckouts = group.memberProjects.length > 1;
 
   const removeMembers = useCallback(
     async (members: ReadonlyArray<SidebarProjectGroupMember>) => {
@@ -392,14 +459,80 @@ function ProjectDetail({
           title={member.environmentLabel ?? "Environment"}
           description={member.workspaceRoot}
           control={
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => void removeMembers([member])}
-              aria-label={`Remove checkout ${member.workspaceRoot}`}
-            >
-              Remove
-            </Button>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <Input
+                key={`${member.physicalProjectKey}:${member.title}`}
+                size="sm"
+                className="w-full sm:w-40"
+                aria-label={`Rename checkout ${member.workspaceRoot}`}
+                defaultValue={member.title}
+                onBlur={(event) => void renameMember(member, event.currentTarget.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") event.currentTarget.blur();
+                }}
+              />
+              <Select
+                value={
+                  groupingSettings.sidebarProjectGroupingOverrides?.[
+                    deriveProjectGroupingOverrideKey(member)
+                  ] ?? "inherit"
+                }
+                onValueChange={(value) => {
+                  if (value !== null) setMemberGrouping(member, value);
+                }}
+              >
+                <SelectTrigger
+                  size="sm"
+                  className="w-40"
+                  aria-label={`Grouping rule for ${member.workspaceRoot}`}
+                >
+                  <SelectValue>
+                    {(groupingSettings.sidebarProjectGroupingOverrides?.[
+                      deriveProjectGroupingOverrideKey(member)
+                    ] ?? "inherit") === "inherit"
+                      ? `Use global default (${GROUPING_MODE_LABELS[groupingSettings.sidebarProjectGroupingMode]})`
+                      : GROUPING_MODE_LABELS[
+                          groupingSettings.sidebarProjectGroupingOverrides![
+                            deriveProjectGroupingOverrideKey(member)
+                          ] as SidebarProjectGroupingMode
+                        ]}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectPopup align="end" alignItemWithTrigger={false}>
+                  <SelectItem hideIndicator value="inherit">
+                    Use global default
+                  </SelectItem>
+                  <SelectItem hideIndicator value="repository">
+                    {GROUPING_MODE_LABELS.repository}
+                  </SelectItem>
+                  <SelectItem hideIndicator value="repository_path">
+                    {GROUPING_MODE_LABELS.repository_path}
+                  </SelectItem>
+                  <SelectItem hideIndicator value="separate">
+                    {GROUPING_MODE_LABELS.separate}
+                  </SelectItem>
+                </SelectPopup>
+              </Select>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  copyToClipboard(member.workspaceRoot, { path: member.workspaceRoot })
+                }
+                aria-label={`Copy path ${member.workspaceRoot}`}
+              >
+                <ClipboardIcon />
+                Copy path
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => void removeMembers([member])}
+                aria-label={`Remove checkout ${member.workspaceRoot}`}
+              >
+                Remove
+              </Button>
+            </div>
           }
         />
       ))}
@@ -491,7 +624,7 @@ function ProjectDetail({
         </SettingsSection>
         <ProjectDefaultsSettings category="project" />
         <ProjectActionsSettings />
-        {hasMultipleCheckouts ? checkoutChoices : null}
+        {checkoutChoices}
         <SettingsSection title="Danger">
           <SettingsRow
             title={

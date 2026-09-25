@@ -20,7 +20,7 @@ const usage = deriveLatestContextWindowSnapshot([
     tone: "info",
     kind: "context-window.updated",
     summary: "Context updated",
-    payload: { usedTokens: 100_000, maxTokens: 1_000_000 },
+    payload: { usedTokens: 27_000, maxTokens: 272_000 },
     turnId: TurnId.make("turn-1"),
     createdAt: "2026-08-24T12:00:00.000Z",
   },
@@ -32,23 +32,35 @@ if (!usage) {
 
 describe("ContextWindowMeter", () => {
   it("keeps the hover popover open while the pointer moves to the compact button", () => {
-    const markup = renderToStaticMarkup(<ContextWindowMeter usage={usage} onCompact={() => {}} />);
+    const markup = renderToStaticMarkup(
+      <ContextWindowMeter usage={usage} displayMode="detailed" onCompact={() => {}} />,
+    );
 
     expect(markup).toContain('data-close-delay="150"');
     expect(markup).toContain("Compact context");
   });
 
   it("closes an informational hover popover without delay", () => {
-    const markup = renderToStaticMarkup(<ContextWindowMeter usage={usage} />);
+    const markup = renderToStaticMarkup(<ContextWindowMeter usage={usage} displayMode="simple" />);
 
     expect(markup).toContain('data-close-delay="0"');
+    expect(markup).toContain(">27k<");
     expect(markup).not.toContain("Compact context");
+  });
+
+  it("shows percentage and used/maximum tokens in detailed mode", () => {
+    const markup = renderToStaticMarkup(
+      <ContextWindowMeter usage={usage} displayMode="detailed" />,
+    );
+
+    expect(markup).toContain(">9.9% · 27k/272k<");
   });
 
   it("shows the unavailable explanation instead of the compact action", () => {
     const markup = renderToStaticMarkup(
       <ContextWindowMeter
         usage={usage}
+        displayMode="detailed"
         onCompact={() => {}}
         compactDisabled
         compactDisabledReason="Send or clear your draft before compacting"

@@ -437,6 +437,9 @@ export const ClientSettingsSchema = Schema.Struct({
   // Legacy context window meter. The composer hides it by default; users who
   // still want the old usage indicator can restore it from Settings.
   contextWindowMeterEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  contextWindowDisplayMode: Schema.Literals(["simple", "detailed"]).pipe(
+    Schema.withDecodingDefault(Effect.succeed("detailed")),
+  ),
   // Desktop resting composer: scrolling an existing thread's conversation
   // settles the composer into its single-line layout. Losing focus never does.
   composerCollapseOnScroll: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
@@ -450,10 +453,8 @@ export const ClientSettingsSchema = Schema.Struct({
   ),
   proactivePanelsEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   showSkillsInSlashMenu: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
-  // Legacy sidebar (the original per-project tree). Deliberately a fresh key
-  // (was `sidebarV2Enabled` + `sidebarV2ConfiguredByUser`): decoding drops the
-  // old keys, so everyone, including prior beta opt-outs, resets to the new
-  // default sidebar.
+  // Retained only to migrate existing persisted opt-ins during client-settings
+  // hydration. The web client clears it after migrating to thread grouping.
   legacySidebarEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   sidebarProjectGroupingMode: SidebarProjectGroupingMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_SIDEBAR_PROJECT_GROUPING_MODE)),
@@ -473,6 +474,8 @@ export const ClientSettingsSchema = Schema.Struct({
   ),
   sidebarShowProviderLogos: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   sidebarShowBranchLabels: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  sidebarShowPullRequests: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  sidebarShowUsage: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   sidebarThreadPreviewCount: SidebarThreadPreviewCount.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_SIDEBAR_THREAD_PREVIEW_COUNT)),
   ),
@@ -1627,6 +1630,7 @@ export const ClientSettingsPatch = Schema.Struct({
   ),
   planModeEnabled: Schema.optionalKey(Schema.Boolean),
   contextWindowMeterEnabled: Schema.optionalKey(Schema.Boolean),
+  contextWindowDisplayMode: Schema.optionalKey(Schema.Literals(["simple", "detailed"])),
   composerCollapseOnScroll: Schema.optionalKey(Schema.Boolean),
   composerRichTextEnabled: Schema.optionalKey(Schema.Boolean),
   sendShortcut: Schema.optionalKey(Schema.Literals(["enter", "mod-enter-multiline", "mod-enter"])),
@@ -1643,6 +1647,8 @@ export const ClientSettingsPatch = Schema.Struct({
   sidebarGroupThreadsByProject: Schema.optionalKey(Schema.Boolean),
   sidebarShowProviderLogos: Schema.optionalKey(Schema.Boolean),
   sidebarShowBranchLabels: Schema.optionalKey(Schema.Boolean),
+  sidebarShowPullRequests: Schema.optionalKey(Schema.Boolean),
+  sidebarShowUsage: Schema.optionalKey(Schema.Boolean),
   sidebarThreadPreviewCount: Schema.optionalKey(SidebarThreadPreviewCount),
   timestampFormat: Schema.optionalKey(TimestampFormat),
   snapShotEnabled: Schema.optionalKey(Schema.Boolean),

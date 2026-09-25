@@ -1,14 +1,54 @@
-import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@t3tools/contracts";
+import {
+  EventId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  TurnId,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import { deriveProviderInstanceEntries } from "../../providerInstances";
+import { deriveLatestContextWindowSnapshot } from "../../lib/contextWindow";
 import {
   formatContextWindowCompactionMessage,
+  formatContextWindowMeterLabel,
   hasAvailableCompactionProvider,
   hasDismissedResumeCompaction,
   resolveContextWindowModelDisplayName,
   shouldOfferResumeCompaction,
-  shouldReserveContextWindowMeter,
 } from "./ContextWindowMeter.logic";
+
+const contextWindow = deriveLatestContextWindowSnapshot([
+  {
+    id: EventId.make("context-window-usage-test"),
+    tone: "info",
+    kind: "context-window.updated",
+    summary: "Context updated",
+    payload: { usedTokens: 27_000, maxTokens: 272_000 },
+    turnId: TurnId.make("context-window-usage-turn"),
+    createdAt: "2026-09-25T00:00:00.000Z",
+  },
+]);
+
+if (!contextWindow) throw new Error("Expected context window test snapshot.");
+
+describe("formatContextWindowMeterLabel", () => {
+  it("formats simple token usage", () => {
+    expect(formatContextWindowMeterLabel(contextWindow, "simple")).toBe("27k");
+  });
+
+  it("formats detailed percentage and used/maximum tokens", () => {
+    expect(formatContextWindowMeterLabel(contextWindow, "detailed")).toBe("9.9% · 27k/272k");
+  });
+
+  it("shows used tokens when the context limit is unavailable", () => {
+    expect(
+      formatContextWindowMeterLabel(
+        { ...contextWindow, maxTokens: null, usedPercentage: null },
+        "detailed",
+      ),
+    ).toBe("27k");
+  });
+});
 
 function claudeProvider(input: {
   instanceId: string;
@@ -235,54 +275,5 @@ describe("hasDismissedResumeCompaction", () => {
         { kind: "user-input.resolved", payload: { answers: ["Don't ask again"] } },
       ]),
     ).toBe(false);
-  });
-});
-
-describe("shouldReserveContextWindowMeter", () => {
-  const loadingStartedThread = {
-    meterEnabled: true,
-    detailLoading: true,
-    threadStarted: true,
-    providerReportsContextWindow: true,
-  };
-
-  it("holds the meter's slot while a started thread's detail loads", () => {
-    expect(shouldReserveContextWindowMeter(loadingStartedThread)).toBe(true);
-  });
-
-  it("reserves nothing once the detail is in", () => {
-    expect(shouldReserveContextWindowMeter({ ...loadingStartedThread, detailLoading: false })).toBe(
-      false,
-    );
-  });
-
-  it("reserves nothing for a thread that never ran a turn", () => {
-    expect(shouldReserveContextWindowMeter({ ...loadingStartedThread, threadStarted: false })).toBe(
-      false,
-    );
-  });
-
-  it("reserves while the thread's provider is not in the catalog yet", () => {
-    expect(
-      shouldReserveContextWindowMeter({
-        ...loadingStartedThread,
-        providerReportsContextWindow: null,
-      }),
-    ).toBe(true);
-  });
-
-  it("reserves nothing for a provider that does not stream usage", () => {
-    expect(
-      shouldReserveContextWindowMeter({
-        ...loadingStartedThread,
-        providerReportsContextWindow: false,
-      }),
-    ).toBe(false);
-  });
-
-  it("reserves nothing while the meter is switched off", () => {
-    expect(shouldReserveContextWindowMeter({ ...loadingStartedThread, meterEnabled: false })).toBe(
-      false,
-    );
   });
 });

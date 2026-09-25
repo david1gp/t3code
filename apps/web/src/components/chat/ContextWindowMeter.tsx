@@ -1,7 +1,10 @@
 import { Button } from "../ui/button";
 import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
-import { formatContextWindowCompactionMessage } from "./ContextWindowMeter.logic";
+import {
+  formatContextWindowCompactionMessage,
+  formatContextWindowMeterLabel,
+} from "./ContextWindowMeter.logic";
 import { Minimize2Icon } from "lucide-react";
 import { composerFloatingLayerProps } from "./composerEventScope";
 
@@ -21,13 +24,19 @@ export function ContextWindowMeter(props: {
   onCompact?: (() => void) | undefined;
   compactDisabled?: boolean | undefined;
   compactDisabledReason?: string | null | undefined;
+  displayMode: "simple" | "detailed";
 }) {
-  const { usage, modelDisplayName, onCompact, compactDisabled, compactDisabledReason } = props;
+  const {
+    usage,
+    modelDisplayName,
+    onCompact,
+    compactDisabled,
+    compactDisabledReason,
+    displayMode,
+  } = props;
   const usedPercentage = formatPercentage(usage.usedPercentage);
+  const meterLabel = formatContextWindowMeterLabel(usage, displayMode);
   const normalizedPercentage = Math.max(0, Math.min(100, usage.usedPercentage ?? 0));
-  const radius = 9.75;
-  const circumference = 2 * Math.PI * radius;
-  const dashOffset = circumference * (1 - normalizedPercentage / 100);
   const totalProcessedTokens = usage.totalProcessedTokens ?? null;
   const showTotalProcessed = totalProcessedTokens !== null && totalProcessedTokens > 0;
   const isOverloaded = normalizedPercentage > 90;
@@ -43,43 +52,12 @@ export function ContextWindowMeter(props: {
         closeDelay={onCompact ? 150 : 0}
         render={
           <Button
-            size="icon-sm"
+            size="xs"
             variant="ghost-muted"
-            className="size-7"
-            aria-label={
-              usage.maxTokens !== null && usedPercentage
-                ? `Context window ${usedPercentage} used`
-                : `Context window ${formatContextWindowTokens(usage.usedTokens)} tokens used`
-            }
+            className="min-w-0 max-w-36 shrink"
+            aria-label={`Context window ${meterLabel} used`}
           >
-            <span className="relative flex size-5 items-center justify-center">
-              <svg
-                viewBox="0 0 24 24"
-                className="-rotate-90 absolute inset-0 size-full transform-gpu mx-0!"
-                aria-hidden="true"
-              >
-                <circle
-                  cx="12"
-                  cy="12"
-                  r={radius}
-                  fill="none"
-                  stroke="color-mix(in oklab, var(--color-muted-foreground) 24%, transparent)"
-                  strokeWidth="3"
-                />
-                <circle
-                  cx="12"
-                  cy="12"
-                  r={radius}
-                  fill="none"
-                  stroke={usageColor}
-                  strokeWidth="3"
-                  strokeLinecap="round"
-                  strokeDasharray={circumference}
-                  strokeDashoffset={dashOffset}
-                  className="transition-[stroke-dashoffset,stroke] duration-500 ease-out motion-reduce:transition-none"
-                />
-              </svg>
-            </span>
+            <span className="block min-w-0 truncate tabular-nums text-[11px]">{meterLabel}</span>
           </Button>
         }
       />
@@ -160,9 +138,4 @@ export function ContextWindowMeter(props: {
       </PopoverPopup>
     </Popover>
   );
-}
-
-/** Holds the meter's footprint while a thread's activities are still loading. */
-export function ContextWindowMeterPlaceholder() {
-  return <span aria-hidden="true" className="size-7 shrink-0" />;
 }

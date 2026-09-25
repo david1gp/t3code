@@ -9916,7 +9916,6 @@ export default function ChatView(props: ChatViewProps) {
             <div className="relative flex min-h-0 flex-1 flex-col bg-background">
               {reportedThreadCosts.totalUsd !== null ? (
                 <div className="flex shrink-0 justify-end px-4 pt-2 text-xs text-muted-foreground">
-                  Reported costs (available turns):{" "}
                   {formatReportedCostUsd(reportedThreadCosts.totalUsd)}
                 </div>
               ) : null}
@@ -10155,10 +10154,8 @@ export default function ChatView(props: ChatViewProps) {
                             providerCatalogKnown={serverConfig !== null}
                             activeProjectDefaultModelSelection={activeProjectDefaultModelSelection}
                             activeThreadModelSelection={activeThread?.modelSelection}
-                            activeContextWindow={activeContextWindow}
                             compactThreadUnavailable={compactThreadUnavailable}
                             compactDisabled={compactDisabled}
-                            compactDisabledReason={compactDisabledReason}
                             resolvedTheme={resolvedTheme}
                             settings={settings}
                             keybindings={keybindings}
@@ -10262,6 +10259,9 @@ export default function ChatView(props: ChatViewProps) {
                                 availableEnvironments={logicalProjectEnvironments}
                                 composerControlsHostRef={setRestingComposerControlsHost}
                                 contextStripVisible={showComposerContextStrip}
+                                activeContextWindow={activeContextWindow}
+                                contextWindowMeterEnabled={settings.contextWindowMeterEnabled}
+                                contextWindowDisplayMode={settings.contextWindowDisplayMode}
                               />
                             </div>
                           )}

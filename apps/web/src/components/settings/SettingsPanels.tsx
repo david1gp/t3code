@@ -562,6 +562,10 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.sidebarShowBranchLabels !== DEFAULT_UNIFIED_SETTINGS.sidebarShowBranchLabels
         ? ["Branch labels"]
         : []),
+      ...(settings.sidebarShowPullRequests !== DEFAULT_UNIFIED_SETTINGS.sidebarShowPullRequests
+        ? ["Pull Requests"]
+        : []),
+      ...(settings.sidebarShowUsage !== DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage ? ["Usage"] : []),
       ...(settings.sidebarProjectGroupingMode !==
       DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode
         ? ["Project Grouping"]
@@ -600,6 +604,9 @@ export function useSettingsRestore(onRestored?: () => void) {
         : []),
       ...(settings.contextWindowMeterEnabled !== DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled
         ? ["Context window indicator"]
+        : []),
+      ...(settings.contextWindowDisplayMode !== DEFAULT_UNIFIED_SETTINGS.contextWindowDisplayMode
+        ? ["Context usage display mode"]
         : []),
       ...(settings.responseStreamingMode !== DEFAULT_UNIFIED_SETTINGS.responseStreamingMode
         ? ["Response streaming"]
@@ -670,6 +677,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.proactivePanelsEnabled,
       settings.environmentIdentificationMode,
       settings.contextWindowMeterEnabled,
+      settings.contextWindowDisplayMode,
       settings.fontFamilyCode,
       settings.fontFamilyComposer,
       settings.fontFamilySans,
@@ -690,6 +698,8 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.sidebarGroupThreadsByProject,
       settings.sidebarShowProviderLogos,
       settings.sidebarShowBranchLabels,
+      settings.sidebarShowPullRequests,
+      settings.sidebarShowUsage,
       settings.showSkillsInSlashMenu,
       settings.timestampFormat,
       settings.notificationMode,
@@ -780,6 +790,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       sendShortcut: DEFAULT_UNIFIED_SETTINGS.sendShortcut,
       followUpBehavior: DEFAULT_UNIFIED_SETTINGS.followUpBehavior,
       contextWindowMeterEnabled: DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled,
+      contextWindowDisplayMode: DEFAULT_UNIFIED_SETTINGS.contextWindowDisplayMode,
       environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
       glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
       panelAnimationDurationMs: DEFAULT_UNIFIED_SETTINGS.panelAnimationDurationMs,
@@ -787,6 +798,8 @@ export function useSettingsRestore(onRestored?: () => void) {
       sidebarGroupThreadsByProject: DEFAULT_UNIFIED_SETTINGS.sidebarGroupThreadsByProject,
       sidebarShowProviderLogos: DEFAULT_UNIFIED_SETTINGS.sidebarShowProviderLogos,
       sidebarShowBranchLabels: DEFAULT_UNIFIED_SETTINGS.sidebarShowBranchLabels,
+      sidebarShowPullRequests: DEFAULT_UNIFIED_SETTINGS.sidebarShowPullRequests,
+      sidebarShowUsage: DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage,
       sidebarProjectGroupingMode: DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode,
       sidebarAutoSettleAfterDays: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleAfterDays,
       sidebarAutoSettleOnMerge: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge,
@@ -2042,7 +2055,6 @@ function AutoSettleDaysInput({
 const LEGACY_FEATURE_TARGET_IDS: ReadonlySet<string> = new Set([
   "legacy-plan-mode",
   "legacy-context-window-indicator",
-  "legacy-sidebar",
 ]);
 
 /**
@@ -2098,28 +2110,35 @@ function LegacyFeaturesSection() {
             />
             <SettingsRow
               {...searchableSetting("legacy-context-window-indicator")}
-              description="Shows context window usage as a circular indicator in the composer."
+              description="Show context usage in the composer and choose how it is displayed."
               control={
-                <Switch
-                  checked={settings.contextWindowMeterEnabled}
-                  onCheckedChange={(checked) =>
-                    updateSettings({ contextWindowMeterEnabled: Boolean(checked) })
-                  }
-                  aria-label="Context window indicator (legacy)"
-                />
-              }
-            />
-            <SettingsRow
-              {...searchableSetting("legacy-sidebar")}
-              description="Restore per-project thread trees instead of the default flat sidebar."
-              control={
-                <Switch
-                  checked={settings.legacySidebarEnabled}
-                  onCheckedChange={(checked) =>
-                    updateSettings({ legacySidebarEnabled: Boolean(checked) })
-                  }
-                  aria-label="Sidebar (legacy)"
-                />
+                <div className="flex items-center gap-3">
+                  <Select
+                    value={settings.contextWindowDisplayMode}
+                    onValueChange={(value) => {
+                      if (value === "simple" || value === "detailed") {
+                        updateSettings({ contextWindowDisplayMode: value });
+                      }
+                    }}
+                  >
+                    <SelectTrigger size="sm" aria-label="Context usage display mode">
+                      <SelectValue>
+                        {settings.contextWindowDisplayMode === "simple" ? "Simple" : "Detailed"}
+                      </SelectValue>
+                    </SelectTrigger>
+                    <SelectPopup align="end" alignItemWithTrigger={false}>
+                      <SelectItem value="simple">Simple</SelectItem>
+                      <SelectItem value="detailed">Detailed</SelectItem>
+                    </SelectPopup>
+                  </Select>
+                  <Switch
+                    checked={settings.contextWindowMeterEnabled}
+                    onCheckedChange={(checked) =>
+                      updateSettings({ contextWindowMeterEnabled: Boolean(checked) })
+                    }
+                    aria-label="Context window indicator (legacy)"
+                  />
+                </div>
               }
             />
           </SettingsGroup>
@@ -2335,6 +2354,55 @@ export function GeneralSettingsPanel() {
                 updateSettings({ sidebarShowBranchLabels: Boolean(checked) })
               }
               aria-label="Show branch labels"
+            />
+          }
+        />
+
+        <SettingsRow
+          title="Show Pull Requests"
+          description="Show the Pull Requests shortcut in the sidebar when supported."
+          resetAction={
+            settings.sidebarShowPullRequests !==
+            DEFAULT_UNIFIED_SETTINGS.sidebarShowPullRequests ? (
+              <SettingResetButton
+                label="Pull Requests"
+                onClick={() =>
+                  updateSettings({
+                    sidebarShowPullRequests: DEFAULT_UNIFIED_SETTINGS.sidebarShowPullRequests,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.sidebarShowPullRequests}
+              onCheckedChange={(checked) =>
+                updateSettings({ sidebarShowPullRequests: Boolean(checked) })
+              }
+              aria-label="Show Pull Requests"
+            />
+          }
+        />
+
+        <SettingsRow
+          title="Show Usage"
+          description="Show the Usage shortcut in the sidebar."
+          resetAction={
+            settings.sidebarShowUsage !== DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage ? (
+              <SettingResetButton
+                label="Usage"
+                onClick={() =>
+                  updateSettings({ sidebarShowUsage: DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.sidebarShowUsage}
+              onCheckedChange={(checked) => updateSettings({ sidebarShowUsage: Boolean(checked) })}
+              aria-label="Show Usage"
             />
           }
         />

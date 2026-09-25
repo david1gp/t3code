@@ -127,6 +127,57 @@ describe("grouped sidebar ownership and drops", () => {
     ).toBeNull();
   });
 
+  it("only exposes preview-visible rows as grouped drag targets and restores the rest on expansion", () => {
+    const row = (key: string) => sidebarGroupedDragId("thread", "alpha", key);
+    const input = { groups, sections, scopeKey: null, previewLimit: 2 };
+    const collapsed = sidebarGroupedListsCreate(input);
+    expect(collapsed[0]?.preview.active.map(({ id }) => id)).toEqual(["first"]);
+    expect(
+      collapsed[0]?.dragItems.filter((item) => item.kind === "thread").map((item) => item.key),
+    ).toEqual(["remote:p", "local:first"]);
+    expect(
+      sidebarGroupedDropResolve({
+        groups: collapsed,
+        activeId: row("local:first"),
+        overId: row("remote:second"),
+      }),
+    ).toBeNull();
+
+    const expanded = sidebarGroupedListsCreate({
+      ...input,
+      expandedPreviewProjects: new Set(["alpha"]),
+    });
+    expect(
+      expanded[0]?.dragItems.filter((item) => item.kind === "thread").map((item) => item.key),
+    ).toEqual(["remote:p", "local:first", "remote:second", "local:sleep"]);
+    expect(
+      sidebarGroupedDropResolve({
+        groups: expanded,
+        activeId: row("local:first"),
+        overId: row("remote:second"),
+      })?.target.activeOrder,
+    ).toEqual(["remote:second", "local:first"]);
+
+    const withHiddenActive = sidebarGroupedListsCreate({
+      groups,
+      sections: {
+        ...sections,
+        pinned: [],
+        active: [...sections.active, thread("local", "a", "hidden")],
+      },
+      scopeKey: null,
+      previewLimit: 2,
+    });
+    expect(withHiddenActive[0]?.dragItems.filter((item) => item.kind === "thread")).toHaveLength(2);
+    expect(
+      sidebarGroupedDropResolve({
+        groups: withHiddenActive,
+        activeId: row("remote:second"),
+        overId: row("local:first"),
+      })?.target.activeOrder,
+    ).toEqual(["remote:second", "local:first", "local:hidden"]);
+  });
+
   it("resolves a flat settled row dropped into its owning project's active section", () => {
     const lists = sidebarGroupedListsCreate({ groups, sections, scopeKey: null });
     const resolved = sidebarGroupedDropResolve({

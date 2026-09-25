@@ -479,15 +479,9 @@ export const SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "legacy-context-window-indicator",
-    title: "Context window indicator (legacy)",
+    title: "Context usage display",
     to: "/settings/general",
-    searchTerms: ["composer meter usage tokens circle old"],
-  },
-  {
-    id: "legacy-sidebar",
-    title: "Sidebar (legacy)",
-    to: "/settings/general",
-    searchTerms: ["project thread tree old flat list"],
+    searchTerms: ["context window simple detailed percentage tokens meter circle legacy"],
   },
   {
     id: "keybindings",

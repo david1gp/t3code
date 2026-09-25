@@ -60,6 +60,8 @@ import { useComposerMenuProps } from "./chat/composerEventScope";
 import { measureRestingComposerControls } from "./chat/restingComposerControlsMeasurement";
 import { resolveRestingComposerControlsNaturalWidth } from "./composerFooterLayout";
 import { cn } from "~/lib/utils";
+import type { ContextWindowSnapshot } from "../lib/contextWindow";
+import { ContextWindowMeter } from "./chat/ContextWindowMeter";
 
 export interface BranchToolbarHandle {
   openBranchPicker: () => void;
@@ -88,6 +90,9 @@ interface BranchToolbarProps {
   onEnvironmentChange?: (environmentId: EnvironmentId) => void;
   composerControlsHostRef?: (element: HTMLDivElement | null) => void;
   contextStripVisible?: boolean;
+  activeContextWindow: ContextWindowSnapshot | null;
+  contextWindowMeterEnabled: boolean;
+  contextWindowDisplayMode: "simple" | "detailed";
 }
 
 interface MobileRunContextSelectorProps {
@@ -507,6 +512,9 @@ export const BranchToolbar = memo(function BranchToolbar({
   onEnvironmentChange,
   composerControlsHostRef,
   contextStripVisible = true,
+  activeContextWindow,
+  contextWindowMeterEnabled,
+  contextWindowDisplayMode,
 }: BranchToolbarProps) {
   const branchSelectorRef = useRef<BranchToolbarBranchSelectorHandle>(null);
   const threadRef = useMemo(
@@ -691,6 +699,10 @@ export const BranchToolbar = memo(function BranchToolbar({
           data-chat-resting-composer-controls-host="true"
           className="flex min-w-0 flex-1 items-center justify-start overflow-x-clip overflow-y-visible"
         />
+      ) : null}
+
+      {contextWindowMeterEnabled && activeContextWindow ? (
+        <ContextWindowMeter usage={activeContextWindow} displayMode={contextWindowDisplayMode} />
       ) : null}
 
       {showGitControls ? (
