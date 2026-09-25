@@ -24,6 +24,7 @@ import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { Bot, Braces, Check, ChevronDown, ChevronRight, ExternalLink, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
+import { formatReportedCostUsd } from "~/lib/reportedThreadCosts";
 import { cn } from "~/lib/utils";
 import { readLocalApi } from "~/localApi";
 import { orchestrationEnvironment } from "~/state/orchestration";
@@ -153,6 +154,9 @@ function AgentRow({ agent }: { agent: RuntimeSubagent }) {
     modelLabel,
     agent.usage ? `${formatSubagentTokenCount(agent.usage.totalTokens)} tok` : "— tok",
     agent.usage?.toolUses !== undefined ? `${agent.usage.toolUses} tools` : null,
+    agent.usage?.costUsd !== undefined
+      ? `API est. ${formatReportedCostUsd(agent.usage.costUsd)}`
+      : null,
     agent.activationCount > 1 ? `run ${agent.activationCount}` : null,
   ].filter((value): value is string => value !== null);
   const sessionUrl = agent.runHandles?.sessionUrl;
