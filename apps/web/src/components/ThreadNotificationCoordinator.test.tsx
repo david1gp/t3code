@@ -18,8 +18,12 @@ const state = vi.hoisted(() => ({
   sessionError: false,
   turnError: false,
   add: vi.fn(
-    (_toast: { title: string; description: string; actionProps: { onClick: () => void } }) =>
-      "toast-1",
+    (_toast: {
+      title: string;
+      description: string;
+      timeout?: number;
+      actionProps: { onClick: () => void };
+    }) => "toast-1",
   ),
   close: vi.fn(),
   navigate: vi.fn(),
@@ -138,6 +142,7 @@ describe("thread notifications", () => {
     const toast = state.add.mock.calls[0]?.[0];
     expect(toast?.title).toBe("Thread completed");
     expect(toast?.description).toBe("Fix the login form");
+    expect(toast?.timeout).toBe(10_000);
     toast?.actionProps.onClick();
     expect(state.close).toHaveBeenCalledWith("toast-1");
     expect(state.navigate).toHaveBeenCalledWith({
