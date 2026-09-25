@@ -319,6 +319,8 @@ function openCodeChildUsage(info: unknown): ThreadTokenUsageSnapshot | undefined
 function openCodeChildTypedUsage(
   messageUsage: ReadonlyMap<string, ThreadTokenUsageSnapshot>,
   toolUses: number,
+  costByPartId: ReadonlyMap<string, number | undefined> = new Map(),
+  includeCost = false,
 ):
   | {
       readonly totalTokens: number;
@@ -328,11 +330,18 @@ function openCodeChildTypedUsage(
       readonly reasoningOutputTokens?: number;
       readonly toolUses: number;
       readonly durationMs?: number;
+      readonly costUsd?: number;
     }
   | undefined {
-  if (messageUsage.size === 0 && toolUses === 0) return undefined;
-  const sum = (key: keyof ThreadTokenUsageSnapshot) =>
-    [...messageUsage.values()].reduce((total, usage) => total + (usage[key] ?? 0), 0);
+  if (messageUsage.size === 0 && toolUses === 0 && costByPartId.size === 0) return undefined;
+  const sum = (
+    key:
+      | "usedTokens"
+      | "inputTokens"
+      | "cachedInputTokens"
+      | "outputTokens"
+      | "reasoningOutputTokens",
+  ) => [...messageUsage.values()].reduce((total, usage) => total + (usage[key] ?? 0), 0);
   const totalTokens = sum("usedTokens");
   const inputTokens = sum("inputTokens");
   const cachedInputTokens = sum("cachedInputTokens");
@@ -341,6 +350,11 @@ function openCodeChildTypedUsage(
   const durationMs = messageUsage.size
     ? Math.max(...[...messageUsage.values()].map((usage) => usage.durationMs ?? 0))
     : 0;
+  const costs = [...costByPartId.values()];
+  const costUsd = costs.reduce<number | undefined>(
+    (total, cost) => (total === undefined || cost === undefined ? undefined : total + cost),
+    0,
+  );
   return {
     totalTokens,
     ...(inputTokens ? { inputTokens } : {}),
@@ -349,6 +363,13 @@ function openCodeChildTypedUsage(
     ...(reasoningOutputTokens ? { reasoningOutputTokens } : {}),
     toolUses,
     ...(durationMs ? { durationMs } : {}),
+    ...(includeCost &&
+    costByPartId.size > 0 &&
+    costs.every((cost) => cost !== undefined) &&
+    costUsd !== undefined &&
+    Number.isFinite(costUsd)
+      ? { costUsd }
+      : {}),
   };
 }
 
@@ -441,6 +462,7 @@ interface OpenCodeSessionContext {
   readonly childTaskStatusById: Map<string, "running" | "idle" | "completed" | "failed">;
   readonly childOriginTurnIdBySessionId: Map<string, TurnId | undefined>;
   readonly childUsageByMessageId: Map<string, Map<string, ThreadTokenUsageSnapshot>>;
+  readonly childCostByPartId: Map<string, Map<string, number | undefined>>;
   readonly childToolCallIds: Map<string, Set<string>>;
   readonly resolvedRequestIds: Set<string>;
   readonly autoRepliedRequestIds: Set<string>;
@@ -2534,6 +2556,7 @@ export function makeOpenCodeAdapter(
         context.childTaskStatusById.delete(sessionId);
         context.childOriginTurnIdBySessionId.delete(sessionId);
         context.childUsageByMessageId.delete(sessionId);
+        context.childCostByPartId.delete(sessionId);
         context.childToolCallIds.delete(sessionId);
         return;
       }
@@ -2578,7 +2601,12 @@ export function makeOpenCodeAdapter(
           context.childTaskStatusById.set(sessionId, "completed");
           const messageUsage = context.childUsageByMessageId.get(sessionId) ?? new Map();
           const toolUses = context.childToolCallIds.get(sessionId)?.size ?? 0;
-          const typedUsage = openCodeChildTypedUsage(messageUsage, toolUses);
+          const typedUsage = openCodeChildTypedUsage(
+            messageUsage,
+            toolUses,
+            context.childCostByPartId.get(sessionId),
+            true,
+          );
           yield* emit({
             ...(yield* buildEventBase({
               threadId: context.session.threadId,
@@ -2605,6 +2633,7 @@ export function makeOpenCodeAdapter(
         const typedUsage = openCodeChildTypedUsage(
           context.childUsageByMessageId.get(sessionId) ?? new Map(),
           context.childToolCallIds.get(sessionId)?.size ?? 0,
+          context.childCostByPartId.get(sessionId),
         );
         yield* emit({
           ...(yield* buildEventBase({
@@ -2634,6 +2663,7 @@ export function makeOpenCodeAdapter(
           const typedUsage = openCodeChildTypedUsage(
             context.childUsageByMessageId.get(sessionId) ?? new Map(),
             context.childToolCallIds.get(sessionId)?.size ?? 0,
+            context.childCostByPartId.get(sessionId),
           );
           yield* emit({
             ...(yield* buildEventBase({
@@ -2660,6 +2690,7 @@ export function makeOpenCodeAdapter(
           const typedUsage = openCodeChildTypedUsage(
             byMessage,
             context.childToolCallIds.get(sessionId)?.size ?? 0,
+            context.childCostByPartId.get(sessionId),
           );
           if (typedUsage) {
             yield* emit({
@@ -2682,6 +2713,42 @@ export function makeOpenCodeAdapter(
         }
         return;
       }
+      if (event.type === "message.part.updated" && event.properties.part.type === "step-finish") {
+        if (context.childTaskStatusById.get(sessionId) === "completed") return;
+        const part = event.properties.part;
+        const cost = part.cost;
+        const costs = context.childCostByPartId.get(sessionId) ?? new Map();
+        costs.set(
+          part.id,
+          typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : undefined,
+        );
+        context.childCostByPartId.set(sessionId, costs);
+        const typedUsage = openCodeChildTypedUsage(
+          context.childUsageByMessageId.get(sessionId) ?? new Map(),
+          context.childToolCallIds.get(sessionId)?.size ?? 0,
+          costs,
+          context.childTaskStatusById.get(sessionId) === "completed",
+        );
+        if (typedUsage) {
+          yield* emit({
+            ...(yield* buildEventBase({
+              threadId: context.session.threadId,
+              turnId: context.childOriginTurnIdBySessionId.get(sessionId),
+              raw,
+            })),
+            type: "task.progress",
+            payload: {
+              taskId,
+              description:
+                context.childSessionInfoById.get(sessionId)?.title ?? "OpenCode child session",
+              typedUsage,
+              status: context.childTaskStatusById.get(sessionId) ?? "running",
+              ...childTaskLinkage(context, sessionId),
+            },
+          });
+        }
+        return;
+      }
       if (event.type === "message.part.updated" && event.properties.part.type === "tool") {
         const part = event.properties.part;
         const callId = part.callID;
@@ -2692,6 +2759,7 @@ export function makeOpenCodeAdapter(
         const typedUsage = openCodeChildTypedUsage(
           context.childUsageByMessageId.get(sessionId) ?? new Map(),
           seenCalls.size,
+          context.childCostByPartId.get(sessionId),
         );
         yield* emit({
           ...(yield* buildEventBase({
@@ -3639,6 +3707,7 @@ export function makeOpenCodeAdapter(
           childTaskStatusById: new Map(),
           childOriginTurnIdBySessionId: new Map(),
           childUsageByMessageId: new Map(),
+          childCostByPartId: new Map(),
           childToolCallIds: new Map(),
           resolvedRequestIds: new Set(),
           autoRepliedRequestIds: new Set(),
@@ -4634,6 +4703,7 @@ export function makeOpenCodeAdapter(
           context.childTaskStatusById.clear();
           context.childOriginTurnIdBySessionId.clear();
           context.childUsageByMessageId.clear();
+          context.childCostByPartId.clear();
           context.childToolCallIds.clear();
           context.messageRoleById.clear();
           context.textPartsByMessageId.clear();

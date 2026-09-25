@@ -2853,6 +2853,53 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           },
         });
         enqueue({
+          id: "evt-child-step-cost",
+          type: "message.part.updated",
+          properties: {
+            sessionID: "ses_late_child",
+            part: {
+              id: "child-step-cost",
+              sessionID: "ses_late_child",
+              messageID: "child-assistant-message",
+              type: "step-finish",
+              reason: "stop",
+              cost: 1.25,
+              tokens: { input: 8, output: 2, reasoning: 1, cache: { read: 1, write: 0 } },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-child-step-cost-duplicate",
+          type: "message.part.updated",
+          properties: {
+            sessionID: "ses_late_child",
+            part: {
+              id: "child-step-cost",
+              sessionID: "ses_late_child",
+              messageID: "child-assistant-message",
+              type: "step-finish",
+              reason: "stop",
+              cost: 1.25,
+              tokens: { input: 8, output: 2, reasoning: 1, cache: { read: 1, write: 0 } },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-child-step-missing-cost",
+          type: "message.part.updated",
+          properties: {
+            sessionID: "ses_late_child",
+            part: {
+              id: "child-step-missing-cost",
+              sessionID: "ses_late_child",
+              messageID: "child-assistant-message",
+              type: "step-finish",
+              reason: "stop",
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            },
+          },
+        });
+        enqueue({
           id: "evt-nested-child-created",
           type: "session.created",
           properties: {
@@ -2867,9 +2914,135 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           },
         });
         enqueue({
+          id: "evt-nested-child-step-missing-cost",
+          type: "message.part.updated",
+          properties: {
+            sessionID: "ses_nested_child",
+            part: {
+              id: "nested-child-step-missing-cost",
+              sessionID: "ses_nested_child",
+              messageID: "nested-assistant-message",
+              type: "step-finish",
+              reason: "stop",
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-nested-child-step-invalid-cost",
+          type: "message.part.updated",
+          properties: {
+            sessionID: "ses_nested_child",
+            part: {
+              id: "nested-child-step-invalid-cost",
+              sessionID: "ses_nested_child",
+              messageID: "nested-assistant-message",
+              type: "step-finish",
+              reason: "stop",
+              cost: -1,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            },
+          },
+        });
+        enqueue({
           id: "evt-nested-child-idle",
           type: "session.status",
           properties: { sessionID: "ses_nested_child", status: { type: "idle" } },
+        });
+        enqueue({
+          id: "evt-cost-complete-created",
+          type: "session.created",
+          properties: {
+            info: {
+              id: "ses_cost_complete",
+              parentID: rootSessionId,
+              title: "Cost complete child",
+              agent: "researcher",
+              model: { id: "model-child", providerID: "provider-child" },
+            },
+          },
+        });
+        for (const [eventId, id, cost] of [
+          ["complete-step-a", "complete-step-a", 0.4],
+          ["complete-step-a-duplicate", "complete-step-a", 0.4],
+          ["complete-step-b", "complete-step-b", 0.6],
+        ] as const) {
+          enqueue({
+            id: `evt-${eventId}`,
+            type: "message.part.updated",
+            properties: {
+              sessionID: "ses_cost_complete",
+              part: {
+                id,
+                sessionID: "ses_cost_complete",
+                messageID: "complete-assistant-message",
+                type: "step-finish",
+                reason: "stop",
+                cost,
+                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              },
+            },
+          });
+        }
+        enqueue({
+          id: "evt-cost-complete-idle",
+          type: "session.status",
+          properties: { sessionID: "ses_cost_complete", status: { type: "idle" } },
+        });
+        enqueue({
+          id: "evt-cost-complete-late-step",
+          type: "message.part.updated",
+          properties: {
+            sessionID: "ses_cost_complete",
+            part: {
+              id: "complete-late-step",
+              sessionID: "ses_cost_complete",
+              messageID: "complete-assistant-message",
+              type: "step-finish",
+              reason: "stop",
+              cost: 0.5,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            },
+          },
+        });
+        enqueue({
+          id: "evt-cost-overflow-created",
+          type: "session.created",
+          properties: {
+            info: {
+              id: "ses_cost_overflow",
+              parentID: rootSessionId,
+              title: "Cost overflow child",
+              agent: "researcher",
+              model: { id: "model-child", providerID: "provider-child" },
+            },
+          },
+        });
+        for (const [id, cost] of [
+          ["overflow-step-a", Number.MAX_VALUE],
+          ["overflow-step-b", Number.MAX_VALUE],
+        ] as const) {
+          enqueue({
+            id: `evt-${id}`,
+            type: "message.part.updated",
+            properties: {
+              sessionID: "ses_cost_overflow",
+              part: {
+                id,
+                sessionID: "ses_cost_overflow",
+                messageID: "overflow-assistant-message",
+                type: "step-finish",
+                reason: "stop",
+                cost,
+                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              },
+            },
+          });
+        }
+        enqueue({
+          id: "evt-cost-overflow-idle",
+          type: "session.status",
+          properties: { sessionID: "ses_cost_overflow", status: { type: "idle" } },
         });
         enqueue({
           id: "evt-child-tool-progress",
@@ -3015,7 +3188,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         const starts = events.filter((event) => event.type === "task.started");
         NodeAssert.deepEqual(
           starts.map((event) => event.payload.taskId),
-          ["ses_late_child", "ses_nested_child"],
+          ["ses_late_child", "ses_nested_child", "ses_cost_complete", "ses_cost_overflow"],
         );
         const childStart = starts.find(
           (event) => event.type === "task.started" && event.payload.taskId === "ses_late_child",
@@ -3098,9 +3271,18 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
               event.payload.title === "Research child after completion",
           ),
         );
+        NodeAssert.ok(
+          !events.some(
+            (event) =>
+              event.type === "task.progress" &&
+              event.payload.taskId === "ses_late_child" &&
+              event.payload.typedUsage?.costUsd === 1.25,
+          ),
+        );
         if (childTerminals[0]?.type === "task.completed") {
           NodeAssert.equal(childTerminals[0].payload.typedUsage?.totalTokens, 12);
           NodeAssert.equal(childTerminals[0].payload.typedUsage?.toolUses, 1);
+          NodeAssert.equal(childTerminals[0].payload.typedUsage?.costUsd, undefined);
         }
         const nestedTerminal = events.find(
           (event) => event.type === "task.completed" && event.payload.taskId === "ses_nested_child",
@@ -3108,6 +3290,31 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         NodeAssert.equal(nestedTerminal?.type, "task.completed");
         if (nestedTerminal?.type === "task.completed") {
           NodeAssert.equal(nestedTerminal.payload.status, "completed");
+          NodeAssert.equal(nestedTerminal.payload.typedUsage?.costUsd, undefined);
+        }
+        const completeTerminal = events.find(
+          (event) =>
+            event.type === "task.completed" && event.payload.taskId === "ses_cost_complete",
+        );
+        NodeAssert.equal(completeTerminal?.type, "task.completed");
+        if (completeTerminal?.type === "task.completed") {
+          NodeAssert.equal(completeTerminal.payload.typedUsage?.costUsd, 1);
+        }
+        NodeAssert.ok(
+          !events.some(
+            (event) =>
+              event.type === "task.progress" &&
+              event.payload.taskId === "ses_cost_complete" &&
+              event.payload.typedUsage?.costUsd !== undefined,
+          ),
+        );
+        const overflowTerminal = events.find(
+          (event) =>
+            event.type === "task.completed" && event.payload.taskId === "ses_cost_overflow",
+        );
+        NodeAssert.equal(overflowTerminal?.type, "task.completed");
+        if (overflowTerminal?.type === "task.completed") {
+          NodeAssert.equal(overflowTerminal.payload.typedUsage?.costUsd, undefined);
         }
         const textDeltas = events.filter((event) => event.type === "content.delta");
         NodeAssert.equal(textDeltas.length, 1);
