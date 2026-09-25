@@ -2,15 +2,12 @@ import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/model
 import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import type { SidebarProjectSnapshot } from "../sidebarProjectGrouping";
 import type { SidebarListItem, SidebarSection } from "./Sidebar.logic";
-import { sidebarGroupedThreadPreview } from "./sidebarGroupedThreadPreview";
 
 export function sidebarGroupedListsCreate(input: {
   groups: readonly SidebarProjectSnapshot[];
   sections: Record<SidebarSection, readonly EnvironmentThreadShell[]>;
   totals?: Partial<Record<SidebarSection, readonly EnvironmentThreadShell[]>>;
   scopeKey: string | null;
-  previewLimit?: number;
-  expandedPreviewProjects?: ReadonlySet<string>;
 }) {
   const byRef = new Map(
     input.groups.flatMap((group) =>
@@ -27,7 +24,12 @@ export function sidebarGroupedListsCreate(input: {
       totalBySection: Record<SidebarSection, number>;
       items: SidebarListItem[];
       dragItems: SidebarListItem[];
-      preview: ReturnType<typeof sidebarGroupedThreadPreview<EnvironmentThreadShell>>;
+      preview: {
+        pinned: EnvironmentThreadShell[];
+        active: EnvironmentThreadShell[];
+        snoozed: EnvironmentThreadShell[];
+        hasMore: false;
+      };
     }
   >();
   for (const project of input.groups) {
@@ -53,13 +55,14 @@ export function sidebarGroupedListsCreate(input: {
     }
   }
   for (const group of lists.values()) {
-    group.preview = sidebarGroupedThreadPreview({
-      pinned: group.sections.pinned,
-      active: group.sections.active,
-      snoozed: group.sections.snoozed,
-      limit: input.previewLimit ?? Number.POSITIVE_INFINITY,
-      expanded: input.expandedPreviewProjects?.has(group.project.projectKey) ?? false,
-    });
+    // Keep the existing render shape while the grouped view consumes these
+    // arrays; unlike the ungrouped list, grouped projects never preview-limit.
+    group.preview = {
+      pinned: [...group.sections.pinned],
+      active: [...group.sections.active],
+      snoozed: [...group.sections.snoozed],
+      hasMore: false,
+    };
     const rows = (section: SidebarSection): SidebarListItem[] =>
       group.sections[section].map((thread) => ({
         kind: "thread",
@@ -72,21 +75,13 @@ export function sidebarGroupedListsCreate(input: {
       { kind: "marker", marker: "pinned-divider" },
       { kind: "marker", marker: "active-placeholder" },
       ...rows("active"),
-      { kind: "marker", marker: "snoozed-header" },
       ...rows("snoozed"),
-      // Kept as an invisible structural boundary so grouped drops can settle
-      // an owned active thread; the actual settled shelf renders once below.
-      { kind: "marker", marker: "settled-header" },
-      { kind: "marker", marker: "settled-placeholder" },
     ];
-    const visibleKeys = new Set(
-      [group.preview.pinned, group.preview.active, group.preview.snoozed]
-        .flat()
-        .map((thread) => scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))),
-    );
-    group.dragItems = group.items.filter(
-      (item) => item.kind === "marker" || visibleKeys.has(item.key),
-    );
+    group.dragItems = [...group.items];
   }
-  return [...lists.values()];
+  return [...lists.values()].filter(
+    (group) =>
+      group.sections.pinned.length + group.sections.active.length + group.sections.snoozed.length >
+      0,
+  );
 }

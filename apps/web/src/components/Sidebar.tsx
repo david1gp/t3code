@@ -6,7 +6,6 @@ import { replaceComposerContextReferences } from "@t3tools/shared/composerContex
 import * as Schema from "effect/Schema";
 import {
   DndContext,
-  closestCenter,
   useDroppable,
   type CollisionDetection,
   useSensor,
@@ -217,6 +216,7 @@ import { sidebarGroupedActiveSort } from "./sidebarGroupedActiveSort";
 import { sidebarGroupedDropResolve } from "./sidebarGroupedDropResolve";
 import { sidebarGroupedDragId } from "./sidebarGroupedDragId";
 import { sidebarGroupedProjectCollisionDetect } from "./sidebarGroupedProjectCollisionDetect";
+import { sidebarGroupedThreadCollisionDetect } from "./sidebarGroupedThreadCollisionDetect";
 import { sidebarDraftRowsSelect } from "./sidebarDraftRowsSelect";
 import {
   ThreadPullRequestBadgeControl,
@@ -585,44 +585,46 @@ function SidebarGroupedProjectRow(props: {
         {...listeners}
         aria-expanded={props.expanded}
         onClick={props.onToggle}
-        className="flex h-9 w-full cursor-grab items-center gap-2 rounded-md px-2 text-left text-xs font-medium text-sidebar-foreground hover:bg-sidebar-row-hover"
+        className="mx-0.5 flex h-8 w-[calc(100%-0.25rem)] cursor-grab items-center gap-2 px-2 text-left text-xs font-medium text-sidebar-muted-foreground/60 hover:text-sidebar-foreground"
       >
+        <span className="min-w-0 shrink truncate">{props.project.displayName}</span>
+        <span aria-hidden className="h-px min-w-2 flex-1 bg-sidebar-border/60" />
         <ChevronDownIcon
           aria-hidden
-          className={cn("size-3 shrink-0 transition-transform", !props.expanded && "-rotate-90")}
+          className={cn("size-3 shrink-0 transition-transform", props.expanded && "rotate-180")}
         />
-        <span className="min-w-0 flex-1 truncate">{props.project.displayName}</span>
-        <span className="text-sidebar-muted-foreground">
-          {props.project.memberProjects.length > 1
-            ? `${props.project.memberProjects.length} projects`
-            : ""}
-        </span>
       </button>
       {props.expanded ? (
-        <ul role="list" className="flex flex-col gap-px pl-2">
+        <ul role="list" className="flex flex-col gap-px">
           {props.children}
         </ul>
       ) : props.collapsedActiveRow ? (
-        <ul role="list" className="pl-2">
-          {props.collapsedActiveRow}
-        </ul>
+        <ul role="list">{props.collapsedActiveRow}</ul>
       ) : null}
     </li>
   );
 }
 
-function SidebarGroupedSectionTarget(props: { id: string; label: string }) {
+function SidebarGroupedSectionTarget(props: {
+  id: string;
+  kind: "boundary" | "placeholder";
+  dragging: boolean;
+}) {
   const { setNodeRef, isOver } = useDroppable({ id: props.id });
   return (
     <li
       ref={setNodeRef}
+      aria-hidden
       className={cn(
-        "list-none px-2 py-1 text-[11px] text-sidebar-muted-foreground",
-        isOver && "text-primary",
+        "relative list-none shrink-0 rounded-sm",
+        props.kind === "placeholder" && props.dragging ? "h-3 border border-dashed" : "h-1",
+        props.kind === "placeholder" && props.dragging && "border-sidebar-foreground/25",
+        props.kind === "boundary" &&
+          props.dragging &&
+          "before:absolute before:inset-x-2 before:top-1/2 before:h-px before:-translate-y-1/2 before:bg-sidebar-foreground/25",
+        isOver && "border-primary/50 bg-primary/20 before:bg-primary/60",
       )}
-    >
-      {props.label}
-    </li>
+    />
   );
 }
 
@@ -1041,6 +1043,7 @@ const dropVerbBadge: Record<SidebarDropVerb, ReactNode> = {
 const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   thread: SidebarThreadSummary;
   variant: "card" | "slim";
+  grouped?: boolean;
   // Slim rows are either settled (action: un-settle) or merely quiet
   // (seen Ready threads — action: settle).
   variantAction: "settle" | "unsettle" | "unsnooze";
@@ -1681,15 +1684,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
           >
             {/* Settled history recedes: dimmed favicon at rest, restored on
               hover so the tail stays scannable when you're hunting. */}
-            <span
-              className={cn(
-                "shrink-0 transition-opacity",
-                (!props.isActive || variantAction === "unsettle") &&
-                  "opacity-40 grayscale group-focus-within/sidebar-row:opacity-100 group-focus-within/sidebar-row:grayscale-0 group-hover/sidebar-row:opacity-100 group-hover/sidebar-row:grayscale-0",
-              )}
-            >
-              {props.project ? <ProjectFavicon project={props.project} className="size-4" /> : null}
-            </span>
+            {!props.grouped ? (
+              <span
+                className={cn(
+                  "shrink-0 transition-opacity",
+                  (!props.isActive || variantAction === "unsettle") &&
+                    "opacity-40 grayscale group-focus-within/sidebar-row:opacity-100 group-focus-within/sidebar-row:grayscale-0 group-hover/sidebar-row:opacity-100 group-hover/sidebar-row:grayscale-0",
+                )}
+              >
+                {props.project ? (
+                  <ProjectFavicon project={props.project} className="size-4" />
+                ) : null}
+              </span>
+            ) : null}
             {draftIndicator}
             {title}
             {pinIndicator}
@@ -1851,10 +1858,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
           >
             <div className="flex h-5 min-w-0 items-center gap-1.5">
               {draftIndicator}
-              {props.project ? (
+              {!props.grouped && props.project ? (
                 <ProjectFavicon project={props.project} className="size-4 shrink-0" />
               ) : null}
-              {props.projectDisplayName ? (
+              {!props.grouped && props.projectDisplayName ? (
                 <span
                   className={cn(
                     "min-w-0 flex-1 truncate text-secondary-label text-xs",
@@ -1939,7 +1946,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                           ) : null}
                         </span>
                       )
-                    ) : (
+                    ) : props.grouped ? null : (
                       threadTimeLabel(thread)
                     )}
                   </span>
@@ -2003,8 +2010,13 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                 </span>
               )}
             </div>
-            <div className="mt-1 flex min-w-0">
+            <div className="mt-1 flex min-w-0 items-center gap-2">
               {title}
+              {props.grouped ? (
+                <span className="shrink-0 text-xs tabular-nums text-secondary-label">
+                  {threadTimeLabel(thread)}
+                </span>
+              ) : null}
               {isRegeneratingTitle ? (
                 <span role="status" className="sr-only">
                   Regenerating title
@@ -2258,9 +2270,6 @@ export default function Sidebar() {
   const showBranchLabels = useClientSettings((s) => s.sidebarShowBranchLabels);
   const timestampFormat = useClientSettings((s) => s.timestampFormat);
   const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
-  const [expandedGroupedThreads, setExpandedGroupedThreads] = useState<ReadonlySet<string>>(
-    () => new Set(),
-  );
   const {
     settleThread,
     unsettleThread,
@@ -2886,12 +2895,10 @@ export default function Sidebar() {
         ? sidebarGroupedListsCreate({
             groups: projectGroups,
             scopeKey: scopedProjectGroup === null ? null : projectScopeKey,
-            previewLimit: sidebarThreadPreviewCount,
-            expandedPreviewProjects: expandedGroupedThreads,
             sections: {
               pinned: pinnedThreads,
               active: sidebarGroupedActiveSort(activeThreads, sidebarThreadSortOrder),
-              snoozed: visibleSnoozedThreads,
+              snoozed: snoozedThreads,
               settled: renderedSettledThreads,
             },
             totals: { snoozed: snoozedThreads, settled: settledThreads },
@@ -2900,8 +2907,6 @@ export default function Sidebar() {
     [
       groupThreadsByProject,
       sidebarThreadSortOrder,
-      sidebarThreadPreviewCount,
-      expandedGroupedThreads,
       projectGroups,
       projectScopeKey,
       scopedProjectGroup,
@@ -2909,7 +2914,6 @@ export default function Sidebar() {
       activeThreads,
       snoozedThreads,
       settledThreads,
-      visibleSnoozedThreads,
       renderedSettledThreads,
     ],
   );
@@ -3632,7 +3636,10 @@ export default function Sidebar() {
     [groupedLists],
   );
   const groupedDragOwners = useMemo(() => {
-    const owners = new Map<string, { projectKey: string; keys: ReadonlySet<string> }>();
+    const owners = new Map<
+      string,
+      { projectKey: string; keys: ReadonlySet<string>; pinnedKeys: ReadonlySet<string> }
+    >();
     for (const group of groupedLists) {
       const keys = new Set(
         group.dragItems.map((item) =>
@@ -3643,11 +3650,19 @@ export default function Sidebar() {
           ),
         ),
       );
+      const pinnedKeys = new Set(
+        group.dragItems.flatMap((item) =>
+          item.kind === "thread" && item.section === "pinned"
+            ? [sidebarGroupedDragId("thread", group.project.projectKey, item.key)]
+            : [],
+        ),
+      );
       for (const item of group.dragItems) {
         if (item.kind === "thread")
           owners.set(sidebarGroupedDragId("thread", group.project.projectKey, item.key), {
             projectKey: group.project.projectKey,
             keys,
+            pinnedKeys,
           });
       }
     }
@@ -3779,17 +3794,17 @@ export default function Sidebar() {
         })
       )
         return [];
-      const nearest = closestCenter({
-        ...args,
-        droppableContainers: args.droppableContainers.filter(
-          (container) => !groupedProjectDragIds.has(String(container.id)),
-        ),
+      const ownerProjectKey = owner.projectKey;
+      const collision = sidebarGroupedThreadCollisionDetect(args, {
+        projectIds: groupedProjectDragIds,
+        ownerKeys: owner.keys,
+        pinnedKeys: owner.pinnedKeys,
+        pinnedHeaderId: sidebarGroupedDragId("marker", ownerProjectKey, "pinned-header"),
+        pinnedDividerId: sidebarGroupedDragId("marker", ownerProjectKey, "pinned-divider"),
       })[0];
-      if (!nearest) return [];
-      const overId = String(nearest.id);
-      // Do not substitute a valid same-project row when the pointer is over a
-      // different project: releasing there must be a no-op, not a reorder.
-      return owner.keys.has(overId) ? [nearest] : [];
+      if (!collision) return [];
+      // Never redirect a foreign-project hover to an eligible local target.
+      return owner.keys.has(String(collision.id)) ? [collision] : [];
     },
     [dndCollisionDetection, groupedDragOwners, groupedProjectDragIds],
   );
@@ -3817,7 +3832,9 @@ export default function Sidebar() {
         : pinnedKeys;
       const activeOrder = grouped
         ? grouped.items.flatMap((item) =>
-            item.kind === "thread" && item.section === "active" ? [item.key] : [],
+            item.kind === "thread" && (item.section === "active" || item.section === "snoozed")
+              ? [item.key]
+              : [],
           )
         : activeKeys;
       const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
@@ -5065,6 +5082,7 @@ export default function Sidebar() {
                         thread: EnvironmentThreadShell,
                         section: SidebarSection,
                         sortable?: SortableThreadRowBag,
+                        grouped = false,
                       ) => {
                         const threadKey = scopedThreadKey(
                           scopeThreadRef(thread.environmentId, thread.id),
@@ -5082,6 +5100,7 @@ export default function Sidebar() {
                             key={`${threadKey}:${rowVariant}`}
                             thread={thread}
                             variant={rowVariant}
+                            grouped={grouped}
                             // Snoozed rows wake, settled rows un-settle, and cards settle.
                             variantAction={
                               section === "snoozed"
@@ -5193,7 +5212,9 @@ export default function Sidebar() {
                               optimisticDrop !== null
                             }
                           >
-                            {(bag) => renderThreadRowInner(thread, section, bag)}
+                            {(bag) =>
+                              renderThreadRowInner(thread, section, bag, groupKey !== undefined)
+                            }
                           </SortableThreadRow>
                         );
                       };
@@ -5202,8 +5223,6 @@ export default function Sidebar() {
                       if (groupThreadsByProject) {
                         for (const group of groupedLists) {
                           const project = group.project;
-                          const previewExpanded = expandedGroupedThreads.has(project.projectKey);
-                          const preview = group.preview;
                           const expanded = resolveProjectExpanded(
                             projectExpandedById,
                             groupPreferenceKeys(project),
@@ -5222,6 +5241,8 @@ export default function Sidebar() {
                                             renderThreadRowInner(
                                               threadByKey.get(item.key)!,
                                               item.section,
+                                              undefined,
+                                              true,
                                             ),
                                           ]
                                         : [],
@@ -5254,89 +5275,41 @@ export default function Sidebar() {
                                 )}
                                 strategy={verticalListSortingStrategy}
                               >
-                                {(["pinned", "active", "snoozed"] as const).map((section) => {
-                                  const list = preview[section];
-                                  if (section === "snoozed" && group.totalBySection.snoozed === 0)
-                                    return null;
-                                  const label =
-                                    section === "pinned"
-                                      ? "Pinned"
-                                      : section === "active"
-                                        ? "Active"
-                                        : "Snoozed";
-                                  const target =
-                                    section === "pinned"
-                                      ? "pinned-header"
-                                      : section === "active"
-                                        ? "active-placeholder"
-                                        : null;
-                                  return (
-                                    <li key={section} className="list-none">
-                                      {section === "snoozed" ? (
-                                        <button
-                                          type="button"
-                                          aria-expanded={snoozedShelfExpanded}
-                                          onClick={toggleSnoozedShelf}
-                                          className="flex w-full cursor-pointer items-center justify-between px-2 py-1 text-[11px] text-sidebar-muted-foreground hover:text-sidebar-foreground"
-                                        >
-                                          {label} ({group.totalBySection[section]}){" "}
-                                          <ChevronDownIcon
-                                            aria-hidden
-                                            className={cn(
-                                              "size-3",
-                                              snoozedShelfExpanded && "rotate-180",
-                                            )}
-                                          />
-                                        </button>
-                                      ) : (
-                                        <ul role="list">
-                                          <SidebarGroupedSectionTarget
-                                            id={sidebarGroupedDragId(
-                                              "marker",
-                                              project.projectKey,
-                                              target ?? "active-placeholder",
-                                            )}
-                                            label={label}
-                                          />
-                                        </ul>
-                                      )}
-                                      <ul role="list" className="flex flex-col gap-px">
-                                        {list.map((thread) =>
-                                          renderThreadRow(thread, section, project.projectKey),
-                                        )}
-                                      </ul>
-                                    </li>
-                                  );
-                                })}
-                                {preview.hasMore ? (
-                                  <li className="list-none">
-                                    <button
-                                      type="button"
-                                      data-thread-selection-safe
-                                      className="w-full cursor-pointer px-2 py-1 text-left text-xs text-sidebar-muted-foreground hover:text-sidebar-foreground"
-                                      onClick={() =>
-                                        setExpandedGroupedThreads((current) => {
-                                          const next = new Set(current);
-                                          if (previewExpanded) next.delete(project.projectKey);
-                                          else next.add(project.projectKey);
-                                          return next;
-                                        })
-                                      }
-                                    >
-                                      {previewExpanded ? "Show less" : "Show more"}
-                                    </button>
-                                  </li>
-                                ) : null}
-                                <ul role="list">
-                                  <SidebarGroupedSectionTarget
-                                    id={sidebarGroupedDragId(
-                                      "marker",
-                                      project.projectKey,
-                                      "settled-placeholder",
-                                    )}
-                                    label="Drop to settle"
-                                  />
-                                </ul>
+                                <SidebarGroupedSectionTarget
+                                  id={sidebarGroupedDragId(
+                                    "marker",
+                                    project.projectKey,
+                                    "pinned-header",
+                                  )}
+                                  kind="boundary"
+                                  dragging={from !== null}
+                                />
+                                {group.sections.pinned.map((thread) =>
+                                  renderThreadRow(thread, "pinned", project.projectKey),
+                                )}
+                                <SidebarGroupedSectionTarget
+                                  id={sidebarGroupedDragId(
+                                    "marker",
+                                    project.projectKey,
+                                    "pinned-divider",
+                                  )}
+                                  kind="boundary"
+                                  dragging={from !== null}
+                                />
+                                <SidebarGroupedSectionTarget
+                                  id={sidebarGroupedDragId(
+                                    "marker",
+                                    project.projectKey,
+                                    "active-placeholder",
+                                  )}
+                                  kind="placeholder"
+                                  dragging={from !== null}
+                                />
+                                {(["active", "snoozed"] as const).flatMap((section) =>
+                                  group.sections[section].map((thread) =>
+                                    renderThreadRow(thread, section, project.projectKey),
+                                  ),
+                                )}
                               </SortableContext>
                             </SidebarGroupedProjectRow>,
                           );

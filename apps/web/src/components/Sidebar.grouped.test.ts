@@ -1,11 +1,12 @@
-import { describe, expect, it } from "vite-plus/test";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
+import { describe, expect, it } from "vite-plus/test";
 import type { SidebarProjectSnapshot } from "../sidebarProjectGrouping";
 import { sidebarGroupedListsCreate } from "./Sidebar.grouped";
-import { sidebarGroupedDropResolve } from "./sidebarGroupedDropResolve";
-import { sidebarGroupedDragId } from "./sidebarGroupedDragId";
-import { sidebarGroupedDraftBelongsToProject } from "./sidebarGroupedDraftBelongsToProject";
 import { sidebarDraftRowsSelect } from "./sidebarDraftRowsSelect";
+import { sidebarGroupedDraftBelongsToProject } from "./sidebarGroupedDraftBelongsToProject";
+import { sidebarGroupedDragId } from "./sidebarGroupedDragId";
+import { sidebarGroupedDropResolve } from "./sidebarGroupedDropResolve";
+import { planSidebarThreadDrop } from "./Sidebar.logic";
 
 const project = (key: string, refs: [string, string][]) =>
   ({
@@ -55,9 +56,9 @@ describe("grouped sidebar ownership and drops", () => {
     ).toEqual(["beta"]);
   });
 
-  it("leaves settled threads and settled counts to the shared flat shelf", () => {
+  it("omits projects with no non-settled rows and leaves settled counts to the shared shelf", () => {
     const lists = sidebarGroupedListsCreate({
-      groups,
+      groups: [...groups, project("empty", [["third", "empty"]])],
       sections,
       totals: { settled: [thread("remote", "b", "done"), thread("local", "a", "older")] },
       scopeKey: null,
@@ -72,11 +73,16 @@ describe("grouped sidebar ownership and drops", () => {
       { settled: [], settledTotal: 0, settledItems: [] },
       { settled: [], settledTotal: 0, settledItems: [] },
     ]);
+    expect(lists.map(({ project }) => project.projectKey)).toEqual(["alpha", "beta"]);
     expect(
-      lists.every(({ items }) =>
-        items.some((item) => item.kind === "marker" && item.marker === "settled-placeholder"),
-      ),
-    ).toBe(true);
+      lists
+        .flatMap(({ items }) => items)
+        .some(
+          (item) =>
+            item.kind === "marker" &&
+            ["snoozed-header", "settled-header", "settled-placeholder"].includes(item.marker),
+        ),
+    ).toBe(false);
   });
 
   it("rejects cross-project and header drops but permits reorder and lifecycle moves within owner", () => {
@@ -103,7 +109,7 @@ describe("grouped sidebar ownership and drops", () => {
         activeId: row("alpha", "local:first"),
         overId: row("alpha", "remote:second"),
       })?.target.activeOrder,
-    ).toEqual(["remote:second", "local:first"]);
+    ).toEqual(["remote:second", "local:first", "local:sleep"]);
     expect(
       sidebarGroupedDropResolve({
         groups: lists,
@@ -114,49 +120,41 @@ describe("grouped sidebar ownership and drops", () => {
     expect(
       sidebarGroupedDropResolve({
         groups: lists,
-        activeId: row("alpha", "local:first"),
-        overId: marker("alpha", "settled-placeholder"),
+        activeId: row("alpha", "remote:p"),
+        overId: row("alpha", "local:first"),
       })?.target.section,
-    ).toBe("settled");
+    ).toBe("active");
     expect(
       sidebarGroupedDropResolve({
         groups: lists,
         activeId: row("alpha", "local:first"),
-        overId: marker("alpha", "snoozed-header"),
+        overId: marker("alpha", "settled-placeholder"),
       }),
     ).toBeNull();
+    expect(
+      sidebarGroupedDropResolve({
+        groups: lists,
+        activeId: row("alpha", "local:first"),
+        overId: row("alpha", "local:sleep"),
+      })?.target.section,
+    ).toBe("active");
   });
 
-  it("only exposes preview-visible rows as grouped drag targets and restores the rest on expansion", () => {
+  it("exposes every non-settled row as a same-project drag target regardless of shelf preview settings", () => {
     const row = (key: string) => sidebarGroupedDragId("thread", "alpha", key);
-    const input = { groups, sections, scopeKey: null, previewLimit: 2 };
-    const collapsed = sidebarGroupedListsCreate(input);
-    expect(collapsed[0]?.preview.active.map(({ id }) => id)).toEqual(["first"]);
+    const collapsed = sidebarGroupedListsCreate({ groups, sections, scopeKey: null });
+    expect(collapsed[0]?.preview.active.map(({ id }) => id)).toEqual(["first", "second"]);
+    expect(collapsed[0]?.preview.snoozed.map(({ id }) => id)).toEqual(["sleep"]);
     expect(
       collapsed[0]?.dragItems.filter((item) => item.kind === "thread").map((item) => item.key),
-    ).toEqual(["remote:p", "local:first"]);
+    ).toEqual(["remote:p", "local:first", "remote:second", "local:sleep"]);
     expect(
       sidebarGroupedDropResolve({
         groups: collapsed,
         activeId: row("local:first"),
         overId: row("remote:second"),
-      }),
-    ).toBeNull();
-
-    const expanded = sidebarGroupedListsCreate({
-      ...input,
-      expandedPreviewProjects: new Set(["alpha"]),
-    });
-    expect(
-      expanded[0]?.dragItems.filter((item) => item.kind === "thread").map((item) => item.key),
-    ).toEqual(["remote:p", "local:first", "remote:second", "local:sleep"]);
-    expect(
-      sidebarGroupedDropResolve({
-        groups: expanded,
-        activeId: row("local:first"),
-        overId: row("remote:second"),
       })?.target.activeOrder,
-    ).toEqual(["remote:second", "local:first"]);
+    ).toEqual(["remote:second", "local:first", "local:sleep"]);
 
     const withHiddenActive = sidebarGroupedListsCreate({
       groups,
@@ -166,16 +164,73 @@ describe("grouped sidebar ownership and drops", () => {
         active: [...sections.active, thread("local", "a", "hidden")],
       },
       scopeKey: null,
-      previewLimit: 2,
     });
-    expect(withHiddenActive[0]?.dragItems.filter((item) => item.kind === "thread")).toHaveLength(2);
+    expect(withHiddenActive[0]?.dragItems.filter((item) => item.kind === "thread")).toHaveLength(4);
     expect(
       sidebarGroupedDropResolve({
         groups: withHiddenActive,
         activeId: row("remote:second"),
         overId: row("local:first"),
       })?.target.activeOrder,
-    ).toEqual(["remote:second", "local:first", "local:hidden"]);
+    ).toEqual(["remote:second", "local:first", "local:hidden", "local:sleep"]);
+  });
+
+  it("plans pin-boundary crossings and wakes snoozed rows reordered in the unified list", () => {
+    const lists = sidebarGroupedListsCreate({ groups, sections, scopeKey: null });
+    const row = (key: string) => sidebarGroupedDragId("thread", "alpha", key);
+    const pinned = sidebarGroupedDropResolve({
+      groups: lists,
+      activeId: row("local:first"),
+      overId: sidebarGroupedDragId("marker", "alpha", "pinned-header"),
+    });
+    expect(pinned?.target.section).toBe("pinned");
+    expect(
+      planSidebarThreadDrop({
+        activeKey: "local:first",
+        activeSection: "active",
+        target: pinned!.target,
+        pinnedOrder: ["remote:p"],
+        pinnedKeysById: new Map([["remote:p", "a"]]),
+        activeOrder: ["local:first", "remote:second", "local:sleep"],
+        activeKeysById: new Map(),
+      }).kind,
+    ).toBe("pin");
+
+    const active = sidebarGroupedDropResolve({
+      groups: lists,
+      activeId: row("remote:p"),
+      overId: row("local:first"),
+    });
+    expect(active?.target.section).toBe("active");
+    expect(
+      planSidebarThreadDrop({
+        activeKey: "remote:p",
+        activeSection: "pinned",
+        target: active!.target,
+        pinnedOrder: ["remote:p"],
+        pinnedKeysById: new Map([["remote:p", "a"]]),
+        activeOrder: ["local:first", "remote:second", "local:sleep"],
+        activeKeysById: new Map(),
+      }),
+    ).toMatchObject({ kind: "move-active", unpin: true });
+
+    const snoozed = sidebarGroupedDropResolve({
+      groups: lists,
+      activeId: row("local:sleep"),
+      overId: row("remote:second"),
+    });
+    expect(snoozed?.target).toMatchObject({ section: "active" });
+    expect(
+      planSidebarThreadDrop({
+        activeKey: "local:sleep",
+        activeSection: "snoozed",
+        target: snoozed!.target,
+        pinnedOrder: ["remote:p"],
+        pinnedKeysById: new Map([["remote:p", "a"]]),
+        activeOrder: ["local:first", "remote:second", "local:sleep"],
+        activeKeysById: new Map(),
+      }),
+    ).toMatchObject({ kind: "move-active", unsnooze: true });
   });
 
   it("resolves a flat settled row dropped into its owning project's active section", () => {
