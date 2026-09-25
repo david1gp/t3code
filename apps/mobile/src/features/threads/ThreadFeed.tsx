@@ -3003,7 +3003,6 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
                 {props.reportedThreadCostUsd !== null ? (
                   <View className="items-center py-3">
                     <Text className="font-t3-medium text-xs tabular-nums text-foreground-secondary">
-                      Reported costs (available turns):{" "}
                       {formatReportedCost(props.reportedThreadCostUsd)}
                     </Text>
                   </View>
