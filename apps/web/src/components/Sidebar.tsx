@@ -2027,20 +2027,14 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                 </span>
               )}
             </div>
-            <div className="mt-1 flex min-w-0 items-center gap-2">
-              {props.grouped ? (
-                <span className="shrink-0 text-xs tabular-nums text-secondary-label">
-                  {threadTimeLabel(thread)}
-                </span>
-              ) : (
-                title
-              )}
-              {isRegeneratingTitle ? (
-                <span role="status" className="sr-only">
-                  Regenerating title
-                </span>
-              ) : null}
-            </div>
+            {!props.grouped ? (
+              <div className="mt-1 flex min-w-0 items-center gap-2">{title}</div>
+            ) : null}
+            {isRegeneratingTitle ? (
+              <span role="status" className="sr-only">
+                Regenerating title
+              </span>
+            ) : null}
             {hasCardMetadata ? (
               <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-secondary-label text-xs">
                 {/* When shown, keep the branch. The plan step used to take this slot while
