@@ -154,9 +154,7 @@ function AgentRow({ agent }: { agent: RuntimeSubagent }) {
     modelLabel,
     agent.usage ? `${formatSubagentTokenCount(agent.usage.totalTokens)} tok` : "— tok",
     agent.usage?.toolUses !== undefined ? `${agent.usage.toolUses} tools` : null,
-    agent.usage?.costUsd !== undefined
-      ? `API est. ${formatReportedCostUsd(agent.usage.costUsd)}`
-      : null,
+    agent.usage?.costUsd !== undefined ? formatReportedCostUsd(agent.usage.costUsd) : null,
     agent.activationCount > 1 ? `run ${agent.activationCount}` : null,
   ].filter((value): value is string => value !== null);
   const sessionUrl = agent.runHandles?.sessionUrl;
