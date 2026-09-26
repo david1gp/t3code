@@ -725,6 +725,60 @@ export function orderItemsByPreferredIds<TItem, TId>(input: {
   return [...ordered, ...remaining];
 }
 
+export function orderGroupedSidebarProjects<TGroup, TId>(input: {
+  groups: readonly TGroup[];
+  preferredIds: readonly TId[];
+  getMemberIds: (group: TGroup) => readonly TId[];
+}): { groups: TGroup[]; projectOrder: TId[] } {
+  const { getMemberIds, groups, preferredIds } = input;
+  const indexById = new Map(preferredIds.map((id, index) => [id, index]));
+  const indexedGroups = groups.map((group, index) => {
+    const memberIds = getMemberIds(group);
+    const knownIndexes = memberIds
+      .map((id) => indexById.get(id))
+      .filter((index): index is number => index !== undefined);
+    return {
+      group,
+      index,
+      memberIds,
+      known: knownIndexes.length > 0,
+      rank: Math.min(...knownIndexes),
+    };
+  });
+  const ordered = indexedGroups.toSorted((left, right) => {
+    if (left.known !== right.known) return left.known ? 1 : -1;
+    if (!left.known) return left.index - right.index;
+    return left.rank - right.rank || left.index - right.index;
+  });
+  const sortedMemberIds = (memberIds: readonly TId[]) =>
+    memberIds.toSorted((left, right) => {
+      const leftIndex = indexById.get(left);
+      const rightIndex = indexById.get(right);
+      if (leftIndex === undefined) return rightIndex === undefined ? 0 : 1;
+      if (rightIndex === undefined) return -1;
+      return leftIndex - rightIndex;
+    });
+  const projectOrder = ordered
+    .filter(({ known }) => !known)
+    .flatMap(({ memberIds }) => sortedMemberIds(memberIds));
+  const groupByMemberId = new Map(
+    ordered.flatMap((entry) => entry.memberIds.map((id) => [id, entry] as const)),
+  );
+  const emittedGroups = new Set<TGroup>();
+  for (const id of preferredIds) {
+    const entry = groupByMemberId.get(id);
+    if (!entry) {
+      // Keep absent projects in their saved slots so reconnecting an environment
+      // does not make its groups look newly added.
+      projectOrder.push(id);
+    } else if (entry.known && !emittedGroups.has(entry.group)) {
+      projectOrder.push(...sortedMemberIds(entry.memberIds));
+      emittedGroups.add(entry.group);
+    }
+  }
+  return { groups: ordered.map(({ group }) => group), projectOrder };
+}
+
 export function getSidebarThreadIdsToPrewarm<TThreadId>(
   visibleThreadIds: readonly TThreadId[],
   limit = SIDEBAR_THREAD_PREWARM_LIMIT,

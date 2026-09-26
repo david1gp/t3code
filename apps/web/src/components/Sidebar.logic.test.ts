@@ -22,6 +22,7 @@ import {
   isSidebarNestedLinkClick,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
+  orderGroupedSidebarProjects,
   resolveProjectStatusIndicator,
   resolveThreadRowClassName,
   resolveSidebarThreadStatus,
@@ -2513,6 +2514,90 @@ describe("sortLogicalProjectsForSidebar", () => {
         (project) => project.projectKey,
       ),
     ).toEqual(["logical-newer", "logical-older"]);
+  });
+});
+
+describe("orderGroupedSidebarProjects", () => {
+  it("seeds the first render and restores the same groups after a restart", () => {
+    const groups = [
+      { key: "first", members: ["physical-first"] },
+      { key: "second", members: ["physical-second"] },
+    ];
+    const firstRender = orderGroupedSidebarProjects({
+      groups,
+      preferredIds: [],
+      getMemberIds: (group) => group.members,
+    });
+    const restarted = orderGroupedSidebarProjects({
+      groups: groups.toReversed(),
+      preferredIds: firstRender.projectOrder,
+      getMemberIds: (group) => group.members,
+    });
+
+    expect(firstRender.groups.map(({ key }) => key)).toEqual(["first", "second"]);
+    expect(restarted.groups.map(({ key }) => key)).toEqual(["first", "second"]);
+    expect(restarted.projectOrder).toEqual(firstRender.projectOrder);
+  });
+
+  it("keeps listed logical groups stable and places a genuinely new group first", () => {
+    const groups = [
+      { key: "new", members: ["physical-new"] },
+      { key: "second", members: ["physical-second"] },
+      { key: "first", members: ["physical-first"] },
+    ];
+
+    const ordered = orderGroupedSidebarProjects({
+      groups,
+      preferredIds: ["physical-first", "physical-second"],
+      getMemberIds: (group) => group.members,
+    });
+
+    expect(ordered.groups.map(({ key }) => key)).toEqual(["new", "first", "second"]);
+    expect(ordered.projectOrder).toEqual(["physical-new", "physical-first", "physical-second"]);
+  });
+
+  it("keeps a newly discovered physical member with its already-listed logical group", () => {
+    const groups = [
+      { key: "second", members: ["physical-second"] },
+      { key: "first", members: ["first-new-member", "physical-first"] },
+    ];
+
+    const ordered = orderGroupedSidebarProjects({
+      groups,
+      preferredIds: ["physical-first", "physical-second"],
+      getMemberIds: (group) => group.members,
+    });
+
+    expect(ordered.groups.map(({ key }) => key)).toEqual(["first", "second"]);
+    expect(ordered.projectOrder).toEqual(["physical-first", "first-new-member", "physical-second"]);
+  });
+
+  it("preserves absent group slots while allowing a new group at the top", () => {
+    const preferredIds = ["physical-first", "physical-absent", "physical-last"];
+    const groups = [
+      { key: "last", members: ["physical-last"] },
+      { key: "new", members: ["physical-new"] },
+      { key: "first", members: ["physical-first"] },
+    ];
+    const missing = orderGroupedSidebarProjects({
+      groups,
+      preferredIds,
+      getMemberIds: (group) => group.members,
+    });
+    const returned = orderGroupedSidebarProjects({
+      groups: [{ key: "absent", members: ["physical-absent"] }, ...groups],
+      preferredIds: missing.projectOrder,
+      getMemberIds: (group) => group.members,
+    });
+
+    expect(missing.projectOrder).toEqual([
+      "physical-new",
+      "physical-first",
+      "physical-absent",
+      "physical-last",
+    ]);
+    expect(returned.groups.map(({ key }) => key)).toEqual(["new", "first", "absent", "last"]);
+    expect(returned.projectOrder).toEqual(missing.projectOrder);
   });
 });
 

@@ -26,6 +26,7 @@ import { useEnvironmentQuery } from "../state/query";
 import { environmentShell } from "../state/shell";
 import {
   buildThreadRouteParams,
+  resolveMissingDraftRouteDestination,
   resolveThreadRouteRenderState,
   type ThreadRouteTarget,
 } from "../threadRoutes";
@@ -154,8 +155,21 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
     if (target.kind !== "draft" || draftSession || canonicalThreadRef) {
       return;
     }
-    void navigate({ to: "/", replace: true });
-  }, [canonicalThreadRef, draftSession, navigate, target.kind]);
+    const destination = resolveMissingDraftRouteDestination(target, threadRefs);
+    if (destination?.kind === "server") {
+      void navigate({
+        to: "/$environmentId/$threadId",
+        params: buildThreadRouteParams(destination.threadRef),
+        replace: true,
+      });
+      return;
+    }
+    if (destination?.kind === "index") {
+      // The index normally starts a new draft; this navigation is the empty
+      // selection after discarding the last draft, so keep it empty.
+      void navigate({ to: "/", search: { suppressAutoDraft: true }, replace: true });
+    }
+  }, [canonicalThreadRef, draftSession, navigate, target, threadRefs]);
 
   useEffect(() => {
     if (target.kind !== "server" || !bootstrapComplete) {

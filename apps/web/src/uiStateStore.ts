@@ -396,6 +396,16 @@ export function setProjectExpanded(
   };
 }
 
+export function setProjectOrder(state: UiState, projectOrder: readonly string[]): UiState {
+  if (
+    state.projectOrder.length === projectOrder.length &&
+    state.projectOrder.every((id, index) => id === projectOrder[index])
+  ) {
+    return state;
+  }
+  return { ...state, projectOrder: [...projectOrder] };
+}
+
 export function reorderProjects(
   state: UiState,
   currentProjectOrder: readonly string[],
@@ -449,6 +459,7 @@ interface UiStateStore extends UiState {
   setPullRequestMergeMethod: (method: PullRequestMergeMethod) => void;
   setShowThreadHeaderActions: (show: boolean) => void;
   setProjectExpanded: (projectIds: string | readonly string[], expanded: boolean) => void;
+  setProjectOrder: (projectOrder: readonly string[]) => void;
   reorderProjects: (
     currentProjectOrder: readonly string[],
     draggedProjectIds: readonly string[],
@@ -472,6 +483,7 @@ export const useUiStateStore = create<UiStateStore>((set) => ({
   setShowThreadHeaderActions: (show) => set((state) => setShowThreadHeaderActions(state, show)),
   setProjectExpanded: (projectIds, expanded) =>
     set((state) => setProjectExpanded(state, projectIds, expanded)),
+  setProjectOrder: (projectOrder) => set((state) => setProjectOrder(state, projectOrder)),
   reorderProjects: (currentProjectOrder, draggedProjectIds, targetProjectIds) =>
     set((state) =>
       reorderProjects(state, currentProjectOrder, draggedProjectIds, targetProjectIds),

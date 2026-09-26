@@ -363,6 +363,38 @@ describe("uiStateStore persistence", () => {
     });
   });
 
+  it("restores a manually reordered grouped project order after reload", () => {
+    const order = ["env-a:project-a", "env-b:project-a", "env-a:project-b"];
+    const reordered = reorderProjects(
+      makeUiState(),
+      order,
+      ["env-a:project-b"],
+      ["env-a:project-a", "env-b:project-a"],
+    );
+
+    persistState(reordered);
+
+    const persisted = JSON.parse(
+      localStorageStub.getItem(PERSISTED_STATE_KEY) ?? "{}",
+    ) as PersistedUiState;
+    expect(parsePersistedState(persisted).projectOrder).toEqual([
+      "env-a:project-b",
+      "env-a:project-a",
+      "env-b:project-a",
+    ]);
+  });
+
+  it("retains the saved slot of an absent project when dragging visible groups", () => {
+    const next = reorderProjects(
+      makeUiState(),
+      ["physical-first", "physical-absent", "physical-last"],
+      ["physical-last"],
+      ["physical-first"],
+    );
+
+    expect(next.projectOrder).toEqual(["physical-last", "physical-first", "physical-absent"]);
+  });
+
   it("restores the sidebar project scope across reloads", () => {
     persistState(makeUiState({ sidebarProjectScopeKey: "github.com/pingdotgg/t3code" }));
 

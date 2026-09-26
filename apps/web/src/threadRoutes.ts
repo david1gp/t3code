@@ -20,6 +20,24 @@ type DraftThreadRouteState = {
 
 export type ThreadRouteRenderState = "loading" | "ready" | "missing";
 
+export type MissingDraftRouteDestination =
+  | { kind: "server"; threadRef: ScopedThreadRef }
+  | { kind: "index" };
+
+export function resolveMissingDraftRouteDestination(
+  target: ThreadRouteTarget,
+  threadRefs: readonly ScopedThreadRef[],
+): MissingDraftRouteDestination | null {
+  if (target.kind !== "draft") {
+    return null;
+  }
+  const threadRef = threadRefs[0];
+  if (threadRef) {
+    return { kind: "server", threadRef };
+  }
+  return { kind: "index" };
+}
+
 export function resolveThreadRouteRenderState(input: {
   bootstrapComplete: boolean;
   serverThreadShellExists: boolean;

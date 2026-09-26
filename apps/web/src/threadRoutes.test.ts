@@ -7,12 +7,38 @@ import {
   buildDraftThreadRouteParams,
   buildThreadRouteParams,
   resolveActiveThreadRouteRef,
+  resolveMissingDraftRouteDestination,
   resolveThreadRouteRenderState,
   resolveThreadRouteRef,
   resolveThreadRouteTarget,
 } from "./threadRoutes";
 
 describe("threadRoutes", () => {
+  it("sends an active discarded draft to an existing thread when available", () => {
+    const activeDraft = { kind: "draft" as const, draftId: DraftId.make("draft-1") };
+    const existingThread = scopeThreadRef("env-1" as never, ThreadId.make("thread-1"));
+
+    expect(resolveMissingDraftRouteDestination(activeDraft, [existingThread])).toEqual({
+      kind: "server",
+      threadRef: existingThread,
+    });
+  });
+
+  it("keeps the index empty after discarding the last draft with no threads", () => {
+    const activeDraft = { kind: "draft" as const, draftId: DraftId.make("draft-1") };
+
+    expect(resolveMissingDraftRouteDestination(activeDraft, [])).toEqual({ kind: "index" });
+  });
+
+  it("does not navigate when a background draft disappears", () => {
+    const activeThread = {
+      kind: "server" as const,
+      threadRef: scopeThreadRef("env-1" as never, ThreadId.make("thread-1")),
+    };
+
+    expect(resolveMissingDraftRouteDestination(activeThread, [])).toBeNull();
+  });
+
   it("builds canonical thread route params from a scoped ref", () => {
     const ref = scopeThreadRef("env-1" as never, ThreadId.make("thread-1"));
 

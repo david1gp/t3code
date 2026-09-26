@@ -1,22 +1,14 @@
-import type { SidebarThreadSortOrder } from "@t3tools/contracts/settings";
-import { sortThreads, type ThreadSortInput } from "../lib/threadSort";
+import { sortActiveThreadsByOrderKey } from "@t3tools/client-runtime/state/thread-sort";
 
-type ActiveThread = ThreadSortInput & {
+type ActiveThread = {
   readonly id: string;
+  readonly createdAt: string;
+  readonly unsettledAt?: string | null | undefined;
+  readonly environmentId?: string | undefined;
   readonly activeOrderKey?: string | null | undefined;
 };
 
-/** Sort only automatic active rows; pinned/manual order-key slots stay put. */
-export function sidebarGroupedActiveSort<T extends ActiveThread>(
-  threads: readonly T[],
-  sortOrder: SidebarThreadSortOrder,
-): T[] {
-  const automatic = sortThreads(
-    threads.filter((thread) => thread.activeOrderKey == null),
-    sortOrder,
-  );
-  let nextAutomatic = 0;
-  return threads.map((thread) =>
-    thread.activeOrderKey == null ? automatic[nextAutomatic++]! : thread,
-  );
+/** Grouped active rows use the shared stable creation/manual-key order, never message activity. */
+export function sidebarGroupedActiveSort<T extends ActiveThread>(threads: readonly T[]): T[] {
+  return sortActiveThreadsByOrderKey(threads);
 }

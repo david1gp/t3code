@@ -178,6 +178,7 @@ import {
   isSidebarNestedLinkClick,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
+  orderGroupedSidebarProjects,
   planSidebarThreadDrop,
   reduceSidebarProjectScopeMenuState,
   resolveAdjacentThreadId,
@@ -587,6 +588,7 @@ function SidebarGroupedProjectRow(props: {
         onClick={props.onToggle}
         className="mx-0.5 flex h-8 w-[calc(100%-0.25rem)] cursor-grab items-center gap-2 px-2 text-left text-xs font-medium text-sidebar-muted-foreground/60 hover:text-sidebar-foreground"
       >
+        <ProjectFavicon project={props.project} className="size-3.5 shrink-0" />
         <span className="min-w-0 shrink truncate">{props.project.displayName}</span>
         <span aria-hidden className="h-px min-w-2 flex-1 bg-sidebar-border/60" />
         <ChevronDownIcon
@@ -617,7 +619,12 @@ function SidebarGroupedSectionTarget(props: {
       aria-hidden
       className={cn(
         "relative list-none shrink-0 rounded-sm",
-        props.kind === "placeholder" && props.dragging ? "h-3 border border-dashed" : "h-1",
+        !props.dragging && "-mb-px",
+        props.kind === "placeholder" && props.dragging
+          ? "h-3 border border-dashed"
+          : props.dragging
+            ? "h-1"
+            : "h-0",
         props.kind === "placeholder" && props.dragging && "border-sidebar-foreground/25",
         props.kind === "boundary" &&
           props.dragging &&
@@ -805,6 +812,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
   composer: ComposerThreadDraftState | null;
   project: ProjectFaviconProject | null;
   projectDisplayName: string | null;
+  grouped: boolean;
   isActive: boolean;
   onNavigate: (draftId: DraftId) => void;
   onDiscard: (draftId: DraftId) => void;
@@ -866,12 +874,16 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
         <div className="relative z-10 px-[var(--sidebar-row-content-inset)] py-[var(--sidebar-content-inset)]">
           <div className="flex h-5 min-w-0 items-center gap-1.5">
             <SquarePenIcon aria-hidden className={draftPenClassName} />
-            {props.project ? (
-              <ProjectFavicon project={props.project} className="size-4 shrink-0" />
+            {!props.grouped ? (
+              <>
+                {props.project ? (
+                  <ProjectFavicon project={props.project} className="size-4 shrink-0" />
+                ) : null}
+                <span className="min-w-0 flex-1 truncate text-xs font-medium text-secondary-label">
+                  {props.projectDisplayName}
+                </span>
+              </>
             ) : null}
-            <span className="min-w-0 flex-1 truncate text-xs font-medium text-secondary-label">
-              {props.projectDisplayName}
-            </span>
             <span className="ml-auto flex h-5 min-w-5 shrink-0 items-center justify-end">
               <Tooltip>
                 <TooltipTrigger
@@ -964,9 +976,8 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
   ]);
   const handleDiscard = useCallback(
     (draftId: DraftId) => {
-      // The /draft/$draftId route redirects home on its own when the draft
-      // it renders disappears, so discarding the open draft needs no
-      // special-casing here.
+      // The route handles active-draft navigation after the store removes it;
+      // this shared path keeps grouped and flat rows on the same cleanup flow.
       releaseComposerDraftUploads(draftId);
       clearDraftThread(draftId);
     },
@@ -987,6 +998,7 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
             composer={composer}
             project={props.projectByKey.get(projectKey) ?? null}
             projectDisplayName={props.projectDisplayNameByKey.get(projectKey) ?? null}
+            grouped={props.groupProject !== undefined}
             isActive={draftId === props.routeDraftId}
             onNavigate={props.onNavigateToDraft}
             onDiscard={handleDiscard}
@@ -1858,6 +1870,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
           >
             <div className="flex h-5 min-w-0 items-center gap-1.5">
               {draftIndicator}
+              {props.grouped ? title : null}
               {!props.grouped && props.project ? (
                 <ProjectFavicon project={props.project} className="size-4 shrink-0" />
               ) : null}
@@ -1870,9 +1883,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                 >
                   {props.projectDisplayName}
                 </span>
-              ) : (
-                <span className="flex-1" />
-              )}
+              ) : null}
               {pinIndicator}
               {/* The visible state owns this slot's width: status at rest,
                   actions on hover/keyboard focus or while the popover is open. Keeping
@@ -1935,10 +1946,16 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                           ) : topStatus.icon === "done" ? (
                             <CircleCheckIcon aria-hidden className="size-4 shrink-0" />
                           ) : null}
-                          {/* The label alone is the live region: a role="status"
-                            wrapper around the ticking duration would make
-                            screen readers announce every second. */}
-                          <span role="status">{topStatus.label}</span>
+                          {props.grouped && status === "working" ? (
+                            <span role="status" className="sr-only">
+                              Working
+                            </span>
+                          ) : (
+                            // The label alone is the live region: a role="status"
+                            // wrapper around the ticking duration would make
+                            // screen readers announce every second.
+                            <span role="status">{topStatus.label}</span>
+                          )}
                           {status === "working" ? (
                             <span aria-hidden>
                               <WorkingDuration startedAt={resolveWorkingStartedAt(thread)} />
@@ -2011,12 +2028,13 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
               )}
             </div>
             <div className="mt-1 flex min-w-0 items-center gap-2">
-              {title}
               {props.grouped ? (
                 <span className="shrink-0 text-xs tabular-nums text-secondary-label">
                   {threadTimeLabel(thread)}
                 </span>
-              ) : null}
+              ) : (
+                title
+              )}
               {isRegeneratingTitle ? (
                 <span role="status" className="sr-only">
                   Regenerating title
@@ -2253,6 +2271,7 @@ export default function Sidebar() {
   const projects = useProjects();
   const projectOrder = useUiStateStore((store) => store.projectOrder);
   const projectExpandedById = useUiStateStore((store) => store.projectExpandedById);
+  const setProjectOrder = useUiStateStore((store) => store.setProjectOrder);
   const setProjectExpanded = useUiStateStore((store) => store.setProjectExpanded);
   const reorderProjects = useUiStateStore((store) => store.reorderProjects);
   const updateClientSettings = useUpdateClientSettings();
@@ -2430,10 +2449,31 @@ export default function Sidebar() {
       sidebarProjectSortOrder,
     ],
   );
-  const projectGroups = useMemo(
-    () => sortLogicalProjectsForSidebar(unsortedProjectGroups, threads, sidebarProjectSortOrder),
-    [sidebarProjectSortOrder, threads, unsortedProjectGroups],
-  );
+  const projectGroups = useMemo(() => {
+    if (!groupThreadsByProject) {
+      return sortLogicalProjectsForSidebar(unsortedProjectGroups, threads, sidebarProjectSortOrder);
+    }
+    return orderGroupedSidebarProjects({
+      groups: unsortedProjectGroups,
+      preferredIds: projectOrder,
+      getMemberIds: (group) => group.memberProjects.map(getProjectOrderKey),
+    }).groups;
+  }, [
+    groupThreadsByProject,
+    projectOrder,
+    sidebarProjectSortOrder,
+    threads,
+    unsortedProjectGroups,
+  ]);
+  useEffect(() => {
+    if (!groupThreadsByProject) return;
+    const { projectOrder: nextOrder } = orderGroupedSidebarProjects({
+      groups: unsortedProjectGroups,
+      preferredIds: projectOrder,
+      getMemberIds: (group) => group.memberProjects.map(getProjectOrderKey),
+    });
+    setProjectOrder(nextOrder);
+  }, [groupThreadsByProject, projectOrder, setProjectOrder, unsortedProjectGroups]);
   const projectGroupsRef = useRef(projectGroups);
   projectGroupsRef.current = projectGroups;
   const serverConfigs = useAtomValue(environmentServerConfigsAtom);
@@ -2897,7 +2937,7 @@ export default function Sidebar() {
             scopeKey: scopedProjectGroup === null ? null : projectScopeKey,
             sections: {
               pinned: pinnedThreads,
-              active: sidebarGroupedActiveSort(activeThreads, sidebarThreadSortOrder),
+              active: sidebarGroupedActiveSort(activeThreads),
               snoozed: snoozedThreads,
               settled: renderedSettledThreads,
             },
@@ -2906,7 +2946,6 @@ export default function Sidebar() {
         : [],
     [
       groupThreadsByProject,
-      sidebarThreadSortOrder,
       projectGroups,
       projectScopeKey,
       scopedProjectGroup,
@@ -4007,7 +4046,11 @@ export default function Sidebar() {
         );
         if (!source || !destination || source === destination) return;
         reorderProjects(
-          projectGroups.flatMap((group) => group.memberProjects.map(getProjectOrderKey)),
+          orderGroupedSidebarProjects({
+            groups: projectGroups,
+            preferredIds: projectOrder,
+            getMemberIds: (group) => group.memberProjects.map(getProjectOrderKey),
+          }).projectOrder,
           source.project.memberProjects.map(getProjectOrderKey),
           destination.project.memberProjects.map(getProjectOrderKey),
         );
@@ -4056,6 +4099,7 @@ export default function Sidebar() {
       groupedProjectDragIds,
       dndCollisionDetection,
       handleThreadDragEnd,
+      projectOrder,
       projectGroups,
       reorderProjects,
       sidebarProjectSortOrder,
@@ -4750,68 +4794,70 @@ export default function Sidebar() {
               searchFieldRef={headerSearchRef}
               hasProjects={projectGroups.length > 0}
               sidebarOptions={
-                <Menu>
-                  <MenuTrigger
-                    render={
-                      <SidebarHeaderIconButton label="Sidebar options">
-                        <ArrowUpDownIcon />
-                      </SidebarHeaderIconButton>
-                    }
-                  />
-                  <MenuPopup align="end" side="bottom">
-                    <MenuGroup>
-                      <div className="px-2 py-1 text-xs font-medium text-muted-foreground">
-                        Sort threads
-                      </div>
-                      <MenuRadioGroup
-                        value={sidebarThreadSortOrder}
-                        onValueChange={(value) =>
-                          updateClientSettings({
-                            sidebarThreadSortOrder: value as SidebarThreadSortOrder,
-                          })
-                        }
-                      >
-                        <MenuRadioItem value="updated_at">Last user message</MenuRadioItem>
-                        <MenuRadioItem value="created_at">Created at</MenuRadioItem>
-                      </MenuRadioGroup>
-                    </MenuGroup>
-                    <MenuGroup>
-                      <div className="px-2 pt-2 pb-1 text-xs font-medium text-muted-foreground">
-                        Visible threads per project
-                      </div>
-                      <div className="px-2 py-1">
-                        <NumberField
-                          aria-label="Visible thread count"
-                          className="w-28"
-                          max={MAX_SIDEBAR_THREAD_PREVIEW_COUNT}
-                          min={MIN_SIDEBAR_THREAD_PREVIEW_COUNT}
-                          onValueChange={(value) => {
-                            if (value === null) return;
-                            const count = Math.min(
-                              MAX_SIDEBAR_THREAD_PREVIEW_COUNT,
-                              Math.max(MIN_SIDEBAR_THREAD_PREVIEW_COUNT, value),
-                            ) as SidebarThreadPreviewCount;
-                            if (count !== sidebarThreadPreviewCount) {
-                              updateClientSettings({ sidebarThreadPreviewCount: count });
-                            }
-                          }}
-                          size="sm"
-                          step={1}
-                          value={sidebarThreadPreviewCount}
+                !groupThreadsByProject ? (
+                  <Menu>
+                    <MenuTrigger
+                      render={
+                        <SidebarHeaderIconButton label="Sidebar options">
+                          <ArrowUpDownIcon />
+                        </SidebarHeaderIconButton>
+                      }
+                    />
+                    <MenuPopup align="end" side="bottom">
+                      <MenuGroup>
+                        <div className="px-2 py-1 text-xs font-medium text-muted-foreground">
+                          Sort threads
+                        </div>
+                        <MenuRadioGroup
+                          value={sidebarThreadSortOrder}
+                          onValueChange={(value) =>
+                            updateClientSettings({
+                              sidebarThreadSortOrder: value as SidebarThreadSortOrder,
+                            })
+                          }
                         >
-                          <NumberFieldGroup>
-                            <NumberFieldDecrement aria-label="Decrease visible thread count" />
-                            <NumberFieldInput
-                              inputMode="numeric"
-                              onKeyDownCapture={(event) => event.stopPropagation()}
-                            />
-                            <NumberFieldIncrement aria-label="Increase visible thread count" />
-                          </NumberFieldGroup>
-                        </NumberField>
-                      </div>
-                    </MenuGroup>
-                  </MenuPopup>
-                </Menu>
+                          <MenuRadioItem value="updated_at">Last user message</MenuRadioItem>
+                          <MenuRadioItem value="created_at">Created at</MenuRadioItem>
+                        </MenuRadioGroup>
+                      </MenuGroup>
+                      <MenuGroup>
+                        <div className="px-2 pt-2 pb-1 text-xs font-medium text-muted-foreground">
+                          Visible threads per project
+                        </div>
+                        <div className="px-2 py-1">
+                          <NumberField
+                            aria-label="Visible thread count"
+                            className="w-28"
+                            max={MAX_SIDEBAR_THREAD_PREVIEW_COUNT}
+                            min={MIN_SIDEBAR_THREAD_PREVIEW_COUNT}
+                            onValueChange={(value) => {
+                              if (value === null) return;
+                              const count = Math.min(
+                                MAX_SIDEBAR_THREAD_PREVIEW_COUNT,
+                                Math.max(MIN_SIDEBAR_THREAD_PREVIEW_COUNT, value),
+                              ) as SidebarThreadPreviewCount;
+                              if (count !== sidebarThreadPreviewCount) {
+                                updateClientSettings({ sidebarThreadPreviewCount: count });
+                              }
+                            }}
+                            size="sm"
+                            step={1}
+                            value={sidebarThreadPreviewCount}
+                          >
+                            <NumberFieldGroup>
+                              <NumberFieldDecrement aria-label="Decrease visible thread count" />
+                              <NumberFieldInput
+                                inputMode="numeric"
+                                onKeyDownCapture={(event) => event.stopPropagation()}
+                              />
+                              <NumberFieldIncrement aria-label="Increase visible thread count" />
+                            </NumberFieldGroup>
+                          </NumberField>
+                        </div>
+                      </MenuGroup>
+                    </MenuPopup>
+                  </Menu>
+                ) : null
               }
               projectScope={
                 <Combobox

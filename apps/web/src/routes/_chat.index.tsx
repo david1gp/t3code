@@ -40,6 +40,7 @@ function ChatIndexRouteView() {
  * end. Falls back to an add-project hero when no project exists yet.
  */
 function IndexDraftLanding() {
+  const { suppressAutoDraft } = Route.useSearch();
   const projects = useProjects();
   const threads = useThreadShells();
   const bootstrapped = useAllEnvironmentShellsBootstrapped();
@@ -56,7 +57,7 @@ function IndexDraftLanding() {
   );
 
   useEffect(() => {
-    if (mostRecentProject === null || startingRef.current) {
+    if (suppressAutoDraft || mostRecentProject === null || startingRef.current) {
       return;
     }
     startingRef.current = true;
@@ -66,7 +67,7 @@ function IndexDraftLanding() {
       startingRef.current = false;
       setStartState((state) => ({ ...state, failed: true }));
     });
-  }, [handleNewThread, mostRecentProject, startState.retryRequest]);
+  }, [handleNewThread, mostRecentProject, startState.retryRequest, suppressAutoDraft]);
 
   if (!bootstrapped) {
     return null;
@@ -110,6 +111,11 @@ function DraftStartError({ onRetry }: { readonly onRetry: () => void }) {
 }
 
 export const Route = createFileRoute("/_chat/")({
+  validateSearch: (raw: Record<string, unknown>) => ({
+    ...(raw.suppressAutoDraft === true || raw.suppressAutoDraft === "true"
+      ? { suppressAutoDraft: true }
+      : {}),
+  }),
   component: ChatIndexRouteView,
 });
 
