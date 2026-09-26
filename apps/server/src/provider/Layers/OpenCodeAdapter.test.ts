@@ -48,6 +48,7 @@ import {
   makeOpenCodeAdapter,
   mergeOpenCodeAssistantText,
   openCodeContextUsageNormalize,
+  type OpenCodeAdapterLiveOptions,
 } from "./OpenCodeAdapter.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 
@@ -680,26 +681,25 @@ const openCodeAdapterTestSettings = Schema.decodeSync(OpenCodeSettings)({
   serverPassword: "secret-password",
 });
 
-const OpenCodeAdapterTestLayer = Layer.effect(
-  OpenCodeAdapter,
-  makeOpenCodeAdapter(openCodeAdapterTestSettings),
-).pipe(
-  Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
-  Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
-  Layer.provideMerge(
-    ServerSettingsService.layerTest({
-      providers: {
-        opencode: {
-          binaryPath: "fake-opencode",
-          serverUrl: "http://127.0.0.1:9999",
-          serverPassword: "secret-password",
+const makeOpenCodeAdapterTestLayer = (options?: OpenCodeAdapterLiveOptions) =>
+  Layer.effect(OpenCodeAdapter, makeOpenCodeAdapter(openCodeAdapterTestSettings, options)).pipe(
+    Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(
+      ServerSettingsService.layerTest({
+        providers: {
+          opencode: {
+            binaryPath: "fake-opencode",
+            serverUrl: "http://127.0.0.1:9999",
+            serverPassword: "secret-password",
+          },
         },
-      },
-    }),
-  ),
-  Layer.provideMerge(providerSessionDirectoryTestLayer),
-  Layer.provideMerge(NodeServices.layer),
-);
+      }),
+    ),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  );
+const OpenCodeAdapterTestLayer = makeOpenCodeAdapterTestLayer();
 
 beforeEach(() => {
   runtimeMock.reset();
@@ -2757,6 +2757,671 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
   );
 
   it.effect(
+    "keeps child task events queued while ancestry lookup stalls without blocking the event pump",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-child-ancestry-stall");
+        const rootSessionId = "http://127.0.0.1:9999/session";
+        const enqueue = makeOpenCodeEventQueue();
+        const lookupStarted = promiseWithResolvers<void>();
+        const releaseLookup = promiseWithResolvers<void>();
+        const retryLookupStarted = promiseWithResolvers<void>();
+        const releaseRetryLookup = promiseWithResolvers<void>();
+        let childLookupCount = 0;
+        runtimeMock.state.sessionGetImplementation = async (sessionID) => {
+          if (sessionID !== "ses_stalled_child") return;
+          childLookupCount += 1;
+          if (childLookupCount === 1) lookupStarted.resolve(undefined);
+          if (childLookupCount === 1) await releaseLookup.promise;
+          if (childLookupCount === 2) {
+            retryLookupStarted.resolve(undefined);
+            await releaseRetryLookup.promise;
+          }
+        };
+        const metadataUpdated = yield* Deferred.make<void>();
+        const childTaskStarted = yield* Deferred.make<void>();
+        const eventsFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId),
+          Stream.tap((event) => {
+            if (event.type === "thread.metadata.updated") {
+              return Deferred.succeed(metadataUpdated, undefined);
+            }
+            if (event.type === "task.started") {
+              return Deferred.succeed(childTaskStarted, undefined);
+            }
+            return Effect.void;
+          }),
+          Stream.runDrain,
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+
+        enqueue({
+          id: "evt-stalled-child-task",
+          type: "session.status",
+          properties: { sessionID: "ses_stalled_child", status: { type: "busy" } },
+        });
+        yield* Effect.promise(() => lookupStarted.promise);
+        enqueue({
+          id: "evt-stalled-child-message",
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_stalled_child",
+            info: { id: "msg-stalled-child", role: "assistant" },
+          },
+        });
+        enqueue({
+          id: "evt-parent-during-child-lookup",
+          type: "session.updated",
+          properties: {
+            info: { id: rootSessionId, title: "Parent remains responsive" },
+          },
+        });
+        yield* Deferred.await(metadataUpdated).pipe(Effect.timeout("1 second"));
+        NodeAssert.equal(
+          childLookupCount,
+          1,
+          "events from one child share a single ancestry lookup",
+        );
+
+        runtimeMock.state.sessionParentById.set("ses_stalled_child", rootSessionId);
+        runtimeMock.state.transientErrorSessionIds.add("ses_stalled_child");
+        releaseLookup.resolve(undefined);
+        yield* advanceTestClock(250);
+        yield* Effect.promise(() => retryLookupStarted.promise);
+        runtimeMock.state.transientErrorSessionIds.delete("ses_stalled_child");
+        releaseRetryLookup.resolve(undefined);
+        yield* Deferred.await(childTaskStarted).pipe(Effect.timeout("1 second"));
+        NodeAssert.equal(
+          childLookupCount,
+          2,
+          "failed ancestry lookup is retried once per child at a time",
+        );
+        yield* adapter.stopSession(threadId);
+        yield* Fiber.interrupt(eventsFiber);
+      }),
+  );
+
+  it.effect(
+    "flushes child events before new arrivals even while a flush is waiting on logging",
+    () =>
+      Effect.gen(function* () {
+        const threadId = asThreadId("thread-child-flush-order");
+        const childId = "ses_ordered_child";
+        const rootId = "http://127.0.0.1:9999/session";
+        const enqueue = makeOpenCodeEventQueue();
+        const lookupStarted = promiseWithResolvers<void>();
+        const releaseLookup = promiseWithResolvers<void>();
+        const flushStarted = promiseWithResolvers<void>();
+        const releaseFlush = promiseWithResolvers<void>();
+        const logged: string[] = [];
+        runtimeMock.state.sessionParentById.set(childId, rootId);
+        runtimeMock.state.sessionGetImplementation = async (sessionId) => {
+          if (sessionId !== childId) return;
+          lookupStarted.resolve(undefined);
+          await releaseLookup.promise;
+        };
+        const adapterLayer = makeOpenCodeAdapterTestLayer({
+          nativeEventLogger: {
+            filePath: "memory://ordered-child",
+            write: (entry) =>
+              Effect.gen(function* () {
+                const id = (entry as { event?: { payload?: { id?: string } } }).event?.payload?.id;
+                if (id === "evt-first-child") {
+                  flushStarted.resolve(undefined);
+                  yield* Effect.promise(() => releaseFlush.promise);
+                }
+                if (id) logged.push(id);
+              }),
+            close: () => Effect.void,
+          },
+        });
+        yield* Effect.gen(function* () {
+          const adapter = yield* OpenCodeAdapter;
+          const metadataUpdated = yield* Deferred.make<void>();
+          const completed = yield* Deferred.make<void>();
+          const events: string[] = [];
+          const eventsFiber = yield* adapter.streamEvents.pipe(
+            Stream.filter((event) => event.threadId === threadId),
+            Stream.tap((event) =>
+              Effect.gen(function* () {
+                if (event.type.startsWith("task.")) events.push(event.type);
+                if (event.type === "thread.metadata.updated") {
+                  yield* Deferred.succeed(metadataUpdated, undefined);
+                }
+                if (event.type === "task.progress") {
+                  yield* Deferred.succeed(completed, undefined);
+                }
+              }),
+            ),
+            Stream.runDrain,
+            Effect.forkChild,
+          );
+          yield* adapter.startSession({
+            provider: ProviderDriverKind.make("opencode"),
+            threadId,
+            runtimeMode: "full-access",
+          });
+          enqueue({
+            id: "evt-first-child",
+            type: "session.status",
+            properties: {
+              sessionID: childId,
+              status: { type: "busy" },
+            },
+          });
+          yield* Effect.promise(() => lookupStarted.promise);
+          enqueue({
+            id: "evt-terminal-child",
+            type: "session.status",
+            properties: {
+              sessionID: childId,
+              status: { type: "idle" },
+            },
+          });
+          releaseLookup.resolve(undefined);
+          yield* Effect.promise(() => flushStarted.promise);
+          enqueue({
+            id: "evt-later-child",
+            type: "session.status",
+            properties: {
+              sessionID: childId,
+              status: { type: "busy" },
+            },
+          });
+          enqueue({
+            id: "evt-parent-marker",
+            type: "session.updated",
+            properties: {
+              info: { id: rootId, title: "Pump advanced past later child event" },
+            },
+          });
+          yield* Deferred.await(metadataUpdated).pipe(Effect.timeout("1 second"));
+          releaseFlush.resolve(undefined);
+          yield* Deferred.await(completed).pipe(Effect.timeout("1 second"));
+          NodeAssert.deepEqual(
+            logged.filter((id) => id.includes("child")),
+            ["evt-first-child", "evt-terminal-child", "evt-later-child"],
+          );
+          NodeAssert.deepEqual(events, ["task.started", "task.completed", "task.progress"]);
+          yield* adapter.stopSession(threadId);
+          yield* Fiber.interrupt(eventsFiber);
+        }).pipe(Effect.provide(adapterLayer));
+      }),
+  );
+
+  it.effect("does not hold the event pump when session.created starts a queued child flush", () =>
+    Effect.gen(function* () {
+      const childId = "ses_created_flush";
+      const rootId = "http://127.0.0.1:9999/session";
+      const threadId = asThreadId("thread-created-flush");
+      const enqueue = makeOpenCodeEventQueue();
+      const lookupStarted = promiseWithResolvers<void>();
+      const releaseLookup = promiseWithResolvers<void>();
+      const flushStarted = promiseWithResolvers<void>();
+      const releaseFlush = promiseWithResolvers<void>();
+      runtimeMock.state.sessionGetImplementation = async (id) => {
+        if (id !== childId) return;
+        lookupStarted.resolve(undefined);
+        await releaseLookup.promise;
+      };
+      const layer = makeOpenCodeAdapterTestLayer({
+        nativeEventLogger: {
+          filePath: "memory://created-flush",
+          write: (entry) =>
+            Effect.gen(function* () {
+              if (
+                (entry as { event?: { payload?: { id?: string } } }).event?.payload?.id !==
+                "evt-created-queued"
+              )
+                return;
+              flushStarted.resolve(undefined);
+              yield* Effect.promise(() => releaseFlush.promise);
+            }),
+          close: () => Effect.void,
+        },
+      });
+      yield* Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const marker = yield* Deferred.make<void>();
+        const completed = yield* Deferred.make<void>();
+        const eventsFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId),
+          Stream.tap((event) => {
+            if (event.type === "thread.metadata.updated")
+              return Deferred.succeed(marker, undefined);
+            if (event.type === "task.completed") return Deferred.succeed(completed, undefined);
+            return Effect.void;
+          }),
+          Stream.runDrain,
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        enqueue({
+          id: "evt-created-queued",
+          type: "session.status",
+          properties: {
+            sessionID: childId,
+            status: { type: "busy" },
+          },
+        });
+        yield* Effect.promise(() => lookupStarted.promise);
+        enqueue({
+          id: "evt-created-child",
+          type: "session.created",
+          properties: {
+            info: { id: childId, parentID: rootId },
+          },
+        });
+        yield* Effect.promise(() => flushStarted.promise);
+        enqueue({
+          id: "evt-created-idle",
+          type: "session.status",
+          properties: {
+            sessionID: childId,
+            status: { type: "idle" },
+          },
+        });
+        enqueue({
+          id: "evt-created-parent-marker",
+          type: "session.updated",
+          properties: {
+            info: { id: rootId, title: "Parent advanced while child flush held" },
+          },
+        });
+        yield* Deferred.await(marker).pipe(Effect.timeout("1 second"));
+        releaseFlush.resolve(undefined);
+        releaseLookup.resolve(undefined);
+        yield* Deferred.await(completed).pipe(Effect.timeout("1 second"));
+        yield* adapter.stopSession(threadId);
+        yield* Fiber.interrupt(eventsFiber);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect(
+    "bounds queued child payloads and reports overflow without dropping the terminal event",
+    () =>
+      Effect.gen(function* () {
+        const childId = "ses_bounded_child";
+        const rootId = "http://127.0.0.1:9999/session";
+        const threadId = asThreadId("thread-bounded-child");
+        const enqueue = makeOpenCodeEventQueue();
+        const lookupStarted = promiseWithResolvers<void>();
+        const releaseLookup = promiseWithResolvers<void>();
+        const logged: string[] = [];
+        runtimeMock.state.sessionParentById.set(childId, rootId);
+        runtimeMock.state.sessionGetImplementation = async (id) => {
+          if (id !== childId) return;
+          lookupStarted.resolve(undefined);
+          await releaseLookup.promise;
+        };
+        const layer = makeOpenCodeAdapterTestLayer({
+          nativeEventLogger: {
+            filePath: "memory://bounded-child",
+            write: (entry) =>
+              Effect.sync(() => {
+                const id = (entry as { event?: { payload?: { id?: string } } }).event?.payload?.id;
+                if (id) logged.push(id);
+              }),
+            close: () => Effect.void,
+          },
+        });
+        yield* Effect.gen(function* () {
+          const adapter = yield* OpenCodeAdapter;
+          const marker = yield* Deferred.make<void>();
+          const completed = yield* Deferred.make<void>();
+          const warnings: string[] = [];
+          const eventsFiber = yield* adapter.streamEvents.pipe(
+            Stream.filter((event) => event.threadId === threadId),
+            Stream.tap((event) => {
+              if (event.type === "thread.metadata.updated")
+                return Deferred.succeed(marker, undefined);
+              if (event.type === "task.completed") return Deferred.succeed(completed, undefined);
+              if (event.type === "runtime.warning") warnings.push(event.payload.message);
+              return Effect.void;
+            }),
+            Stream.runDrain,
+            Effect.forkChild,
+          );
+          yield* adapter.startSession({
+            provider: ProviderDriverKind.make("opencode"),
+            threadId,
+            runtimeMode: "full-access",
+          });
+          enqueue({
+            id: "evt-bounded-busy",
+            type: "session.status",
+            properties: {
+              sessionID: childId,
+              status: { type: "busy" },
+            },
+          });
+          yield* Effect.promise(() => lookupStarted.promise);
+          for (let index = 0; index < 600; index += 1) {
+            enqueue({
+              id: `evt-bounded-${index}`,
+              type: "message.part.delta",
+              properties: {
+                sessionID: childId,
+                messageID: "msg-bounded",
+                partID: "part-bounded",
+                field: "text",
+                delta: "x",
+              },
+            });
+          }
+          enqueue({
+            id: "evt-bounded-idle",
+            type: "session.status",
+            properties: {
+              sessionID: childId,
+              status: { type: "idle" },
+            },
+          });
+          enqueue({
+            id: "evt-bounded-marker",
+            type: "session.updated",
+            properties: {
+              info: { id: rootId, title: "Done enqueueing" },
+            },
+          });
+          yield* Deferred.await(marker).pipe(Effect.timeout("1 second"));
+          releaseLookup.resolve(undefined);
+          yield* Deferred.await(completed).pipe(Effect.timeout("1 second"));
+          NodeAssert.ok(warnings.some((message) => message.includes("discarded")));
+          NodeAssert.ok(logged.filter((id) => /^evt-bounded-\d+$/.test(id)).length <= 256);
+          NodeAssert.ok(logged.includes("evt-bounded-idle"));
+          yield* adapter.stopSession(threadId);
+          yield* Fiber.interrupt(eventsFiber);
+        }).pipe(Effect.provide(layer));
+      }),
+  );
+
+  it.effect("keeps terminal child events past the old queue and unrelated-session limits", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-child-event-overload");
+      const childId = "ses_overloaded_child";
+      const rootId = "http://127.0.0.1:9999/session";
+      const enqueue = makeOpenCodeEventQueue();
+      const lookupStarted = promiseWithResolvers<void>();
+      const releaseLookup = promiseWithResolvers<void>();
+      runtimeMock.state.sessionParentById.set(childId, rootId);
+      runtimeMock.state.sessionGetImplementation = async (sessionId) => {
+        if (sessionId !== childId) return;
+        lookupStarted.resolve(undefined);
+        await releaseLookup.promise;
+      };
+      const pumpAdvanced = yield* Deferred.make<void>();
+      const childCompleted = yield* Deferred.make<void>();
+      const overflowWarned = yield* Deferred.make<void>();
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.tap((event) => {
+          if (event.type === "thread.metadata.updated")
+            return Deferred.succeed(pumpAdvanced, undefined);
+          if (event.type === "task.completed") return Deferred.succeed(childCompleted, undefined);
+          if (
+            event.type === "runtime.warning" &&
+            typeof event.payload.detail === "string" &&
+            event.payload.detail.includes("pending session limit")
+          ) {
+            return Deferred.succeed(overflowWarned, undefined);
+          }
+          return Effect.void;
+        }),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      for (let index = 0; index < 70; index += 1) {
+        enqueue({
+          id: `evt-unrelated-${index}`,
+          type: "session.status",
+          properties: {
+            sessionID: `ses_unrelated_${index}`,
+            status: { type: "busy" },
+          },
+        });
+      }
+      enqueue({
+        id: "evt-overloaded-start",
+        type: "session.status",
+        properties: {
+          sessionID: childId,
+          status: { type: "busy" },
+        },
+      });
+      yield* Effect.promise(() => lookupStarted.promise).pipe(Effect.timeout("1 second"));
+      for (let index = 0; index < 257; index += 1) {
+        enqueue({
+          id: `evt-overloaded-progress-${index}`,
+          type: "message.part.delta",
+          properties: {
+            sessionID: childId,
+            messageID: "msg-overloaded",
+            partID: "part-overloaded",
+            field: "text",
+            delta: "x",
+          },
+        });
+      }
+      enqueue({
+        id: "evt-overloaded-completed",
+        type: "session.status",
+        properties: {
+          sessionID: childId,
+          status: { type: "idle" },
+        },
+      });
+      enqueue({
+        id: "evt-overload-pump-marker",
+        type: "session.updated",
+        properties: {
+          info: { id: rootId, title: "Overload event pump is responsive" },
+        },
+      });
+      yield* Deferred.await(pumpAdvanced).pipe(Effect.timeout("1 second"));
+      yield* Deferred.await(overflowWarned).pipe(Effect.timeout("1 second"));
+      releaseLookup.resolve(undefined);
+      yield* Deferred.await(childCompleted).pipe(Effect.timeout("1 second"));
+      yield* adapter.stopSession(threadId);
+      yield* Fiber.interrupt(eventsFiber);
+    }),
+  );
+
+  it.effect("stops retrying definitively unrelated child sessions", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-unrelated-child-retry");
+      const enqueue = makeOpenCodeEventQueue();
+      const firstLookup = promiseWithResolvers<void>();
+      const fifthLookup = promiseWithResolvers<void>();
+      let lookups = 0;
+      runtimeMock.state.sessionGetImplementation = async (sessionId) => {
+        if (sessionId !== "ses_unrelated") return;
+        lookups += 1;
+        if (lookups === 1) firstLookup.resolve(undefined);
+        if (lookups === 5) fifthLookup.resolve(undefined);
+      };
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      enqueue({
+        id: "evt-unrelated",
+        type: "session.status",
+        properties: {
+          sessionID: "ses_unrelated",
+          status: { type: "busy" },
+        },
+      });
+      yield* Effect.promise(() => firstLookup.promise);
+      yield* advanceTestClock(10_000);
+      yield* Effect.promise(() => fifthLookup.promise);
+      yield* advanceTestClock(10_000);
+      NodeAssert.equal(lookups, 5);
+      for (let index = 0; index < 20; index += 1) {
+        enqueue({
+          id: `evt-unrelated-repeat-${index}`,
+          type: "session.status",
+          properties: {
+            sessionID: "ses_unrelated",
+            status: { type: "busy" },
+          },
+        });
+      }
+      const marker = yield* Deferred.make<void>();
+      const completed = yield* Deferred.make<void>();
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.tap((event) => {
+          if (event.type === "thread.metadata.updated") return Deferred.succeed(marker, undefined);
+          if (event.type === "task.completed") return Deferred.succeed(completed, undefined);
+          return Effect.void;
+        }),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      enqueue({
+        id: "evt-unrelated-marker",
+        type: "session.updated",
+        properties: {
+          info: { id: "http://127.0.0.1:9999/session", title: "Traffic drained" },
+        },
+      });
+      yield* Deferred.await(marker).pipe(Effect.timeout("1 second"));
+      NodeAssert.equal(lookups, 5, "repeated unrelated traffic must not restart lookups");
+      enqueue({
+        id: "evt-unrelated-now-child",
+        type: "session.created",
+        properties: {
+          info: { id: "ses_unrelated", parentID: "http://127.0.0.1:9999/session" },
+        },
+      });
+      enqueue({
+        id: "evt-unrelated-now-idle",
+        type: "session.status",
+        properties: {
+          sessionID: "ses_unrelated",
+          status: { type: "idle" },
+        },
+      });
+      yield* Deferred.await(completed).pipe(Effect.timeout("1 second"));
+      NodeAssert.equal(lookups, 5, "explicit late ancestry needs no new lookup");
+      yield* adapter.stopSession(threadId);
+      yield* Fiber.interrupt(eventsFiber);
+    }),
+  );
+
+  it.effect("attributes delayed child start and completion to the turn that received them", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-child-delayed-origin");
+      const childId = "ses_delayed_origin";
+      const rootId = "http://127.0.0.1:9999/session";
+      const enqueue = makeOpenCodeEventQueue();
+      const lookupStarted = promiseWithResolvers<void>();
+      const releaseLookup = promiseWithResolvers<void>();
+      runtimeMock.state.sessionParentById.set(childId, rootId);
+      runtimeMock.state.sessionGetImplementation = async (sessionId) => {
+        if (sessionId !== childId) return;
+        lookupStarted.resolve(undefined);
+        await releaseLookup.promise;
+      };
+      const parentCompleted = yield* Deferred.make<void>();
+      const childCompleted = yield* Deferred.make<void>();
+      const childEvents: Array<{ type: string; turnId: unknown }> = [];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.tap((event) =>
+          Effect.gen(function* () {
+            if (event.type === "turn.completed")
+              yield* Deferred.succeed(parentCompleted, undefined);
+            if (event.type === "task.started" || event.type === "task.completed") {
+              childEvents.push({ type: event.type, turnId: event.turnId });
+              if (event.type === "task.completed")
+                yield* Deferred.succeed(childCompleted, undefined);
+            }
+          }),
+        ),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "Delegate",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+      enqueue({
+        id: "evt-delayed-origin-busy",
+        type: "session.status",
+        properties: {
+          sessionID: childId,
+          status: { type: "busy" },
+        },
+      });
+      yield* Effect.promise(() => lookupStarted.promise);
+      enqueue({
+        id: "evt-parent-busy-before-origin",
+        type: "session.status",
+        properties: {
+          sessionID: rootId,
+          status: { type: "busy" },
+        },
+      });
+      enqueue({
+        id: "evt-parent-idle-before-origin",
+        type: "session.status",
+        properties: {
+          sessionID: rootId,
+          status: { type: "idle" },
+        },
+      });
+      yield* Deferred.await(parentCompleted).pipe(Effect.timeout("1 second"));
+      enqueue({
+        id: "evt-delayed-origin-idle",
+        type: "session.status",
+        properties: {
+          sessionID: childId,
+          status: { type: "idle" },
+        },
+      });
+      releaseLookup.resolve(undefined);
+      yield* Deferred.await(childCompleted).pipe(Effect.timeout("1 second"));
+      NodeAssert.deepEqual(childEvents, [
+        { type: "task.started", turnId: turn.turnId },
+        { type: "task.completed", turnId: turn.turnId },
+      ]);
+      yield* adapter.stopSession(threadId);
+      yield* Fiber.interrupt(eventsFiber);
+    }),
+  );
+
+  it.effect(
     "normalizes nested child sessions without mixing their transcript or usage into the parent",
     () =>
       Effect.gen(function* () {
@@ -2766,6 +3431,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         runtimeMock.state.sessionParentById.set("ses_late_child", rootSessionId);
         runtimeMock.state.sessionParentById.set("ses_nested_child", "ses_late_child");
         const enqueue = makeOpenCodeEventQueue();
+        const childMetadataDone = yield* Deferred.make<void>();
         const eventsFiber = yield* adapter.streamEvents.pipe(
           Stream.filter(
             (event) =>
@@ -2775,6 +3441,13 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
                 event.type === "content.delta" ||
                 event.type === "thread.token-usage.updated" ||
                 event.type === "turn.completed"),
+          ),
+          Stream.tap((event) =>
+            event.type === "task.progress" &&
+            event.payload.taskId === "ses_late_child" &&
+            event.payload.title === "Research child after completion"
+              ? Deferred.succeed(childMetadataDone, undefined)
+              : Effect.void,
           ),
           Stream.takeUntil((event) => event.type === "turn.completed"),
           Stream.runCollect,
@@ -3127,6 +3800,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
             },
           },
         });
+        yield* Deferred.await(childMetadataDone).pipe(Effect.timeout("1 second"));
         enqueue({
           id: "evt-parent-assistant",
           type: "message.updated",
@@ -3186,10 +3860,12 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
         const events = yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second"));
         const starts = events.filter((event) => event.type === "task.started");
-        NodeAssert.deepEqual(
-          starts.map((event) => event.payload.taskId),
-          ["ses_late_child", "ses_nested_child", "ses_cost_complete", "ses_cost_overflow"],
-        );
+        NodeAssert.deepEqual(starts.map((event) => event.payload.taskId).sort(), [
+          "ses_cost_complete",
+          "ses_cost_overflow",
+          "ses_late_child",
+          "ses_nested_child",
+        ]);
         const childStart = starts.find(
           (event) => event.type === "task.started" && event.payload.taskId === "ses_late_child",
         );

@@ -468,6 +468,15 @@ interface OpenCodeSessionContext {
   readonly autoRepliedRequestIds: Set<string>;
   readonly emittedTerminalRequestIds: Set<string>;
   readonly requestRelationRetries: Map<string, OpenCodeRequestRelationRetry>;
+  readonly pendingChildTaskEvents: Map<
+    string,
+    Array<{ event: OpenCodeSubscribedEvent; turnId: TurnId | undefined }>
+  >;
+  readonly childTaskRelationRetries: Map<string, Fiber.Fiber<void>>;
+  readonly childTaskEventFlushes: Set<string>;
+  readonly unrelatedChildSessionIds: Map<string, boolean>;
+  childTaskOverflowWarned: boolean;
+  childTaskTerminalOverflowWarned: boolean;
   readonly pendingPermissions: Map<string, PermissionRequest>;
   readonly pendingQuestions: Map<string, QuestionRequest>;
   readonly messageRoleById: Map<string, "user" | "assistant">;
@@ -2535,6 +2544,7 @@ export function makeOpenCodeAdapter(
       context: OpenCodeSessionContext,
       event: OpenCodeSubscribedEvent,
       sessionId: string,
+      arrivalTurnId: TurnId | undefined,
     ) {
       const taskId = RuntimeTaskId.make(sessionId);
       const raw = event;
@@ -2574,7 +2584,7 @@ export function makeOpenCodeAdapter(
         const originTurnId =
           parentId && context.childOriginTurnIdBySessionId.has(parentId)
             ? parentOriginTurnId
-            : context.activeTurnId;
+            : arrivalTurnId;
         context.childOriginTurnIdBySessionId.set(sessionId, originTurnId);
       }
       const explicitRestart =
@@ -2796,6 +2806,207 @@ export function makeOpenCodeAdapter(
       }
     });
 
+    const flushPendingChildTaskEvents = Effect.fn("flushPendingChildTaskEvents")(function* (
+      context: OpenCodeSessionContext,
+      sessionId: string,
+    ) {
+      const events = context.pendingChildTaskEvents.get(sessionId);
+      if (!events || context.childTaskEventFlushes.has(sessionId)) return;
+      context.childTaskEventFlushes.add(sessionId);
+      yield* Effect.gen(function* () {
+        while (events.length > 0) {
+          const pending = events.shift();
+          if (!pending) continue;
+          const { event, turnId } = pending;
+          yield* writeNativeEventBestEffort(context.session.threadId, {
+            observedAt: yield* nowIso,
+            event: {
+              provider: PROVIDER,
+              threadId: context.session.threadId,
+              providerThreadId: context.openCodeSessionId,
+              type: event.type,
+              ...(turnId ? { turnId } : {}),
+              childSessionId: sessionId,
+              payload: event,
+            },
+          });
+          yield* handleChildSessionEvent(context, event, sessionId, turnId);
+        }
+        context.pendingChildTaskEvents.delete(sessionId);
+      }).pipe(Effect.ensuring(Effect.sync(() => context.childTaskEventFlushes.delete(sessionId))));
+    });
+
+    const MAX_PENDING_CHILD_SESSIONS = 64;
+    const MAX_PENDING_CHILD_EVENTS = 256;
+    const MAX_UNRELATED_CHILD_SESSIONS = 256;
+    const isTerminalChildTaskEvent = (event: OpenCodeSubscribedEvent) =>
+      event.type === "session.deleted" ||
+      event.type === "session.error" ||
+      (event.type === "session.status" && event.properties.status.type === "idle") ||
+      (event.type === "message.updated" &&
+        event.properties.info.role === "assistant" &&
+        Boolean(event.properties.info.error));
+
+    const warnChildTaskEventsDropped = Effect.fn("warnChildTaskEventsDropped")(function* (
+      context: OpenCodeSessionContext,
+      detail: string,
+    ) {
+      yield* emit({
+        ...(yield* buildEventBase({ threadId: context.session.threadId })),
+        type: "runtime.warning",
+        payload: {
+          message: "OpenCode child task events were discarded before ancestry was known.",
+          detail,
+        },
+      });
+    });
+
+    const markUnrelatedChildSession = (context: OpenCodeSessionContext, sessionId: string) => {
+      context.unrelatedChildSessionIds.delete(sessionId);
+      context.unrelatedChildSessionIds.set(sessionId, false);
+      if (context.unrelatedChildSessionIds.size > MAX_UNRELATED_CHILD_SESSIONS) {
+        context.unrelatedChildSessionIds.delete(
+          context.unrelatedChildSessionIds.keys().next().value!,
+        );
+      }
+    };
+
+    const queuePendingChildTaskEvent = Effect.fn("queuePendingChildTaskEvent")(function* (
+      context: OpenCodeSessionContext,
+      sessionId: string,
+      event: OpenCodeSubscribedEvent,
+    ) {
+      let pending = context.pendingChildTaskEvents.get(sessionId);
+      if (!pending) {
+        if (context.pendingChildTaskEvents.size >= MAX_PENDING_CHILD_SESSIONS) {
+          const oldestId = [...context.pendingChildTaskEvents.keys()].find(
+            (id) => !context.relatedSessionIds.has(id) && !context.childTaskEventFlushes.has(id),
+          );
+          if (oldestId !== undefined) {
+            const discarded = context.pendingChildTaskEvents.get(oldestId);
+            context.pendingChildTaskEvents.delete(oldestId);
+            markUnrelatedChildSession(context, oldestId);
+            const retry = context.childTaskRelationRetries.get(oldestId);
+            if (retry) {
+              context.childTaskRelationRetries.delete(oldestId);
+              yield* Fiber.interrupt(retry).pipe(Effect.forkIn(context.sessionScope));
+            }
+            if (
+              !context.childTaskOverflowWarned ||
+              discarded?.some(({ event: queued }) => isTerminalChildTaskEvent(queued))
+            ) {
+              context.childTaskOverflowWarned = true;
+              if (discarded?.some(({ event: queued }) => isTerminalChildTaskEvent(queued))) {
+                context.unrelatedChildSessionIds.set(oldestId, true);
+              }
+              yield* warnChildTaskEventsDropped(
+                context,
+                `Events for ${oldestId} exceeded the pending session limit.`,
+              );
+            }
+          } else {
+            markUnrelatedChildSession(context, sessionId);
+            if (!context.childTaskOverflowWarned || isTerminalChildTaskEvent(event)) {
+              context.childTaskOverflowWarned = true;
+              yield* warnChildTaskEventsDropped(
+                context,
+                `Events for ${sessionId} exceeded the pending session limit.`,
+              );
+            }
+            return;
+          }
+        }
+        pending = [];
+        context.pendingChildTaskEvents.set(sessionId, pending);
+      }
+      if (pending.length >= MAX_PENDING_CHILD_EVENTS) {
+        const progressIndex = pending.findIndex(
+          ({ event: queued }) => !isTerminalChildTaskEvent(queued),
+        );
+        pending.splice(progressIndex < 0 ? 0 : progressIndex, 1);
+        if (progressIndex < 0 && !context.childTaskTerminalOverflowWarned) {
+          context.childTaskTerminalOverflowWarned = true;
+          yield* warnChildTaskEventsDropped(
+            context,
+            `Terminal events for ${sessionId} exceeded the pending child event limit.`,
+          );
+        }
+        if (!context.childTaskOverflowWarned) {
+          context.childTaskOverflowWarned = true;
+          yield* warnChildTaskEventsDropped(
+            context,
+            "Pending child event buffer exceeded its limit; terminal events are preferred over progress.",
+          );
+        }
+      }
+      pending.push({ event, turnId: context.activeTurnId });
+    });
+
+    const scheduleChildTaskRelationRetry = Effect.fn("scheduleChildTaskRelationRetry")(function* (
+      context: OpenCodeSessionContext,
+      sessionId: string,
+    ) {
+      if (context.childTaskRelationRetries.has(sessionId)) return;
+      if (!context.pendingChildTaskEvents.has(sessionId)) return;
+      const run = Effect.gen(function* () {
+        let retryCount = 0;
+        let unrelatedCount = 0;
+        while (context.pendingChildTaskEvents.has(sessionId)) {
+          const relation = yield* isRelatedOpenCodeSession(context, sessionId).pipe(
+            Effect.match({
+              onFailure: () => undefined,
+              onSuccess: (related) => related,
+            }),
+          );
+          if (
+            context.childTaskRelationRetries.get(sessionId) !== fiber ||
+            !context.pendingChildTaskEvents.has(sessionId)
+          )
+            return;
+          if (relation === true || context.relatedSessionIds.has(sessionId)) {
+            addRelatedOpenCodeSession(context, sessionId);
+            yield* flushPendingChildTaskEvents(context, sessionId).pipe(
+              Effect.forkIn(context.sessionScope),
+            );
+            return;
+          }
+          if (relation === false) {
+            // A child can arrive before session.get sees its new ancestor.
+            // Give that race a short window, not perpetual unrelated retries.
+            unrelatedCount += 1;
+            if (unrelatedCount >= 5) {
+              const discarded = context.pendingChildTaskEvents.get(sessionId);
+              context.pendingChildTaskEvents.delete(sessionId);
+              markUnrelatedChildSession(context, sessionId);
+              if (discarded?.some(({ event }) => isTerminalChildTaskEvent(event))) {
+                context.unrelatedChildSessionIds.set(sessionId, true);
+                yield* warnChildTaskEventsDropped(
+                  context,
+                  `Terminal events for ${sessionId} could not be routed after five unrelated ancestry lookups.`,
+                );
+              }
+              return;
+            }
+          } else {
+            unrelatedCount = 0;
+          }
+          yield* Effect.sleep(`${Math.min(250 * 2 ** retryCount, 5_000)} millis`);
+          retryCount += 1;
+        }
+      }).pipe(
+        Effect.catchCause(() => Effect.void),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (context.childTaskRelationRetries.get(sessionId) === fiber) {
+              context.childTaskRelationRetries.delete(sessionId);
+            }
+          }),
+        ),
+      );
+      const fiber = yield* run.pipe(Effect.forkIn(context.sessionScope));
+      context.childTaskRelationRetries.set(sessionId, fiber);
+    });
+
     const handleSubscribedEvent = Effect.fn("handleSubscribedEvent")(function* (
       context: OpenCodeSessionContext,
       event: OpenCodeSubscribedEvent,
@@ -2846,6 +3057,7 @@ export function makeOpenCodeAdapter(
         const session = event.properties.info;
         if (session.parentID && context.relatedSessionIds.has(session.parentID)) {
           addRelatedOpenCodeSession(context, session.id);
+          context.unrelatedChildSessionIds.delete(session.id);
           context.childParentBySessionId.set(session.id, session.parentID);
           context.childSessionInfoById.set(session.id, session);
         }
@@ -2867,17 +3079,38 @@ export function makeOpenCodeAdapter(
           event.type === "message.removed" ||
           event.type === "message.part.removed" ||
           event.type === "todo.updated");
-      if (
-        isChildTaskEvent &&
-        !context.relatedSessionIds.has(payloadSessionId) &&
-        (yield* isRelatedOpenCodeSession(context, payloadSessionId))
-      ) {
-        // A child event can beat its session.created metadata on the shared
-        // event stream. session.get supplies ancestry and metadata here.
-        const info = context.childSessionInfoById.get(payloadSessionId);
-        if (info?.parentID) {
-          addRelatedOpenCodeSession(context, payloadSessionId);
-          context.childParentBySessionId.set(payloadSessionId, info.parentID);
+      if (isChildTaskEvent && payloadSessionId !== undefined) {
+        // Do ancestry I/O off the event pump: session.get can stall even though
+        // unrelated parent events still need to flow through this subscription.
+        if (context.pendingChildTaskEvents.has(payloadSessionId)) {
+          yield* queuePendingChildTaskEvent(context, payloadSessionId, event);
+          if (
+            context.relatedSessionIds.has(payloadSessionId) &&
+            !context.childTaskEventFlushes.has(payloadSessionId)
+          ) {
+            yield* flushPendingChildTaskEvents(context, payloadSessionId).pipe(
+              Effect.forkIn(context.sessionScope),
+            );
+          }
+          return;
+        }
+        if (!context.relatedSessionIds.has(payloadSessionId)) {
+          if (context.unrelatedChildSessionIds.has(payloadSessionId)) {
+            if (
+              isTerminalChildTaskEvent(event) &&
+              !context.unrelatedChildSessionIds.get(payloadSessionId)
+            ) {
+              context.unrelatedChildSessionIds.set(payloadSessionId, true);
+              yield* warnChildTaskEventsDropped(
+                context,
+                `Terminal event for unrelated session ${payloadSessionId} was not routed.`,
+              );
+            }
+            return;
+          }
+          yield* queuePendingChildTaskEvent(context, payloadSessionId, event);
+          yield* scheduleChildTaskRelationRetry(context, payloadSessionId);
+          return;
         }
       }
       let isKnownPendingTerminalEvent = false;
@@ -2946,7 +3179,7 @@ export function makeOpenCodeAdapter(
       if (isRelatedChildTaskEvent && payloadSessionId !== undefined) {
         // Child text, plans and tools belong to the Agents surface. Never
         // feed them through the parent transcript or parent usage fold.
-        yield* handleChildSessionEvent(context, event, payloadSessionId);
+        yield* handleChildSessionEvent(context, event, payloadSessionId, turnId);
         return;
       }
 
@@ -3713,6 +3946,12 @@ export function makeOpenCodeAdapter(
           autoRepliedRequestIds: new Set(),
           emittedTerminalRequestIds: new Set(),
           requestRelationRetries: new Map(),
+          pendingChildTaskEvents: new Map(),
+          childTaskRelationRetries: new Map(),
+          childTaskEventFlushes: new Set(),
+          unrelatedChildSessionIds: new Map(),
+          childTaskOverflowWarned: false,
+          childTaskTerminalOverflowWarned: false,
           pendingPermissions: new Map(),
           pendingQuestions: new Map(),
           textPartsByMessageId: new Map(),
