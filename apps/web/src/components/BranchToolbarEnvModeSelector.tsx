@@ -31,6 +31,10 @@ interface BranchToolbarEnvModeSelectorProps {
   previousWorktreeLabel?: string | null;
   previousWorktreeBranch?: string | null;
   onUsePreviousWorktree?: () => void;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  hiddenTrigger?: boolean;
+  popupAnchor?: HTMLElement | null;
 }
 
 export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSelector({
@@ -42,6 +46,10 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
   previousWorktreeLabel,
   previousWorktreeBranch = null,
   onUsePreviousWorktree,
+  open,
+  onOpenChange,
+  hiddenTrigger = false,
+  popupAnchor,
 }: BranchToolbarEnvModeSelectorProps) {
   const composerFloatingLayerProps = useComposerMenuProps();
   const showPreviousWorktree = Boolean(previousWorktreeLabel && onUsePreviousWorktree);
@@ -97,6 +105,8 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
   return (
     <Select
       modal={false}
+      open={open}
+      onOpenChange={onOpenChange}
       value={effectiveEnvMode}
       onValueChange={(value: string | null) => {
         if (value === PREVIOUS_WORKTREE_SELECT_VALUE) {
@@ -107,7 +117,7 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
       }}
       items={envModeItems}
     >
-      <Tooltip>
+      <Tooltip disabled={hiddenTrigger}>
         <TooltipTrigger
           render={
             <SelectTrigger
@@ -115,8 +125,9 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
               size="xs"
               className="min-w-0 shrink"
               aria-label="Workspace"
-              data-composer-shortcut="composer.workspace"
+              data-composer-shortcut={hiddenTrigger ? undefined : "composer.workspace"}
               data-composer-context-control
+              tabIndex={hiddenTrigger ? -1 : undefined}
             />
           }
         >
@@ -128,7 +139,7 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
             <FolderIcon className="size-3" />
           )}
           <span
-            data-composer-label
+            data-composer-label={hiddenTrigger ? undefined : ""}
             className="min-w-0 max-w-[240px] group-data-[compact]/composer-context:max-w-0"
           >
             <span
@@ -147,7 +158,12 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
       </Tooltip>
       <SelectPopup
         alignItemWithTrigger={false}
-        className={showPreviousWorktree ? "w-[min(21rem,calc(100vw-2rem))]" : undefined}
+        anchor={popupAnchor}
+        side={hiddenTrigger ? "top" : undefined}
+        matchTriggerWidth={!hiddenTrigger}
+        className={
+          hiddenTrigger || showPreviousWorktree ? "w-[min(21rem,calc(100vw-2rem))]" : undefined
+        }
         {...composerFloatingLayerProps}
       >
         <SelectGroup>

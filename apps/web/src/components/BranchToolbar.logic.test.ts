@@ -4,6 +4,7 @@ import {
   dedupeRemoteBranchesWithLocalMatches,
   deriveLocalBranchNameFromRemoteRef,
   resolveEnvironmentOptionLabel,
+  resolveContextStripSelectorVisibility,
   resolveBranchSelectionTarget,
   resolveCurrentWorkspaceLabel,
   resolveDraftEnvModeAfterBranchChange,
@@ -24,6 +25,95 @@ import {
 
 const localEnvironmentId = EnvironmentId.make("environment-local");
 const remoteEnvironmentId = EnvironmentId.make("environment-remote");
+
+describe("resolveContextStripSelectorVisibility", () => {
+  it("keeps the hidden branch selector mounted for the picker shortcut", () => {
+    expect(
+      resolveContextStripSelectorVisibility({
+        showGitControls: true,
+        showCheckoutSelector: true,
+        showBranchSelector: false,
+        showEnvironmentIndicator: false,
+      }),
+    ).toEqual({
+      showWorkspaceSelector: true,
+      mountHiddenWorkspaceSelector: false,
+      showBranchSelector: false,
+      mountBranchSelector: true,
+      showMobileRunContextSelector: true,
+      showDesktopRunContextSelector: true,
+    });
+  });
+
+  it("hides checkout and branch selectors independently", () => {
+    expect(
+      resolveContextStripSelectorVisibility({
+        showGitControls: true,
+        showCheckoutSelector: false,
+        showBranchSelector: true,
+        showEnvironmentIndicator: false,
+      }),
+    ).toMatchObject({
+      showWorkspaceSelector: false,
+      mountHiddenWorkspaceSelector: true,
+      showBranchSelector: true,
+      mountBranchSelector: true,
+      showMobileRunContextSelector: false,
+      showDesktopRunContextSelector: false,
+    });
+    expect(
+      resolveContextStripSelectorVisibility({
+        showGitControls: true,
+        showCheckoutSelector: false,
+        showBranchSelector: false,
+        showEnvironmentIndicator: false,
+      }),
+    ).toMatchObject({
+      showWorkspaceSelector: false,
+      mountHiddenWorkspaceSelector: true,
+      showBranchSelector: false,
+      mountBranchSelector: true,
+      showMobileRunContextSelector: false,
+      showDesktopRunContextSelector: false,
+    });
+  });
+
+  it("keeps the run-on selector available when checkout is hidden", () => {
+    expect(
+      resolveContextStripSelectorVisibility({
+        showGitControls: true,
+        showCheckoutSelector: false,
+        showBranchSelector: false,
+        showEnvironmentIndicator: true,
+      }),
+    ).toEqual({
+      showWorkspaceSelector: false,
+      mountHiddenWorkspaceSelector: true,
+      showBranchSelector: false,
+      mountBranchSelector: true,
+      showMobileRunContextSelector: true,
+      showDesktopRunContextSelector: true,
+    });
+  });
+
+  it("does not mount a hidden checkout picker in a non-Git project", () => {
+    expect(
+      resolveContextStripSelectorVisibility({
+        showGitControls: false,
+        showCheckoutSelector: false,
+        showBranchSelector: false,
+        showEnvironmentIndicator: true,
+      }),
+    ).toEqual({
+      showWorkspaceSelector: false,
+      mountHiddenWorkspaceSelector: false,
+      showBranchSelector: false,
+      mountBranchSelector: false,
+      showMobileRunContextSelector: false,
+      showDesktopRunContextSelector: true,
+    });
+  });
+});
 
 describe("resolvePreviousWorktreeSeed", () => {
   it("picks the most recently updated worktree thread", () => {

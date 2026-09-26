@@ -84,6 +84,7 @@ interface BranchToolbarBranchSelectorProps {
   forceNewWorktree?: boolean;
   ref?: Ref<BranchToolbarBranchSelectorHandle>;
   className?: string;
+  hiddenTrigger?: boolean;
   environmentId: EnvironmentId;
   threadId: ThreadId;
   draftId?: DraftId;
@@ -105,6 +106,7 @@ export function BranchToolbarBranchSelector({
   forceNewWorktree = false,
   ref,
   className,
+  hiddenTrigger = false,
   environmentId,
   threadId,
   draftId,
@@ -809,16 +811,21 @@ export function BranchToolbarBranchSelector({
             render={<ComposerControl size="xs" />}
             // No press-scale: the popup aligns live to this trigger, so a
             // momentary 0.97 shrink would drag the open popup ~3px sideways.
-            className="min-w-0 max-w-full active:scale-100"
+            className={cn(
+              "min-w-0 max-w-full active:scale-100",
+              hiddenTrigger && "pointer-events-none absolute opacity-0",
+            )}
             disabled={isInitialBranchesLoadPending || isBranchActionPending}
+            aria-hidden={hiddenTrigger || undefined}
+            tabIndex={hiddenTrigger ? -1 : undefined}
           >
             <GitBranchIcon className="size-3 shrink-0 opacity-70" />
             <span
-              data-composer-label
+              data-composer-label={hiddenTrigger ? undefined : ""}
               className="min-w-0 max-w-[240px] group-data-[compact]/composer-context:max-w-0"
             >
               <span
-                data-composer-label-motion
+                data-composer-label-motion={hiddenTrigger ? undefined : ""}
                 className="flex w-full max-w-[240px] transition-opacity duration-180 ease-[cubic-bezier(0.32,0.72,0,1)] group-data-[compact]/composer-context:opacity-0 motion-reduce:transition-none"
               >
                 <MiddleTruncate value={triggerLabel} />

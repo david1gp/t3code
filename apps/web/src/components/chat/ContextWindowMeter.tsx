@@ -57,7 +57,9 @@ export function ContextWindowMeter(props: {
             className="min-w-0 max-w-36 shrink"
             aria-label={`Context window ${meterLabel} used`}
           >
-            <span className="block min-w-0 truncate tabular-nums text-[11px]">{meterLabel}</span>
+            <span className="block min-w-0 truncate tabular-nums text-[11px] text-muted-foreground">
+              {meterLabel}
+            </span>
           </Button>
         }
       />

@@ -93,6 +93,7 @@ import {
   type SetStateAction,
   Suspense,
   useCallback,
+  useContext,
   useEffect,
   useEffectEvent,
   useLayoutEffect,
@@ -228,6 +229,8 @@ import {
   foldSubagentActivities,
 } from "@t3tools/client-runtime/state/subagentRuntime";
 import { BranchToolbar, type BranchToolbarHandle } from "./BranchToolbar";
+import { CheckoutPickerContext } from "./CheckoutPickerContext";
+import { checkoutPickerAvailable } from "./checkoutPickerAvailable";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import { isEditableFocused } from "../lib/editableFocus";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
@@ -1587,6 +1590,15 @@ export default function ChatView(props: ChatViewProps) {
   }, [routeKind, routeThreadRef, routeThreadState]);
   const markThreadVisited = useUiStateStore((store) => store.markThreadVisited);
   const settings = useEnvironmentSettings(environmentId);
+  const showCheckoutSelector = useClientSettings(
+    (clientSettings) => clientSettings.showCheckoutSelector,
+  );
+  const showBranchSelector = useClientSettings(
+    (clientSettings) => clientSettings.showBranchSelector,
+  );
+  const showInlineAccessMode = useClientSettings(
+    (clientSettings) => clientSettings.showInlineAccessMode,
+  );
   const setStickyComposerModelSelection = useComposerDraftStore(
     (store) => store.setStickyModelSelection,
   );
@@ -1658,6 +1670,7 @@ export default function ChatView(props: ChatViewProps) {
   const localComposerRef = useRef<ChatComposerHandle | null>(null);
   const composerRef = useComposerHandleContext() ?? localComposerRef;
   const branchToolbarRef = useRef<BranchToolbarHandle>(null);
+  const registerCheckoutPicker = useContext(CheckoutPickerContext)?.register;
   const pasteAsTextShortcutUntilRef = useRef(0);
   const [restingComposerControlsHost, setRestingComposerControlsHost] =
     useState<HTMLDivElement | null>(null);
@@ -3762,6 +3775,20 @@ export default function ChatView(props: ChatViewProps) {
     }
   }, [environmentId, gitStatusCwd, liveIsGitRepo]);
   const isGitRepo = liveIsGitRepo ?? recallCheckoutIsRepo(environmentId, gitStatusCwd) ?? true;
+  const canOpenCheckoutPicker = checkoutPickerAvailable({
+    hasActiveThread: activeThread != null,
+    hasActiveProject: activeProject !== null,
+    isGitRepo,
+    envLocked,
+    hasMultipleModelSelections: fanoutState.selections !== null,
+    hasPinnedServerWorktree: routeKind === "server" && activeThread?.worktreePath != null,
+  });
+  const canOpenHiddenCheckoutPicker = !showCheckoutSelector && canOpenCheckoutPicker;
+  useEffect(() => {
+    if (!registerCheckoutPicker || !canOpenHiddenCheckoutPicker) return;
+    registerCheckoutPicker(() => branchToolbarRef.current?.openCheckoutPicker());
+    return () => registerCheckoutPicker(null);
+  }, [registerCheckoutPicker, canOpenHiddenCheckoutPicker]);
   // Keep a hidden, off-flow strip mounted for existing threads so the composer
   // can measure whether its relocated controls fit. The visible chrome remains
   // content-driven: Git/environment context or controls that actually fit.
@@ -6872,12 +6899,22 @@ export default function ChatView(props: ChatViewProps) {
       if (
         command === "composer.host" ||
         command === "composer.effort" ||
-        command === "composer.mode" ||
-        command === "composer.workspace"
+        command === "composer.mode"
       ) {
         event.preventDefault();
         event.stopPropagation();
         if (!event.repeat) composerRef.current?.openControl(command);
+        return;
+      }
+
+      if (command === "composer.workspace") {
+        if (!canOpenCheckoutPicker) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (!event.repeat) {
+          if (showCheckoutSelector) composerRef.current?.openControl(command);
+          else branchToolbarRef.current?.openCheckoutPicker();
+        }
         return;
       }
 
@@ -6963,6 +7000,8 @@ export default function ChatView(props: ChatViewProps) {
     toggleRightPanelMaximized,
     toggleTerminalVisibility,
     composerRef,
+    canOpenCheckoutPicker,
+    showCheckoutSelector,
   ]);
 
   // Paste-to-focus: the resting composer blurs on a click into the timeline,
@@ -9914,11 +9953,6 @@ export default function ChatView(props: ChatViewProps) {
             </div>
             {/* Messages Wrapper */}
             <div className="relative flex min-h-0 flex-1 flex-col bg-background">
-              {reportedThreadCosts.totalUsd !== null ? (
-                <div className="flex shrink-0 justify-end px-4 pt-2 text-xs text-muted-foreground">
-                  {formatReportedCostUsd(reportedThreadCosts.totalUsd)}
-                </div>
-              ) : null}
               {/* Messages — LegendList handles virtualization and scrolling internally */}
               <MessagesTimeline
                 citationRequest={paintOnlyDisplayedTimeline ? null : citationRequest}
@@ -10149,6 +10183,7 @@ export default function ChatView(props: ChatViewProps) {
                             threadSyncPhase={activeEnvironmentUnavailable ? null : threadSyncPhase}
                             runtimeMode={runtimeMode}
                             interactionMode={interactionMode}
+                            showInlineAccessMode={showInlineAccessMode}
                             lockedProvider={lockedProvider}
                             providerStatuses={providerStatuses as ServerProvider[]}
                             providerCatalogKnown={serverConfig !== null}
@@ -10227,6 +10262,8 @@ export default function ChatView(props: ChatViewProps) {
                                 environmentId={activeThread.environmentId}
                                 threadId={activeThread.id}
                                 showGitControls={isGitRepo}
+                                showCheckoutSelector={showCheckoutSelector}
+                                showBranchSelector={showBranchSelector}
                                 {...(routeKind === "draft" && draftId ? { draftId } : {})}
                                 onEnvModeChange={onEnvModeChange}
                                 startFromOrigin={startFromOrigin}
@@ -10259,6 +10296,11 @@ export default function ChatView(props: ChatViewProps) {
                                 availableEnvironments={logicalProjectEnvironments}
                                 composerControlsHostRef={setRestingComposerControlsHost}
                                 contextStripVisible={showComposerContextStrip}
+                                reportedThreadCostLabel={
+                                  reportedThreadCosts.totalUsd === null
+                                    ? null
+                                    : formatReportedCostUsd(reportedThreadCosts.totalUsd)
+                                }
                                 activeContextWindow={activeContextWindow}
                                 contextWindowMeterEnabled={settings.contextWindowMeterEnabled}
                                 contextWindowDisplayMode={settings.contextWindowDisplayMode}

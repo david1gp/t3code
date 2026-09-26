@@ -252,6 +252,26 @@ describe("searchSettings", () => {
     expect(searchableSetting("archive")).toEqual({ id: "archive", title: "Archived threads" });
   });
 
+  it("finds each display control by its visible label", () => {
+    expect(searchableSetting("show-checkout-selector")).toEqual({
+      id: "show-checkout-selector",
+      title: "Show checkout selector",
+    });
+    expect(searchableSetting("show-branch-selector")).toEqual({
+      id: "show-branch-selector",
+      title: "Show branch selector",
+    });
+    expect(searchableSetting("show-inline-access-mode")).toEqual({
+      id: "show-inline-access-mode",
+      title: "Show inline access mode",
+    });
+    expect(searchableSetting("show-usage")).toEqual({ id: "show-usage", title: "Show Usage" });
+    expect(searchSettings("checkout selector")[0]?.id).toBe("show-checkout-selector");
+    expect(searchSettings("branch selector")[0]?.id).toBe("show-branch-selector");
+    expect(searchSettings("inline access mode")[0]?.id).toBe("show-inline-access-mode");
+    expect(searchSettings("show usage")[0]?.id).toBe("show-usage");
+  });
+
   it("routes appearance settings to their current section", () => {
     expect(searchSettings("theme")[0]).toMatchObject({
       id: "theme",

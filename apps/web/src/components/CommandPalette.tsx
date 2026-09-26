@@ -45,6 +45,7 @@ import {
   ChartNoAxesColumnIcon,
   CornerLeftUpIcon,
   FileSearchIcon,
+  FolderGit2Icon,
   FolderIcon,
   FolderPlusIcon,
   LinkIcon,
@@ -58,6 +59,7 @@ import {
   TextSearchIcon,
 } from "lucide-react";
 import {
+  useContext,
   useCallback,
   useDeferredValue,
   useEffect,
@@ -160,6 +162,7 @@ import {
 } from "./CommandPalette.logic";
 import { orderItemsByPreferredIds, sortLogicalProjectsForSidebar } from "./Sidebar.logic";
 import { resolveEnvironmentOptionLabel } from "./BranchToolbar.logic";
+import { CheckoutPickerContext } from "./CheckoutPickerContext";
 import { CommandPaletteContent } from "./CommandPaletteContent";
 import { CommandPaletteResults } from "./CommandPaletteResults";
 import { AzureDevOpsIcon, BitbucketIcon, GitHubIcon, GitLabIcon, ForgejoIcon } from "./Icons";
@@ -485,6 +488,15 @@ export function CommandPalette({ children }: { children: ReactNode }) {
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const { theme, themeHalves, resolvedTheme, appearanceMode, setAppearanceMode } = useTheme();
   const composerHandleRef = useRef<ChatComposerHandle | null>(null);
+  const [openCheckoutPicker, setOpenCheckoutPicker] = useState<(() => void) | null>(null);
+  const registerCheckoutPicker = useCallback(
+    (open: (() => void) | null) => setOpenCheckoutPicker(() => open),
+    [],
+  );
+  const checkoutPickerContext = useMemo(
+    () => ({ register: registerCheckoutPicker, open: openCheckoutPicker }),
+    [registerCheckoutPicker, openCheckoutPicker],
+  );
   const routeTarget = useParams({
     strict: false,
     select: (params) => resolveThreadRouteTarget(params),
@@ -604,31 +616,33 @@ export function CommandPalette({ children }: { children: ReactNode }) {
   );
 
   return (
-    <ComposerHandleContext value={composerHandleRef}>
-      <CommandDialog
-        open={state.open}
-        onOpenChange={(open, eventDetails) => {
-          if (!open && eventDetails.reason === "escape-key" && state.mode !== "command") {
-            eventDetails.cancel();
-            toggleMode("command");
-            return;
-          }
-          setOpen(open);
-        }}
-      >
-        {/* Block background focus calls for the entire time the palette is open. */}
-        <div className="contents" inert={state.open}>
-          {children}
-        </div>
-        <CommandPaletteDialog
-          mode={state.mode}
-          openIntent={state.openIntent}
-          setOpen={setOpen}
-          openOverlayMode={toggleMode}
-          clearOpenIntent={clearOpenIntent}
-        />
-      </CommandDialog>
-    </ComposerHandleContext>
+    <CheckoutPickerContext value={checkoutPickerContext}>
+      <ComposerHandleContext value={composerHandleRef}>
+        <CommandDialog
+          open={state.open}
+          onOpenChange={(open, eventDetails) => {
+            if (!open && eventDetails.reason === "escape-key" && state.mode !== "command") {
+              eventDetails.cancel();
+              toggleMode("command");
+              return;
+            }
+            setOpen(open);
+          }}
+        >
+          {/* Block background focus calls for the entire time the palette is open. */}
+          <div className="contents" inert={state.open}>
+            {children}
+          </div>
+          <CommandPaletteDialog
+            mode={state.mode}
+            openIntent={state.openIntent}
+            setOpen={setOpen}
+            openOverlayMode={toggleMode}
+            clearOpenIntent={clearOpenIntent}
+          />
+        </CommandDialog>
+      </ComposerHandleContext>
+    </CheckoutPickerContext>
   );
 }
 
@@ -684,6 +698,7 @@ function OpenCommandPaletteDialog(props: {
   readonly openOverlayMode: (mode: SearchOverlayMode) => void;
   readonly clearOpenIntent: () => void;
 }) {
+  const openCheckoutPicker = useContext(CheckoutPickerContext)?.open;
   const navigate = useNavigate();
   const pathname = useLocation({ select: (location) => location.pathname });
   const { clearOpenIntent, openIntent, openOverlayMode, setOpen } = props;
@@ -1735,6 +1750,20 @@ function OpenCommandPaletteDialog(props: {
   ]);
 
   const actionItems: Array<CommandPaletteActionItem | CommandPaletteSubmenuItem> = [];
+
+  if (!clientSettings.showCheckoutSelector && openCheckoutPicker) {
+    actionItems.push({
+      kind: "action",
+      value: "action:change-checkout",
+      searchTerms: ["checkout", "workspace", "worktree", "local", "change checkout"],
+      title: "Change checkout",
+      icon: <FolderGit2Icon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        // Wait for the palette to release its inert background and focus trap.
+        requestAnimationFrame(openCheckoutPicker);
+      },
+    });
+  }
 
   if (projects.length > 0) {
     const activeProjectTitle =

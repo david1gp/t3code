@@ -620,6 +620,28 @@ describe("ClientSettings sidebar", () => {
   });
 });
 
+describe("ClientSettings chat display", () => {
+  it("shows checkout, branch, and inline access mode by default", () => {
+    expect(decodeClientSettings({})).toMatchObject({
+      showCheckoutSelector: true,
+      showBranchSelector: true,
+      showInlineAccessMode: true,
+    });
+  });
+
+  it("preserves each chat display preference independently in settings and patches", () => {
+    const preferences = {
+      showCheckoutSelector: false,
+      showBranchSelector: true,
+      showInlineAccessMode: false,
+    };
+
+    expect(encodeClientSettings(decodeClientSettings(preferences))).toMatchObject(preferences);
+    expect(decodeClientSettingsPatch(preferences)).toEqual(preferences);
+    expect(() => decodeClientSettingsPatch({ showCheckoutSelector: "yes" })).toThrow();
+  });
+});
+
 describe("ClientSettings context window meter", () => {
   it("defaults off and preserves an explicit legacy opt-in", () => {
     expect(decodeClientSettings({}).contextWindowMeterEnabled).toBe(false);

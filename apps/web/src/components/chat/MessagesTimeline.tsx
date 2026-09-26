@@ -2470,7 +2470,7 @@ function AssistantMessageMeta({
       )}
       {reportedCostUsd !== undefined ? (
         <span className="text-muted-foreground text-xs tabular-nums">
-          Reported cost: {formatReportedCostUsd(reportedCostUsd)}
+          {formatReportedCostUsd(reportedCostUsd)}
         </span>
       ) : null}
     </div>

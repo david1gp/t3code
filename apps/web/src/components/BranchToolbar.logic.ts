@@ -23,6 +23,24 @@ export interface EnvironmentOption {
 export const EnvMode = Schema.Literals(["local", "worktree"]);
 export type EnvMode = typeof EnvMode.Type;
 
+export function resolveContextStripSelectorVisibility(input: {
+  showGitControls: boolean;
+  showCheckoutSelector: boolean;
+  showBranchSelector: boolean;
+  showEnvironmentIndicator: boolean;
+}) {
+  const showWorkspaceSelector = input.showGitControls && input.showCheckoutSelector;
+  return {
+    showWorkspaceSelector,
+    mountHiddenWorkspaceSelector: input.showGitControls && !input.showCheckoutSelector,
+    showBranchSelector: input.showGitControls && input.showBranchSelector,
+    mountBranchSelector: input.showGitControls,
+    showMobileRunContextSelector:
+      input.showGitControls && (showWorkspaceSelector || input.showEnvironmentIndicator),
+    showDesktopRunContextSelector: showWorkspaceSelector || input.showEnvironmentIndicator,
+  };
+}
+
 const GENERIC_LOCAL_ENVIRONMENT_LABELS = new Set(["local", "local environment"]);
 
 function normalizeDisplayLabel(value: string | null | undefined): string | null {

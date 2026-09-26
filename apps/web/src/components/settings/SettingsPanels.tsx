@@ -566,6 +566,15 @@ export function useSettingsRestore(onRestored?: () => void) {
         ? ["Pull Requests"]
         : []),
       ...(settings.sidebarShowUsage !== DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage ? ["Usage"] : []),
+      ...(settings.showCheckoutSelector !== DEFAULT_UNIFIED_SETTINGS.showCheckoutSelector
+        ? ["Checkout selector"]
+        : []),
+      ...(settings.showBranchSelector !== DEFAULT_UNIFIED_SETTINGS.showBranchSelector
+        ? ["Branch selector"]
+        : []),
+      ...(settings.showInlineAccessMode !== DEFAULT_UNIFIED_SETTINGS.showInlineAccessMode
+        ? ["Inline access mode"]
+        : []),
       ...(settings.sidebarProjectGroupingMode !==
       DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode
         ? ["Project Grouping"]
@@ -700,6 +709,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.sidebarShowBranchLabels,
       settings.sidebarShowPullRequests,
       settings.sidebarShowUsage,
+      settings.showCheckoutSelector,
+      settings.showBranchSelector,
+      settings.showInlineAccessMode,
       settings.showSkillsInSlashMenu,
       settings.timestampFormat,
       settings.notificationMode,
@@ -800,6 +812,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       sidebarShowBranchLabels: DEFAULT_UNIFIED_SETTINGS.sidebarShowBranchLabels,
       sidebarShowPullRequests: DEFAULT_UNIFIED_SETTINGS.sidebarShowPullRequests,
       sidebarShowUsage: DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage,
+      showCheckoutSelector: DEFAULT_UNIFIED_SETTINGS.showCheckoutSelector,
+      showBranchSelector: DEFAULT_UNIFIED_SETTINGS.showBranchSelector,
+      showInlineAccessMode: DEFAULT_UNIFIED_SETTINGS.showInlineAccessMode,
       sidebarProjectGroupingMode: DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode,
       sidebarAutoSettleAfterDays: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleAfterDays,
       sidebarAutoSettleOnMerge: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge,
@@ -2239,6 +2254,108 @@ export function GeneralSettingsPanel() {
   return (
     <SettingsPageContainer>
       <ProjectDefaultsSettings category="general" />
+      <SettingsSection id="display" title="Display">
+        <SettingsRow
+          {...searchableSetting("show-checkout-selector")}
+          description="Show the checkout selector in the chat toolbar."
+          resetAction={
+            settings.showCheckoutSelector !== DEFAULT_UNIFIED_SETTINGS.showCheckoutSelector ? (
+              <SettingResetButton
+                label="checkout selector"
+                onClick={() =>
+                  updateSettings({
+                    showCheckoutSelector: DEFAULT_UNIFIED_SETTINGS.showCheckoutSelector,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.showCheckoutSelector}
+              onCheckedChange={(checked) =>
+                updateSettings({ showCheckoutSelector: Boolean(checked) })
+              }
+              aria-label="Show checkout selector"
+            />
+          }
+        />
+
+        <SettingsRow
+          {...searchableSetting("show-branch-selector")}
+          description="Show the branch selector in the chat toolbar."
+          resetAction={
+            settings.showBranchSelector !== DEFAULT_UNIFIED_SETTINGS.showBranchSelector ? (
+              <SettingResetButton
+                label="branch selector"
+                onClick={() =>
+                  updateSettings({
+                    showBranchSelector: DEFAULT_UNIFIED_SETTINGS.showBranchSelector,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.showBranchSelector}
+              onCheckedChange={(checked) =>
+                updateSettings({ showBranchSelector: Boolean(checked) })
+              }
+              aria-label="Show branch selector"
+            />
+          }
+        />
+
+        <SettingsRow
+          {...searchableSetting("show-inline-access-mode")}
+          description="Show the access-mode control beside the composer."
+          resetAction={
+            settings.showInlineAccessMode !== DEFAULT_UNIFIED_SETTINGS.showInlineAccessMode ? (
+              <SettingResetButton
+                label="inline access mode"
+                onClick={() =>
+                  updateSettings({
+                    showInlineAccessMode: DEFAULT_UNIFIED_SETTINGS.showInlineAccessMode,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.showInlineAccessMode}
+              onCheckedChange={(checked) =>
+                updateSettings({ showInlineAccessMode: Boolean(checked) })
+              }
+              aria-label="Show inline access mode"
+            />
+          }
+        />
+
+        <SettingsRow
+          {...searchableSetting("show-usage")}
+          description="Show the Usage shortcut in the sidebar."
+          resetAction={
+            settings.sidebarShowUsage !== DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage ? (
+              <SettingResetButton
+                label="Usage"
+                onClick={() =>
+                  updateSettings({ sidebarShowUsage: DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.sidebarShowUsage}
+              onCheckedChange={(checked) => updateSettings({ sidebarShowUsage: Boolean(checked) })}
+              aria-label="Show Usage"
+            />
+          }
+        />
+      </SettingsSection>
+
       <SettingsSection id="organization" title="Organization">
         <SettingsRow
           {...searchableSetting("project-grouping")}
@@ -2381,28 +2498,6 @@ export function GeneralSettingsPanel() {
                 updateSettings({ sidebarShowPullRequests: Boolean(checked) })
               }
               aria-label="Show Pull Requests"
-            />
-          }
-        />
-
-        <SettingsRow
-          title="Show Usage"
-          description="Show the Usage shortcut in the sidebar."
-          resetAction={
-            settings.sidebarShowUsage !== DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage ? (
-              <SettingResetButton
-                label="Usage"
-                onClick={() =>
-                  updateSettings({ sidebarShowUsage: DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage })
-                }
-              />
-            ) : null
-          }
-          control={
-            <Switch
-              checked={settings.sidebarShowUsage}
-              onCheckedChange={(checked) => updateSettings({ sidebarShowUsage: Boolean(checked) })}
-              aria-label="Show Usage"
             />
           }
         />

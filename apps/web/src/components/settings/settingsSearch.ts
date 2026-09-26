@@ -272,6 +272,30 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["combine matching repositories environments sidebar"],
   },
   {
+    id: "show-checkout-selector",
+    title: "Show checkout selector",
+    to: "/settings/general",
+    searchTerms: ["chat toolbar local checkout display hide"],
+  },
+  {
+    id: "show-branch-selector",
+    title: "Show branch selector",
+    to: "/settings/general",
+    searchTerms: ["chat toolbar branch display hide"],
+  },
+  {
+    id: "show-inline-access-mode",
+    title: "Show inline access mode",
+    to: "/settings/general",
+    searchTerms: ["composer full access control display hide"],
+  },
+  {
+    id: "show-usage",
+    title: "Show Usage",
+    to: "/settings/general",
+    searchTerms: ["sidebar shortcut"],
+  },
+  {
     id: "auto-settle-inactive-threads",
     title: "Auto-settle inactive threads",
     to: "/settings/general",

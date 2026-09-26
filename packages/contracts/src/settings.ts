@@ -445,6 +445,9 @@ export const ClientSettingsSchema = Schema.Struct({
   composerCollapseOnScroll: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   // Rich text is the default; users can opt out for literal Markdown editing.
   composerRichTextEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  showCheckoutSelector: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  showBranchSelector: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  showInlineAccessMode: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   sendShortcut: Schema.Literals(["enter", "mod-enter-multiline", "mod-enter"]).pipe(
     Schema.withDecodingDefault(Effect.succeed("enter")),
   ),
@@ -1633,6 +1636,9 @@ export const ClientSettingsPatch = Schema.Struct({
   contextWindowDisplayMode: Schema.optionalKey(Schema.Literals(["simple", "detailed"])),
   composerCollapseOnScroll: Schema.optionalKey(Schema.Boolean),
   composerRichTextEnabled: Schema.optionalKey(Schema.Boolean),
+  showCheckoutSelector: Schema.optionalKey(Schema.Boolean),
+  showBranchSelector: Schema.optionalKey(Schema.Boolean),
+  showInlineAccessMode: Schema.optionalKey(Schema.Boolean),
   sendShortcut: Schema.optionalKey(Schema.Literals(["enter", "mod-enter-multiline", "mod-enter"])),
   followUpBehavior: Schema.optionalKey(Schema.Literals(["queue", "steer"])),
   proactivePanelsEnabled: Schema.optionalKey(Schema.Boolean),
