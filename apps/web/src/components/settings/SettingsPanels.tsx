@@ -575,6 +575,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.showInlineAccessMode !== DEFAULT_UNIFIED_SETTINGS.showInlineAccessMode
         ? ["Inline access mode"]
         : []),
+      ...(settings.showCompactComposerMenu !== DEFAULT_UNIFIED_SETTINGS.showCompactComposerMenu
+        ? ["Compact composer menu"]
+        : []),
       ...(settings.sidebarProjectGroupingMode !==
       DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode
         ? ["Project Grouping"]
@@ -616,6 +619,14 @@ export function useSettingsRestore(onRestored?: () => void) {
         : []),
       ...(settings.contextWindowDisplayMode !== DEFAULT_UNIFIED_SETTINGS.contextWindowDisplayMode
         ? ["Context usage display mode"]
+        : []),
+      ...(settings.showThreadCostInContextStrip !==
+      DEFAULT_UNIFIED_SETTINGS.showThreadCostInContextStrip
+        ? ["Thread cost in context strip"]
+        : []),
+      ...(settings.showThreadCostInComposerFooter !==
+      DEFAULT_UNIFIED_SETTINGS.showThreadCostInComposerFooter
+        ? ["Thread cost in composer footer"]
         : []),
       ...(settings.responseStreamingMode !== DEFAULT_UNIFIED_SETTINGS.responseStreamingMode
         ? ["Response streaming"]
@@ -687,6 +698,8 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.environmentIdentificationMode,
       settings.contextWindowMeterEnabled,
       settings.contextWindowDisplayMode,
+      settings.showThreadCostInContextStrip,
+      settings.showThreadCostInComposerFooter,
       settings.fontFamilyCode,
       settings.fontFamilyComposer,
       settings.fontFamilySans,
@@ -712,6 +725,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.showCheckoutSelector,
       settings.showBranchSelector,
       settings.showInlineAccessMode,
+      settings.showCompactComposerMenu,
       settings.showSkillsInSlashMenu,
       settings.timestampFormat,
       settings.notificationMode,
@@ -803,6 +817,8 @@ export function useSettingsRestore(onRestored?: () => void) {
       followUpBehavior: DEFAULT_UNIFIED_SETTINGS.followUpBehavior,
       contextWindowMeterEnabled: DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled,
       contextWindowDisplayMode: DEFAULT_UNIFIED_SETTINGS.contextWindowDisplayMode,
+      showThreadCostInContextStrip: DEFAULT_UNIFIED_SETTINGS.showThreadCostInContextStrip,
+      showThreadCostInComposerFooter: DEFAULT_UNIFIED_SETTINGS.showThreadCostInComposerFooter,
       environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
       glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
       panelAnimationDurationMs: DEFAULT_UNIFIED_SETTINGS.panelAnimationDurationMs,
@@ -815,6 +831,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       showCheckoutSelector: DEFAULT_UNIFIED_SETTINGS.showCheckoutSelector,
       showBranchSelector: DEFAULT_UNIFIED_SETTINGS.showBranchSelector,
       showInlineAccessMode: DEFAULT_UNIFIED_SETTINGS.showInlineAccessMode,
+      showCompactComposerMenu: DEFAULT_UNIFIED_SETTINGS.showCompactComposerMenu,
       sidebarProjectGroupingMode: DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode,
       sidebarAutoSettleAfterDays: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleAfterDays,
       sidebarAutoSettleOnMerge: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge,
@@ -2065,12 +2082,9 @@ function AutoSettleDaysInput({
   );
 }
 
-// The legacy rows sit behind the fold, so a settings-search jump has to
+// The legacy row sits behind the fold, so a settings-search jump has to
 // expand the section before its target can mount and scroll.
-const LEGACY_FEATURE_TARGET_IDS: ReadonlySet<string> = new Set([
-  "legacy-plan-mode",
-  "legacy-context-window-indicator",
-]);
+const LEGACY_FEATURE_TARGET_IDS: ReadonlySet<string> = new Set(["legacy-plan-mode"]);
 
 /**
  * Retired features kept only for users who still depend on them. Collapsed by
@@ -2121,39 +2135,6 @@ function LegacyFeaturesSection() {
                   }}
                   aria-label="Plan mode (legacy)"
                 />
-              }
-            />
-            <SettingsRow
-              {...searchableSetting("legacy-context-window-indicator")}
-              description="Show context usage in the composer and choose how it is displayed."
-              control={
-                <div className="flex items-center gap-3">
-                  <Select
-                    value={settings.contextWindowDisplayMode}
-                    onValueChange={(value) => {
-                      if (value === "simple" || value === "detailed") {
-                        updateSettings({ contextWindowDisplayMode: value });
-                      }
-                    }}
-                  >
-                    <SelectTrigger size="sm" aria-label="Context usage display mode">
-                      <SelectValue>
-                        {settings.contextWindowDisplayMode === "simple" ? "Simple" : "Detailed"}
-                      </SelectValue>
-                    </SelectTrigger>
-                    <SelectPopup align="end" alignItemWithTrigger={false}>
-                      <SelectItem value="simple">Simple</SelectItem>
-                      <SelectItem value="detailed">Detailed</SelectItem>
-                    </SelectPopup>
-                  </Select>
-                  <Switch
-                    checked={settings.contextWindowMeterEnabled}
-                    onCheckedChange={(checked) =>
-                      updateSettings({ contextWindowMeterEnabled: Boolean(checked) })
-                    }
-                    aria-label="Context window indicator (legacy)"
-                  />
-                </div>
               }
             />
           </SettingsGroup>
@@ -2254,106 +2235,231 @@ export function GeneralSettingsPanel() {
   return (
     <SettingsPageContainer>
       <ProjectDefaultsSettings category="general" />
-      <SettingsSection id="display" title="Display">
-        <SettingsRow
-          {...searchableSetting("show-checkout-selector")}
-          description="Show the checkout selector in the chat toolbar."
-          resetAction={
-            settings.showCheckoutSelector !== DEFAULT_UNIFIED_SETTINGS.showCheckoutSelector ? (
-              <SettingResetButton
-                label="checkout selector"
-                onClick={() =>
-                  updateSettings({
-                    showCheckoutSelector: DEFAULT_UNIFIED_SETTINGS.showCheckoutSelector,
-                  })
+      <SettingsSection id="display" title="Display" variant="plain">
+        <SettingsSection title="Sidebar" className="py-2">
+          <SettingsRow
+            {...searchableSetting("show-usage")}
+            description="Show the Usage shortcut in the sidebar."
+            resetAction={
+              settings.sidebarShowUsage !== DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage ? (
+                <SettingResetButton
+                  label="Usage shortcut"
+                  onClick={() =>
+                    updateSettings({ sidebarShowUsage: DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <Switch
+                checked={settings.sidebarShowUsage}
+                onCheckedChange={(checked) =>
+                  updateSettings({ sidebarShowUsage: Boolean(checked) })
                 }
+                aria-label="Show sidebar Usage shortcut"
               />
-            ) : null
-          }
-          control={
-            <Switch
-              checked={settings.showCheckoutSelector}
-              onCheckedChange={(checked) =>
-                updateSettings({ showCheckoutSelector: Boolean(checked) })
-              }
-              aria-label="Show checkout selector"
-            />
-          }
-        />
+            }
+          />
+        </SettingsSection>
 
-        <SettingsRow
-          {...searchableSetting("show-branch-selector")}
-          description="Show the branch selector in the chat toolbar."
-          resetAction={
-            settings.showBranchSelector !== DEFAULT_UNIFIED_SETTINGS.showBranchSelector ? (
-              <SettingResetButton
-                label="branch selector"
-                onClick={() =>
-                  updateSettings({
-                    showBranchSelector: DEFAULT_UNIFIED_SETTINGS.showBranchSelector,
-                  })
+        <SettingsSection title="Chat area / toolbar" className="py-2">
+          <SettingsRow
+            {...searchableSetting("show-checkout-selector")}
+            description="Show the checkout selector in the chat toolbar."
+            resetAction={
+              settings.showCheckoutSelector !== DEFAULT_UNIFIED_SETTINGS.showCheckoutSelector ? (
+                <SettingResetButton
+                  label="checkout selector"
+                  onClick={() =>
+                    updateSettings({
+                      showCheckoutSelector: DEFAULT_UNIFIED_SETTINGS.showCheckoutSelector,
+                    })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <Switch
+                checked={settings.showCheckoutSelector}
+                onCheckedChange={(checked) =>
+                  updateSettings({ showCheckoutSelector: Boolean(checked) })
                 }
+                aria-label="Show checkout selector"
               />
-            ) : null
-          }
-          control={
-            <Switch
-              checked={settings.showBranchSelector}
-              onCheckedChange={(checked) =>
-                updateSettings({ showBranchSelector: Boolean(checked) })
-              }
-              aria-label="Show branch selector"
-            />
-          }
-        />
+            }
+          />
 
-        <SettingsRow
-          {...searchableSetting("show-inline-access-mode")}
-          description="Show the access-mode control beside the composer."
-          resetAction={
-            settings.showInlineAccessMode !== DEFAULT_UNIFIED_SETTINGS.showInlineAccessMode ? (
-              <SettingResetButton
-                label="inline access mode"
-                onClick={() =>
-                  updateSettings({
-                    showInlineAccessMode: DEFAULT_UNIFIED_SETTINGS.showInlineAccessMode,
-                  })
+          <SettingsRow
+            {...searchableSetting("show-branch-selector")}
+            description="Show the branch selector in the chat toolbar."
+            resetAction={
+              settings.showBranchSelector !== DEFAULT_UNIFIED_SETTINGS.showBranchSelector ? (
+                <SettingResetButton
+                  label="branch selector"
+                  onClick={() =>
+                    updateSettings({
+                      showBranchSelector: DEFAULT_UNIFIED_SETTINGS.showBranchSelector,
+                    })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <Switch
+                checked={settings.showBranchSelector}
+                onCheckedChange={(checked) =>
+                  updateSettings({ showBranchSelector: Boolean(checked) })
                 }
+                aria-label="Show branch selector"
               />
-            ) : null
-          }
-          control={
-            <Switch
-              checked={settings.showInlineAccessMode}
-              onCheckedChange={(checked) =>
-                updateSettings({ showInlineAccessMode: Boolean(checked) })
-              }
-              aria-label="Show inline access mode"
-            />
-          }
-        />
+            }
+          />
 
-        <SettingsRow
-          {...searchableSetting("show-usage")}
-          description="Show the Usage shortcut in the sidebar."
-          resetAction={
-            settings.sidebarShowUsage !== DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage ? (
-              <SettingResetButton
-                label="Usage"
-                onClick={() =>
-                  updateSettings({ sidebarShowUsage: DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage })
+          <SettingsRow
+            {...searchableSetting("legacy-context-window-indicator")}
+            description="Show the text context meter in the chat toolbar and choose how it is displayed. Simple shows the current token size."
+            control={
+              <div className="flex items-center gap-3">
+                <Select
+                  value={settings.contextWindowDisplayMode}
+                  onValueChange={(value) => {
+                    if (value === "simple" || value === "detailed") {
+                      updateSettings({ contextWindowDisplayMode: value });
+                    }
+                  }}
+                >
+                  <SelectTrigger size="sm" aria-label="Context usage display mode">
+                    <SelectValue>
+                      {settings.contextWindowDisplayMode === "simple" ? "Simple" : "Detailed"}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectPopup align="end" alignItemWithTrigger={false}>
+                    <SelectItem value="simple">Simple</SelectItem>
+                    <SelectItem value="detailed">Detailed</SelectItem>
+                  </SelectPopup>
+                </Select>
+                <Switch
+                  checked={settings.contextWindowMeterEnabled}
+                  onCheckedChange={(checked) =>
+                    updateSettings({ contextWindowMeterEnabled: Boolean(checked) })
+                  }
+                  aria-label="Show text context meter in chat toolbar"
+                />
+              </div>
+            }
+          />
+          <SettingsRow
+            {...searchableSetting("show-thread-cost-in-context-strip")}
+            description="Show the thread cost in the strip below the composer."
+            resetAction={
+              settings.showThreadCostInContextStrip !==
+              DEFAULT_UNIFIED_SETTINGS.showThreadCostInContextStrip ? (
+                <SettingResetButton
+                  label="thread cost in context strip"
+                  onClick={() =>
+                    updateSettings({
+                      showThreadCostInContextStrip:
+                        DEFAULT_UNIFIED_SETTINGS.showThreadCostInContextStrip,
+                    })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <Switch
+                checked={settings.showThreadCostInContextStrip}
+                onCheckedChange={(checked) =>
+                  updateSettings({ showThreadCostInContextStrip: Boolean(checked) })
                 }
+                aria-label="Show thread cost in context strip"
               />
-            ) : null
-          }
-          control={
-            <Switch
-              checked={settings.sidebarShowUsage}
-              onCheckedChange={(checked) => updateSettings({ sidebarShowUsage: Boolean(checked) })}
-              aria-label="Show Usage"
-            />
-          }
-        />
+            }
+          />
+        </SettingsSection>
+
+        <SettingsSection title="Chat composer" className="py-2">
+          <SettingsRow
+            {...searchableSetting("show-inline-access-mode")}
+            description="Show the access-mode control beside the composer."
+            resetAction={
+              settings.showInlineAccessMode !== DEFAULT_UNIFIED_SETTINGS.showInlineAccessMode ? (
+                <SettingResetButton
+                  label="inline access mode"
+                  onClick={() =>
+                    updateSettings({
+                      showInlineAccessMode: DEFAULT_UNIFIED_SETTINGS.showInlineAccessMode,
+                    })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <Switch
+                checked={settings.showInlineAccessMode}
+                onCheckedChange={(checked) =>
+                  updateSettings({ showInlineAccessMode: Boolean(checked) })
+                }
+                aria-label="Show inline access mode"
+              />
+            }
+          />
+        </SettingsSection>
+
+        <SettingsSection title="Chat composer footer" className="py-2">
+          <SettingsRow
+            {...searchableSetting("show-thread-cost-in-composer-footer")}
+            description="Show the thread cost in the composer footer when the context strip is hidden."
+            resetAction={
+              settings.showThreadCostInComposerFooter !==
+              DEFAULT_UNIFIED_SETTINGS.showThreadCostInComposerFooter ? (
+                <SettingResetButton
+                  label="thread cost in composer footer"
+                  onClick={() =>
+                    updateSettings({
+                      showThreadCostInComposerFooter:
+                        DEFAULT_UNIFIED_SETTINGS.showThreadCostInComposerFooter,
+                    })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <Switch
+                checked={settings.showThreadCostInComposerFooter}
+                onCheckedChange={(checked) =>
+                  updateSettings({ showThreadCostInComposerFooter: Boolean(checked) })
+                }
+                aria-label="Show thread cost when context strip is hidden"
+              />
+            }
+          />
+          <SettingsRow
+            {...searchableSetting("show-compact-composer-menu")}
+            description="Show the compact composer menu for overflowed controls."
+            resetAction={
+              settings.showCompactComposerMenu !==
+              DEFAULT_UNIFIED_SETTINGS.showCompactComposerMenu ? (
+                <SettingResetButton
+                  label="compact composer menu"
+                  onClick={() =>
+                    updateSettings({
+                      showCompactComposerMenu: DEFAULT_UNIFIED_SETTINGS.showCompactComposerMenu,
+                    })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <Switch
+                checked={settings.showCompactComposerMenu}
+                onCheckedChange={(checked) =>
+                  updateSettings({ showCompactComposerMenu: Boolean(checked) })
+                }
+                aria-label="Show compact composer menu"
+              />
+            }
+          />
+        </SettingsSection>
       </SettingsSection>
 
       <SettingsSection id="organization" title="Organization">

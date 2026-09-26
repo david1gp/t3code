@@ -626,6 +626,7 @@ describe("ClientSettings chat display", () => {
       showCheckoutSelector: true,
       showBranchSelector: true,
       showInlineAccessMode: true,
+      showCompactComposerMenu: true,
     });
   });
 
@@ -634,6 +635,7 @@ describe("ClientSettings chat display", () => {
       showCheckoutSelector: false,
       showBranchSelector: true,
       showInlineAccessMode: false,
+      showCompactComposerMenu: false,
     };
 
     expect(encodeClientSettings(decodeClientSettings(preferences))).toMatchObject(preferences);
@@ -667,6 +669,23 @@ describe("ClientSettings context window meter", () => {
     expect(
       decodeClientSettings({ contextWindowMeterEnabled: true }).contextWindowMeterEnabled,
     ).toBe(true);
+  });
+});
+
+describe("ClientSettings thread cost visibility", () => {
+  it("defaults both locations on and persists their preferences independently", () => {
+    expect(decodeClientSettings({})).toMatchObject({
+      showThreadCostInContextStrip: true,
+      showThreadCostInComposerFooter: true,
+    });
+
+    const preferences = {
+      showThreadCostInContextStrip: false,
+      showThreadCostInComposerFooter: true,
+    };
+    expect(decodeClientSettingsPatch(preferences)).toEqual(preferences);
+    expect(encodeClientSettings(decodeClientSettings(preferences))).toMatchObject(preferences);
+    expect(() => decodeClientSettingsPatch({ showThreadCostInContextStrip: "yes" })).toThrow();
   });
 });
 

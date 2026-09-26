@@ -440,6 +440,12 @@ export const ClientSettingsSchema = Schema.Struct({
   contextWindowDisplayMode: Schema.Literals(["simple", "detailed"]).pipe(
     Schema.withDecodingDefault(Effect.succeed("detailed")),
   ),
+  showThreadCostInContextStrip: Schema.Boolean.pipe(
+    Schema.withDecodingDefault(Effect.succeed(true)),
+  ),
+  showThreadCostInComposerFooter: Schema.Boolean.pipe(
+    Schema.withDecodingDefault(Effect.succeed(true)),
+  ),
   // Desktop resting composer: scrolling an existing thread's conversation
   // settles the composer into its single-line layout. Losing focus never does.
   composerCollapseOnScroll: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
@@ -448,6 +454,7 @@ export const ClientSettingsSchema = Schema.Struct({
   showCheckoutSelector: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   showBranchSelector: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   showInlineAccessMode: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  showCompactComposerMenu: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   sendShortcut: Schema.Literals(["enter", "mod-enter-multiline", "mod-enter"]).pipe(
     Schema.withDecodingDefault(Effect.succeed("enter")),
   ),
@@ -1634,11 +1641,14 @@ export const ClientSettingsPatch = Schema.Struct({
   planModeEnabled: Schema.optionalKey(Schema.Boolean),
   contextWindowMeterEnabled: Schema.optionalKey(Schema.Boolean),
   contextWindowDisplayMode: Schema.optionalKey(Schema.Literals(["simple", "detailed"])),
+  showThreadCostInContextStrip: Schema.optionalKey(Schema.Boolean),
+  showThreadCostInComposerFooter: Schema.optionalKey(Schema.Boolean),
   composerCollapseOnScroll: Schema.optionalKey(Schema.Boolean),
   composerRichTextEnabled: Schema.optionalKey(Schema.Boolean),
   showCheckoutSelector: Schema.optionalKey(Schema.Boolean),
   showBranchSelector: Schema.optionalKey(Schema.Boolean),
   showInlineAccessMode: Schema.optionalKey(Schema.Boolean),
+  showCompactComposerMenu: Schema.optionalKey(Schema.Boolean),
   sendShortcut: Schema.optionalKey(Schema.Literals(["enter", "mod-enter-multiline", "mod-enter"])),
   followUpBehavior: Schema.optionalKey(Schema.Literals(["queue", "steer"])),
   proactivePanelsEnabled: Schema.optionalKey(Schema.Boolean),

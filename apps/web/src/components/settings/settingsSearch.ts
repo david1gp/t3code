@@ -272,6 +272,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["combine matching repositories environments sidebar"],
   },
   {
+    id: "show-usage",
+    title: "Show sidebar Usage shortcut",
+    to: "/settings/general",
+    searchTerms: ["sidebar shortcut usage"],
+  },
+  {
     id: "show-checkout-selector",
     title: "Show checkout selector",
     to: "/settings/general",
@@ -284,16 +290,36 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["chat toolbar branch display hide"],
   },
   {
+    id: "legacy-context-window-indicator",
+    title: "Show text context meter",
+    to: "/settings/general",
+    searchTerms: [
+      "chat toolbar context usage window simple detailed percentage tokens meter circle legacy",
+    ],
+  },
+  {
+    id: "show-thread-cost-in-context-strip",
+    title: "Show thread cost in context strip",
+    to: "/settings/general",
+    searchTerms: ["chat toolbar price usage cost below composer display hide"],
+  },
+  {
+    id: "show-thread-cost-in-composer-footer",
+    title: "Show thread cost when context strip is hidden",
+    to: "/settings/general",
+    searchTerms: ["chat composer footer price usage cost fallback display hide"],
+  },
+  {
     id: "show-inline-access-mode",
     title: "Show inline access mode",
     to: "/settings/general",
     searchTerms: ["composer full access control display hide"],
   },
   {
-    id: "show-usage",
-    title: "Show Usage",
+    id: "show-compact-composer-menu",
+    title: "Show compact composer menu",
     to: "/settings/general",
-    searchTerms: ["sidebar shortcut"],
+    searchTerms: ["ellipsis overflow composer controls display hide"],
   },
   {
     id: "auto-settle-inactive-threads",
@@ -500,12 +526,6 @@ export const SETTINGS_SEARCH_ITEMS = [
     title: "Plan mode (legacy)",
     to: "/settings/general",
     searchTerms: ["build plan composer old"],
-  },
-  {
-    id: "legacy-context-window-indicator",
-    title: "Context usage display",
-    to: "/settings/general",
-    searchTerms: ["context window simple detailed percentage tokens meter circle legacy"],
   },
   {
     id: "keybindings",

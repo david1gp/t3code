@@ -313,6 +313,8 @@ import {
   suppressActiveComposerScrollGesture,
 } from "./composerScrollGesture";
 import { prepareVideoFirstFrame } from "../../lib/videoFirstFrame";
+import type { ContextWindowSnapshot } from "../../lib/contextWindow";
+import { ContextWindowMeter } from "./ContextWindowMeter";
 
 function ComposerVideoThumbnail({ file }: { file: File }) {
   const setVideo = useCallback(
@@ -1373,6 +1375,7 @@ export interface ChatComposerProps {
   runtimeMode: RuntimeMode;
   interactionMode: ProviderInteractionMode;
   showInlineAccessMode: boolean;
+  showCompactComposerMenu: boolean;
 
   // Provider / model
   lockedProvider: ProviderDriverKind | null;
@@ -1389,6 +1392,9 @@ export interface ChatComposerProps {
   // Misc
   resolvedTheme: "light" | "dark";
   settings: UnifiedSettings;
+  showComposerContextStrip: boolean;
+  reportedThreadCostLabel: string | null;
+  activeContextWindow: ContextWindowSnapshot | null;
   keybindings: ResolvedKeybindingsConfig;
   terminalOpen: boolean;
   gitCwd: string | null;
@@ -4701,6 +4707,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // collapse. Both leave the footer unrendered, so the strip is the only place
   // to see or change the model without expanding the composer.
   const composerControlsInStrip = isComposerResting || isComposerCollapsedMobile;
+  const showFooterThreadCost =
+    !props.showComposerContextStrip &&
+    props.settings.showThreadCostInComposerFooter &&
+    props.reportedThreadCostLabel !== null;
+  const showFooterContextMeter =
+    !props.showComposerContextStrip &&
+    props.settings.contextWindowMeterEnabled &&
+    props.activeContextWindow !== null;
+  const showFooterMetrics = showFooterThreadCost || showFooterContextMeter;
   const composerControlsVisibleInStrip = composerControlsInStrip && restingControlsVisible;
   const composerControlsHidden = composerControlsInStrip && !restingControlsVisible;
   if (composerControlsHidden && isComposerModelPickerOpen) {
@@ -4946,14 +4961,17 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       ),
     },
   ];
-  const hiddenRestingBlockIds = restingBlockDefs
-    .slice(restingBlockDefs.length - restingHiddenBlockCount)
-    .map((def) => def.id);
+  const hiddenRestingBlockIds = new Set(
+    restingBlockDefs.slice(restingBlockDefs.length - restingHiddenBlockCount).map((def) => def.id),
+  );
   const showCompactComposerControlsMenu = shouldShowCompactComposerControlsMenu({
-    hiddenBlockCount: hiddenRestingBlockIds.length,
-    showInlineAccessMode: props.showInlineAccessMode,
+    hasOverflowedTraits: hiddenRestingBlockIds.has("traits"),
+    hasOverflowedPlanMode: hiddenRestingBlockIds.has("mode") && planModeUiEnabled,
+    hasOverflowedAccessMode: hiddenRestingBlockIds.has("mode") && props.showInlineAccessMode,
+    showCompactComposerMenu: props.showCompactComposerMenu,
     composerControlsHidden,
   });
+  const showOverflowedAccessMode = hiddenRestingBlockIds.has("mode") && props.showInlineAccessMode;
   const composerControls = showProviderUnavailable ? (
     <ComposerControl
       type="button"
@@ -5097,11 +5115,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           <CompactComposerControlsMenu
             interactionMode={interactionMode}
             runtimeMode={runtimeMode}
+            showAccessModeControl={showOverflowedAccessMode}
             size={composerControlsInStrip ? "xs" : "sm"}
             hidden={!showCompactComposerControlsMenu}
-            showInteractionModeToggle={planModeUiEnabled && hiddenRestingBlockIds.includes("mode")}
+            showInteractionModeToggle={planModeUiEnabled && hiddenRestingBlockIds.has("mode")}
             traitsMenuContent={
-              hiddenRestingBlockIds.includes("traits") ? providerTraitsMenuContent : undefined
+              hiddenRestingBlockIds.has("traits") ? providerTraitsMenuContent : undefined
             }
             onToggleInteractionMode={toggleInteractionMode}
             onRuntimeModeChange={handleRuntimeModeChange}
@@ -6763,7 +6782,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 className={cn(
                   "relative",
                   isComposerResting && "flex min-w-0 items-center gap-1",
-                  isComposerResting && (showComposerAttachAction ? "pr-20" : "pr-12"),
+                  isComposerResting &&
+                    !showFooterMetrics &&
+                    (showComposerAttachAction ? "pr-20" : "pr-12"),
                 )}
               >
                 {previewFile ? (
@@ -6911,6 +6932,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   isComposerFooterCompact ? "gap-1.5" : "gap-2 sm:gap-0",
                   showMobilePendingAnswerActions && "hidden sm:flex",
                   isComposerResting &&
+                    !showFooterMetrics &&
                     "absolute bottom-px right-px z-10 h-12 w-auto gap-0 py-0 sm:gap-0 sm:py-0",
                 )}
               >
@@ -6925,6 +6947,25 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 >
                   {composerControlsInStrip ? null : composerControls}
                 </div>
+
+                {showFooterMetrics ? (
+                  <div className="flex min-w-0 shrink items-center gap-1">
+                    {showFooterThreadCost ? (
+                      <span
+                        className="min-w-0 truncate text-[11px] tabular-nums text-muted-foreground"
+                        title={props.reportedThreadCostLabel ?? undefined}
+                      >
+                        {props.reportedThreadCostLabel}
+                      </span>
+                    ) : null}
+                    {showFooterContextMeter && props.activeContextWindow ? (
+                      <ContextWindowMeter
+                        usage={props.activeContextWindow}
+                        displayMode={props.settings.contextWindowDisplayMode}
+                      />
+                    ) : null}
+                  </div>
+                ) : null}
 
                 {/* Right side: send / stop button */}
                 <div

@@ -265,11 +265,67 @@ describe("searchSettings", () => {
       id: "show-inline-access-mode",
       title: "Show inline access mode",
     });
-    expect(searchableSetting("show-usage")).toEqual({ id: "show-usage", title: "Show Usage" });
+    expect(searchableSetting("show-compact-composer-menu")).toEqual({
+      id: "show-compact-composer-menu",
+      title: "Show compact composer menu",
+    });
+    expect(searchableSetting("show-usage")).toEqual({
+      id: "show-usage",
+      title: "Show sidebar Usage shortcut",
+    });
     expect(searchSettings("checkout selector")[0]?.id).toBe("show-checkout-selector");
     expect(searchSettings("branch selector")[0]?.id).toBe("show-branch-selector");
     expect(searchSettings("inline access mode")[0]?.id).toBe("show-inline-access-mode");
+    expect(searchSettings("compact composer menu")[0]?.id).toBe("show-compact-composer-menu");
     expect(searchSettings("show usage")[0]?.id).toBe("show-usage");
+  });
+
+  it("keeps chat context-meter search anchored separately from sidebar Usage", () => {
+    const contextResults = searchSettings("context");
+    const usageResults = searchSettings("usage");
+
+    expect(contextResults[0]).toMatchObject({
+      id: "legacy-context-window-indicator",
+      to: "/settings/general",
+    });
+    expect(usageResults.map((item) => item.id)).toContain("legacy-context-window-indicator");
+    expect(usageResults.map((item) => item.id)).toContain("show-usage");
+
+    const contextMeter = SETTINGS_SEARCH_ITEMS.find(
+      (item) => item.id === "legacy-context-window-indicator",
+    );
+    const sidebarUsage = SETTINGS_SEARCH_ITEMS.find((item) => item.id === "show-usage");
+    expect(searchableSetting("legacy-context-window-indicator")).toEqual({
+      id: "legacy-context-window-indicator",
+      title: "Show text context meter",
+    });
+    expect(contextMeter).not.toHaveProperty("targetId");
+    expect(searchableSetting("show-usage")).toEqual({
+      id: "show-usage",
+      title: "Show sidebar Usage shortcut",
+    });
+    expect(sidebarUsage).toMatchObject({
+      id: "show-usage",
+      title: "Show sidebar Usage shortcut",
+      to: "/settings/general",
+    });
+    expect(sidebarUsage).not.toHaveProperty("targetId");
+    expect(contextMeter?.id).not.toBe(sidebarUsage?.id);
+  });
+
+  it("finds both thread cost display switches at their rows", () => {
+    expect(searchSettings("thread cost").map((item) => item.id)).toEqual([
+      "show-thread-cost-in-context-strip",
+      "show-thread-cost-in-composer-footer",
+    ]);
+    expect(searchableSetting("show-thread-cost-in-context-strip")).toEqual({
+      id: "show-thread-cost-in-context-strip",
+      title: "Show thread cost in context strip",
+    });
+    expect(searchableSetting("show-thread-cost-in-composer-footer")).toEqual({
+      id: "show-thread-cost-in-composer-footer",
+      title: "Show thread cost when context strip is hidden",
+    });
   });
 
   it("routes appearance settings to their current section", () => {
@@ -414,9 +470,8 @@ describe("settings search targets", () => {
     const streaming = getSettingsSearchTargetScope("response-streaming")!;
     expect(streaming.scope).toBe("project-defaults");
     expect(isSettingsSearchScopeAvailable(streaming.scope, "project")).toBe(true);
-    for (const id of ["legacy-plan-mode", "legacy-context-window-indicator"]) {
-      expect(getSettingsSearchTargetScope(id)!.scope).toBeNull();
-    }
+    expect(getSettingsSearchTargetScope("legacy-plan-mode")!.scope).toBeNull();
+    expect(getSettingsSearchTargetScope("legacy-context-window-indicator")!.scope).toBeNull();
     expect(getSettingsSearchTargetScope("legacy-sidebar")).toBeNull();
   });
 });

@@ -98,6 +98,7 @@ interface BranchToolbarProps {
   activeContextWindow: ContextWindowSnapshot | null;
   contextWindowMeterEnabled: boolean;
   contextWindowDisplayMode: "simple" | "detailed";
+  showThreadCostInContextStrip: boolean;
 }
 
 interface MobileRunContextSelectorProps {
@@ -533,6 +534,7 @@ export const BranchToolbar = memo(function BranchToolbar({
   activeContextWindow,
   contextWindowMeterEnabled,
   contextWindowDisplayMode,
+  showThreadCostInContextStrip,
 }: BranchToolbarProps) {
   const branchSelectorRef = useRef<BranchToolbarBranchSelectorHandle>(null);
   const threadRef = useMemo(
@@ -756,7 +758,7 @@ export const BranchToolbar = memo(function BranchToolbar({
         />
       ) : null}
 
-      {reportedThreadCostLabel !== null ? (
+      {showThreadCostInContextStrip && reportedThreadCostLabel !== null ? (
         <span className="shrink-0 whitespace-nowrap text-[11px] tabular-nums">
           {reportedThreadCostLabel}
         </span>

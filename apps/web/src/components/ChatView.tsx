@@ -1599,6 +1599,9 @@ export default function ChatView(props: ChatViewProps) {
   const showInlineAccessMode = useClientSettings(
     (clientSettings) => clientSettings.showInlineAccessMode,
   );
+  const showCompactComposerMenu = useClientSettings(
+    (clientSettings) => clientSettings.showCompactComposerMenu,
+  );
   const setStickyComposerModelSelection = useComposerDraftStore(
     (store) => store.setStickyModelSelection,
   );
@@ -2909,6 +2912,10 @@ export default function ChatView(props: ChatViewProps) {
     () => deriveReportedThreadCosts(activeThread?.activities ?? EMPTY_ACTIVITIES),
     [activeThread?.activities],
   );
+  const reportedThreadCostLabel =
+    reportedThreadCosts.totalUsd === null
+      ? null
+      : formatReportedCostUsd(reportedThreadCosts.totalUsd);
   const activeProviderInstanceId = selectedProviderEntry?.instanceId ?? null;
   const activeProviderStatus = selectedProviderEntry?.snapshot ?? null;
   const { enabled: interactionModeEnabled, interactionMode } = resolveComposerInteractionMode({
@@ -10184,6 +10191,7 @@ export default function ChatView(props: ChatViewProps) {
                             runtimeMode={runtimeMode}
                             interactionMode={interactionMode}
                             showInlineAccessMode={showInlineAccessMode}
+                            showCompactComposerMenu={showCompactComposerMenu}
                             lockedProvider={lockedProvider}
                             providerStatuses={providerStatuses as ServerProvider[]}
                             providerCatalogKnown={serverConfig !== null}
@@ -10193,6 +10201,9 @@ export default function ChatView(props: ChatViewProps) {
                             compactDisabled={compactDisabled}
                             resolvedTheme={resolvedTheme}
                             settings={settings}
+                            showComposerContextStrip={showComposerContextStrip}
+                            reportedThreadCostLabel={reportedThreadCostLabel}
+                            activeContextWindow={activeContextWindow}
                             keybindings={keybindings}
                             terminalOpen={Boolean(terminalUiState.terminalOpen)}
                             gitCwd={gitCwd}
@@ -10296,14 +10307,11 @@ export default function ChatView(props: ChatViewProps) {
                                 availableEnvironments={logicalProjectEnvironments}
                                 composerControlsHostRef={setRestingComposerControlsHost}
                                 contextStripVisible={showComposerContextStrip}
-                                reportedThreadCostLabel={
-                                  reportedThreadCosts.totalUsd === null
-                                    ? null
-                                    : formatReportedCostUsd(reportedThreadCosts.totalUsd)
-                                }
+                                reportedThreadCostLabel={reportedThreadCostLabel}
                                 activeContextWindow={activeContextWindow}
                                 contextWindowMeterEnabled={settings.contextWindowMeterEnabled}
                                 contextWindowDisplayMode={settings.contextWindowDisplayMode}
+                                showThreadCostInContextStrip={settings.showThreadCostInContextStrip}
                               />
                             </div>
                           )}

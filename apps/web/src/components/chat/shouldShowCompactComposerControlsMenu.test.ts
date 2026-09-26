@@ -1,35 +1,67 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import { shouldShowCompactComposerControlsMenu } from "./shouldShowCompactComposerControlsMenu";
+import { getCompactComposerMenuShortcuts } from "./getCompactComposerMenuShortcuts";
+
+const defaults = {
+  hasOverflowedTraits: false,
+  hasOverflowedPlanMode: false,
+  hasOverflowedAccessMode: false,
+  showCompactComposerMenu: true,
+  composerControlsHidden: false,
+};
 
 describe("shouldShowCompactComposerControlsMenu", () => {
-  it("keeps the compact menu hidden when all controls fit and inline access is shown", () => {
+  it("hides the ellipsis when overflow contains no actionable menu controls", () => {
+    expect(shouldShowCompactComposerControlsMenu(defaults)).toBe(false);
+  });
+
+  it.each([
+    ["provider traits", { hasOverflowedTraits: true }],
+    ["Plan mode", { hasOverflowedPlanMode: true }],
+    ["visible Access", { hasOverflowedAccessMode: true }],
+  ] as const)("shows the ellipsis for overflowed %s", (_control, overflow) => {
+    expect(shouldShowCompactComposerControlsMenu({ ...defaults, ...overflow })).toBe(true);
+  });
+
+  it("does not count hidden inline Access as actionable overflow", () => {
     expect(
       shouldShowCompactComposerControlsMenu({
-        hiddenBlockCount: 0,
-        showInlineAccessMode: true,
-        composerControlsHidden: false,
+        ...defaults,
+        hasOverflowedAccessMode: false,
       }),
     ).toBe(false);
   });
 
-  it("shows the compact menu as the access-mode route when inline access is hidden", () => {
+  it("hides actionable overflow when the preference is off", () => {
     expect(
       shouldShowCompactComposerControlsMenu({
-        hiddenBlockCount: 0,
-        showInlineAccessMode: false,
-        composerControlsHidden: false,
+        ...defaults,
+        hasOverflowedTraits: true,
+        showCompactComposerMenu: false,
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
-  it("keeps the compact menu hidden while composer controls are hidden, even with overflow", () => {
+  it("preserves hidden composer controls precedence", () => {
     expect(
       shouldShowCompactComposerControlsMenu({
-        hiddenBlockCount: 2,
-        showInlineAccessMode: false,
+        ...defaults,
+        hasOverflowedPlanMode: true,
         composerControlsHidden: true,
       }),
     ).toBe(false);
+  });
+});
+
+describe("getCompactComposerMenuShortcuts", () => {
+  it("does not advertise Access when inline Access is hidden", () => {
+    expect(getCompactComposerMenuShortcuts(false, true)).toBe("composer.effort");
+    expect(getCompactComposerMenuShortcuts(false, false)).toBeUndefined();
+  });
+
+  it("advertises available Access and provider traits shortcuts", () => {
+    expect(getCompactComposerMenuShortcuts(true, true)).toBe("composer.mode composer.effort");
+    expect(getCompactComposerMenuShortcuts(true, false)).toBe("composer.mode");
   });
 });
