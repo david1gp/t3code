@@ -30,6 +30,9 @@ const cliBuildChannel = /^[^-+]+-(?:nightly|preview)\./.test(packageJson.version
 // executable needs a host Node that supports `--build-sea` (25.7+), so this is
 // a separate mode rather than a second entry in the default build.
 const packExecutable = process.env.T3CODE_PACK_EXE === "1";
+// The SEA cannot import packages from disk; Pi's optional image resize already
+// falls back when its WASM is unavailable there. Keep its JS inside the exe.
+const isPhotonDependency = (id: string) => id.startsWith("@silvia-odwyer/photon-node");
 // `<platform>-<arch>` in nodejs.org naming (darwin-x64, linux-arm64, win-x64).
 // When set, tsdown injects the bundle into a downloaded Node of that target
 // instead of the host Node, which is how the arm64 macOS runner produces the
@@ -102,8 +105,10 @@ export default mergeConfig(
         // false from `alwaysBundle` only means "no opinion", so a transitive
         // dependency would still be bundled — which silently inlined native
         // loaders such as node-gyp-build, losing native acceleration.
-        alwaysBundle: shouldBundleCliDependency,
-        neverBundle: (id: string) => isExternalCliDependency(id),
+        alwaysBundle: (id: string) =>
+          (packExecutable && isPhotonDependency(id)) || shouldBundleCliDependency(id),
+        neverBundle: (id: string) =>
+          isExternalCliDependency(id) && !(packExecutable && isPhotonDependency(id)),
         onlyBundle: false,
       },
       banner: {

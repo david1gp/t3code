@@ -30,6 +30,8 @@ export const CLI_RUNTIME_EXTERNAL_PREFIXES = [
   "ffi-rs",
   "@yuuang/",
   "@ff-labs/",
+  // Pi's Photon JS loader reads photon_rs_bg.wasm beside its own file.
+  "@silvia-odwyer/photon-node",
   "@clerk/electron-passkeys",
   "node-gyp-build",
   "node-addon-api",

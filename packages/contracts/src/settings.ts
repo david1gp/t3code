@@ -766,6 +766,18 @@ export const GrokSettings = makeProviderSettingsSchema(
 );
 export type GrokSettings = typeof GrokSettings.Type;
 
+export const PiSettings = makeProviderSettingsSchema({
+  enabled: Schema.Boolean.pipe(
+    Schema.withDecodingDefault(Effect.succeed(false)),
+    Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+  ),
+  customModels: Schema.Array(CustomModelSetting).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+    Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+  ),
+});
+export type PiSettings = typeof PiSettings.Type;
+
 /**
  * Antigravity ACP auth methods. Personal and Enterprise open a Google sign-in
  * in the browser. The API key and Agent Platform methods take credentials from
