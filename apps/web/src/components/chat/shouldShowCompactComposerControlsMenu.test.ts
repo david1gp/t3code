@@ -2,6 +2,8 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { shouldShowCompactComposerControlsMenu } from "./shouldShowCompactComposerControlsMenu";
 import { getCompactComposerMenuShortcuts } from "./getCompactComposerMenuShortcuts";
+import { providerSupportsRuntimeMode } from "../settings/providerSupportsRuntimeMode";
+import { ProviderDriverKind } from "@t3tools/contracts";
 
 const defaults = {
   hasOverflowedTraits: false,
@@ -29,6 +31,24 @@ describe("shouldShowCompactComposerControlsMenu", () => {
       shouldShowCompactComposerControlsMenu({
         ...defaults,
         hasOverflowedAccessMode: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not advertise an access shortcut or overflow for Pi, while retaining traits", () => {
+    const showAccess = providerSupportsRuntimeMode(ProviderDriverKind.make("pi"));
+    expect(getCompactComposerMenuShortcuts(showAccess, true)).toBe("composer.effort");
+    expect(
+      shouldShowCompactComposerControlsMenu({
+        ...defaults,
+        hasOverflowedAccessMode: showAccess,
+        hasOverflowedTraits: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowCompactComposerControlsMenu({
+        ...defaults,
+        hasOverflowedAccessMode: showAccess,
       }),
     ).toBe(false);
   });

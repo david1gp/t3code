@@ -1,4 +1,6 @@
-import type {
+import {
+  PROVIDER_DISPLAY_NAMES,
+  type ProviderDriverKind,
   ModelCapabilities,
   ModelSelection,
   ServerConfig as T3ServerConfig,
@@ -34,9 +36,7 @@ function providerDisplayLabel(provider: {
   readonly instanceId: string;
 }): string {
   if (provider.displayName) return provider.displayName;
-  if (provider.driver === "codex") return "Codex";
-  if (provider.driver === "claudeAgent") return "Claude";
-  return provider.instanceId;
+  return PROVIDER_DISPLAY_NAMES[provider.driver as ProviderDriverKind] ?? provider.instanceId;
 }
 
 function normalizeSelectionOptions(

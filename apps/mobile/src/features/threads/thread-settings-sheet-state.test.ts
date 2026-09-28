@@ -9,6 +9,7 @@ import {
   modelFavoriteKey,
   modelMatchesCatalogQuery,
   pendingModelAfterPress,
+  threadSettingsRuntimeModeVisible,
   toggleModelFavorite,
 } from "./thread-settings-sheet-state";
 
@@ -35,6 +36,37 @@ function modelOption(
 }
 
 describe("thread settings sheet state", () => {
+  it("hides runtime only for the currently displayed Pi model, including a staged pick", () => {
+    const codex = modelOption("codex-model");
+    const pi = {
+      ...modelOption("pi-model"),
+      key: "pi_work:pi-model",
+      providerDriver: "pi",
+      selection: { instanceId: ProviderInstanceId.make("pi_work"), model: "pi-model" },
+    };
+    const providerGroups = [
+      { providerKey: "codex", providerLabel: "Codex", models: [codex] },
+      { providerKey: "pi_work", providerLabel: "Pi", models: [pi] },
+    ];
+    const visible = (selectedModel: ModelOption, pendingModel: ModelOption | null) =>
+      threadSettingsRuntimeModeVisible({
+        selectedModel: selectedModel.selection,
+        pendingModel,
+        providerGroups,
+      });
+
+    expect(visible(codex, null)).toBe(true);
+    expect(visible(codex, pi)).toBe(false);
+    expect(visible(pi, null)).toBe(false);
+    expect(visible(pi, codex)).toBe(true);
+    expect(
+      threadSettingsRuntimeModeVisible({
+        selectedModel: pi.selection,
+        pendingModel: null,
+        providerGroups: [],
+      }),
+    ).toBe(true);
+  });
   it("keeps favorites in catalog order ahead of other models", () => {
     const models = [
       modelOption("first"),

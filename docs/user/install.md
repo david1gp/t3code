@@ -5,8 +5,9 @@ desktop, web, or mobile app. Set up the machine where the agents will work first
 
 ## Requirements
 
-You need an installed, authenticated provider before starting a thread. You can
-launch T3 Code and configure providers afterwards.
+You need a configured, authenticated provider before starting a thread. Some
+providers require an installed CLI; you can launch T3 Code and configure
+providers afterwards.
 
 ## Command line
 
@@ -107,19 +108,26 @@ and enable the provider you want. Installation, login, and configuration belong
 to that environment's machine, even when you connect from a phone or another
 computer.
 
-| Provider    | Install and authenticate                                                                     |
-| ----------- | -------------------------------------------------------------------------------------------- |
-| Codex       | Install [Codex CLI](https://developers.openai.com/codex/cli), then run `codex login`.        |
-| Claude      | Install [Claude Code](https://claude.com/product/claude-code), then run `claude auth login`. |
-| Cursor      | Install [Cursor CLI](https://cursor.com/cli), then run `agent login`.                        |
-| Grok Build  | Install [Grok Build CLI](https://x.ai/cli), then run `grok login`.                           |
-| OpenCode    | Install [OpenCode](https://opencode.ai), then run `opencode auth login`.                     |
-| Antigravity | Install and sign in with Google from T3 Code's provider settings.                            |
+To use Pi, enable it for the environment here, then choose a Pi model in the
+thread's model picker.
+
+| Provider    | Install and authenticate                                                                      |
+| ----------- | --------------------------------------------------------------------------------------------- |
+| Codex       | Install [Codex CLI](https://developers.openai.com/codex/cli), then run `codex login`.         |
+| Claude      | Install [Claude Code](https://claude.com/product/claude-code), then run `claude auth login`.  |
+| Cursor      | Install [Cursor CLI](https://cursor.com/cli), then run `agent login`.                         |
+| Grok Build  | Install [Grok Build CLI](https://x.ai/cli), then run `grok login`.                            |
+| OpenCode    | Install [OpenCode](https://opencode.ai), then run `opencode auth login`.                      |
+| Pi          | Use Pi's normal credential setup; T3 reads its saved credentials from the server environment. |
+| Antigravity | Install and sign in with Google from T3 Code's provider settings.                             |
 
 Provider CLIs must be on the server's `PATH`. If T3 Code cannot find one, set its
 **Binary path** in provider settings, especially when using a version manager.
 Cursor's executable is `cursor-agent`, although its login command is
-`agent login`. Antigravity can use its managed runtime without a `PATH` entry.
+`agent login`. Pi runs from the official SDK bundled with T3 Code, not an
+installed Pi CLI, and has no binary path setting. Its saved credentials and
+configuration are separate from T3 Code provider logins. Antigravity can use its
+managed runtime without a `PATH` entry.
 
 T3 Code warns when a provider version has known compatibility problems with your
 release. Check **Settings → Providers** on that environment for the recommended

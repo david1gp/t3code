@@ -1,5 +1,20 @@
+import type { ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
 import type { ModelOption, ProviderGroup } from "../../lib/modelOptions";
-import type { ProviderInstanceId } from "@t3tools/contracts";
+import { providerSupportsRuntimeMode } from "../../lib/providerSupportsRuntimeMode";
+
+export function threadSettingsRuntimeModeVisible(input: {
+  readonly pendingModel: ModelOption | null;
+  readonly selectedModel: ModelSelection | null;
+  readonly providerGroups: ReadonlyArray<ProviderGroup>;
+}): boolean {
+  const instanceId = input.pendingModel?.selection.instanceId ?? input.selectedModel?.instanceId;
+  const driver =
+    input.pendingModel?.providerDriver ??
+    input.providerGroups
+      .find((group) => group.models.some((model) => model.selection.instanceId === instanceId))
+      ?.models.find((model) => model.selection.instanceId === instanceId)?.providerDriver;
+  return providerSupportsRuntimeMode(driver);
+}
 
 export type ModelFavorite = {
   readonly provider: ProviderInstanceId;

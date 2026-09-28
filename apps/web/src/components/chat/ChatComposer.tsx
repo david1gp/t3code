@@ -2,6 +2,7 @@ import { DESKTOP_PASTE_AS_TEXT_EVENT } from "../../lib/desktopPasteAsText";
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { runtimeModeConfig, runtimeModeOptions } from "./runtimeModeConfig";
+import { providerSupportsRuntimeMode } from "../settings/providerSupportsRuntimeMode";
 import { useRightPanelStore } from "~/rightPanelStore";
 import { AttachmentFilePreview } from "../files/AttachmentFilePreview";
 import { Dialog, DialogPopup, DialogTitle } from "../ui/dialog";
@@ -4931,6 +4932,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     size: composerControlsInStrip ? "xs" : "sm",
     hidden: composerControlsHidden || restingHiddenBlockCount > 1,
   });
+  const showAccessModeControl =
+    props.showInlineAccessMode && providerSupportsRuntimeMode(selectedProvider);
   const restingBlockDefs = [
     ...(providerTraitsPicker
       ? [
@@ -4945,21 +4948,25 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           },
         ]
       : []),
-    {
-      id: "mode",
-      content: (
-        <ComposerFooterModeControls
-          showAccessModeControl={props.showInlineAccessMode}
-          showInteractionModeToggle={planModeUiEnabled}
-          interactionMode={interactionMode}
-          runtimeMode={runtimeMode}
-          size={composerControlsInStrip ? "xs" : "sm"}
-          hidden={composerControlsHidden || restingHiddenBlockCount > 0}
-          onToggleInteractionMode={toggleInteractionMode}
-          onRuntimeModeChange={handleRuntimeModeChange}
-        />
-      ),
-    },
+    ...(showAccessModeControl || planModeUiEnabled
+      ? [
+          {
+            id: "mode",
+            content: (
+              <ComposerFooterModeControls
+                showAccessModeControl={showAccessModeControl}
+                showInteractionModeToggle={planModeUiEnabled}
+                interactionMode={interactionMode}
+                runtimeMode={runtimeMode}
+                size={composerControlsInStrip ? "xs" : "sm"}
+                hidden={composerControlsHidden || restingHiddenBlockCount > 0}
+                onToggleInteractionMode={toggleInteractionMode}
+                onRuntimeModeChange={handleRuntimeModeChange}
+              />
+            ),
+          },
+        ]
+      : []),
   ];
   const hiddenRestingBlockIds = new Set(
     restingBlockDefs.slice(restingBlockDefs.length - restingHiddenBlockCount).map((def) => def.id),
@@ -4967,11 +4974,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const showCompactComposerControlsMenu = shouldShowCompactComposerControlsMenu({
     hasOverflowedTraits: hiddenRestingBlockIds.has("traits"),
     hasOverflowedPlanMode: hiddenRestingBlockIds.has("mode") && planModeUiEnabled,
-    hasOverflowedAccessMode: hiddenRestingBlockIds.has("mode") && props.showInlineAccessMode,
+    hasOverflowedAccessMode: hiddenRestingBlockIds.has("mode") && showAccessModeControl,
     showCompactComposerMenu: props.showCompactComposerMenu,
     composerControlsHidden,
   });
-  const showOverflowedAccessMode = hiddenRestingBlockIds.has("mode") && props.showInlineAccessMode;
+  const showOverflowedAccessMode = hiddenRestingBlockIds.has("mode") && showAccessModeControl;
   const composerControls = showProviderUnavailable ? (
     <ComposerControl
       type="button"

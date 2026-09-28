@@ -13,6 +13,38 @@ import {
 } from "./modelOptions";
 
 describe("mobile model options", () => {
+  it("selects Pi models generically and retains model options for a custom Pi instance", () => {
+    const config = {
+      providers: [
+        {
+          instanceId: "pi_work",
+          driver: "pi",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          models: [{ slug: "anthropic/sonnet", name: "Sonnet", capabilities: null }],
+        },
+      ],
+    } as unknown as ServerConfig;
+    const selection = {
+      instanceId: ProviderInstanceId.make("pi_work"),
+      model: "anthropic/sonnet",
+      options: [{ id: "thinking", value: "high" }],
+    } as ModelSelection;
+
+    const options = buildModelOptions(config, selection);
+    expect(groupByProvider(options)[0]?.providerLabel).toBe("Pi");
+    expect(options[0]?.selection).toEqual(selection);
+    expect(
+      resolveNewTaskModelSelection({
+        draftSelection: null,
+        projectDefaultSelection: null,
+        stickySelection: null,
+        modelOptions: options,
+      })?.instanceId,
+    ).toBe(selection.instanceId);
+  });
+
   it("groups models by provider and flags legacy entries", () => {
     const config = {
       providers: [

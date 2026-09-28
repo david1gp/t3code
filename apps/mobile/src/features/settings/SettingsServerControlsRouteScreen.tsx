@@ -17,6 +17,7 @@ import { Alert, Platform, Pressable, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { RUNTIME_MODE_CHOICES } from "../threads/thread-settings-options";
+import { mobileDefaultRuntimeModeVisible } from "./mobileDefaultRuntimeModeVisible";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { SettingsScreen } from "./components/SettingsScreen";
@@ -300,26 +301,28 @@ function ServerSettingsDetail(props: { readonly page: SettingsPage }) {
                       />
                     ))}
                   </SettingsSection>
-                  <SettingsSection
-                    title="Default permissions"
-                    trailing={
-                      pendingWrites === 0 && uniform("defaultRuntimeMode") === null ? (
-                        <MixedValuesLabel projectSelected={projectSelected} />
-                      ) : null
-                    }
-                  >
-                    {RUNTIME_MODE_CHOICES.map((choice, index) => (
-                      <ChoiceRow
-                        key={choice.mode}
-                        label={choice.label}
-                        description={choice.description}
-                        selected={uniform("defaultRuntimeMode") === choice.mode}
-                        separated={index > 0}
-                        disabled={disabledFor("defaultRuntimeMode")}
-                        onPress={() => write({ defaultRuntimeMode: choice.mode })}
-                      />
-                    ))}
-                  </SettingsSection>
+                  {mobileDefaultRuntimeModeVisible(displayTargets) ? (
+                    <SettingsSection
+                      title="Default permissions"
+                      trailing={
+                        pendingWrites === 0 && uniform("defaultRuntimeMode") === null ? (
+                          <MixedValuesLabel projectSelected={projectSelected} />
+                        ) : null
+                      }
+                    >
+                      {RUNTIME_MODE_CHOICES.map((choice, index) => (
+                        <ChoiceRow
+                          key={choice.mode}
+                          label={choice.label}
+                          description={choice.description}
+                          selected={uniform("defaultRuntimeMode") === choice.mode}
+                          separated={index > 0}
+                          disabled={disabledFor("defaultRuntimeMode")}
+                          onPress={() => write({ defaultRuntimeMode: choice.mode })}
+                        />
+                      ))}
+                    </SettingsSection>
+                  ) : null}
                 </>
               ) : null}
 

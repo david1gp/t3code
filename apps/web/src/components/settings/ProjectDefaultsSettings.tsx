@@ -28,6 +28,7 @@ import { Switch } from "../ui/switch";
 import type { ProjectSettingsCategory } from "./ProjectSettingsPanel";
 import { searchableSetting } from "./settingsSearch";
 import { useSettingsScope } from "./SettingsScopeContext";
+import { providerSupportsRuntimeMode } from "./providerSupportsRuntimeMode";
 import {
   SETTINGS_PICKER_TRIGGER_CLASSNAME,
   SettingResetButton,
@@ -272,67 +273,69 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
       ) : category === "general" ? (
         <>
           {modelRow}
-          <SettingsRow
-            serverScoped
-            settingKeys={["defaultRuntimeMode"]}
-            mixed={mixedPermissions}
-            {...searchableSetting("default-permissions")}
-            description={
-              isProjectScope
-                ? "Permissions for new threads in this project."
-                : "Default permissions for new threads. Projects can override them."
-            }
-            resetAction={
-              settings.defaultRuntimeMode !== DEFAULT_SERVER_SETTINGS.defaultRuntimeMode ? (
-                <SettingResetButton
-                  label="default permissions"
-                  onClick={() =>
-                    updateSettings({
-                      defaultRuntimeMode: DEFAULT_SERVER_SETTINGS.defaultRuntimeMode,
-                    })
-                  }
-                />
-              ) : null
-            }
-            control={
-              <Select
-                value={mixedPermissions ? null : settings.defaultRuntimeMode}
-                onValueChange={(value) => {
-                  if (value) updateSettings({ defaultRuntimeMode: value });
-                }}
-              >
-                <SelectTrigger size="sm" aria-label="Default permissions">
-                  {!mixedPermissions && (
-                    <PermissionIcon className="size-3.5 shrink-0 text-muted-foreground" />
-                  )}
-                  <SelectValue>
-                    {mixedPermissions
-                      ? "Mixed"
-                      : runtimeModeConfig[settings.defaultRuntimeMode].label}
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectPopup align="end" alignItemWithTrigger={false}>
-                  {runtimeModeOptions.map((mode) => {
-                    const option = runtimeModeConfig[mode];
-                    const Icon = option.icon;
-                    return (
-                      <SelectItem key={mode} value={mode} className="min-w-64">
-                        <div className="grid gap-0.5">
-                          <span className="inline-flex items-center gap-1.5 font-medium">
-                            <Icon className="size-3.5 shrink-0 text-muted-foreground" />
-                            {option.label}
-                          </span>
-                          <span className="text-xs leading-4 text-muted-foreground">
-                            {option.description}
-                          </span>
-                        </div>
-                      </SelectItem>
-                    );
-                  })}
-                </SelectPopup>
-              </Select>
-            }
-          />
+          {providerSupportsRuntimeMode(activeEntry?.driverKind) && (
+            <SettingsRow
+              serverScoped
+              settingKeys={["defaultRuntimeMode"]}
+              mixed={mixedPermissions}
+              {...searchableSetting("default-permissions")}
+              description={
+                isProjectScope
+                  ? "Permissions for new threads in this project."
+                  : "Default permissions for new threads. Projects can override them."
+              }
+              resetAction={
+                settings.defaultRuntimeMode !== DEFAULT_SERVER_SETTINGS.defaultRuntimeMode ? (
+                  <SettingResetButton
+                    label="default permissions"
+                    onClick={() =>
+                      updateSettings({
+                        defaultRuntimeMode: DEFAULT_SERVER_SETTINGS.defaultRuntimeMode,
+                      })
+                    }
+                  />
+                ) : null
+              }
+              control={
+                <Select
+                  value={mixedPermissions ? null : settings.defaultRuntimeMode}
+                  onValueChange={(value) => {
+                    if (value) updateSettings({ defaultRuntimeMode: value });
+                  }}
+                >
+                  <SelectTrigger size="sm" aria-label="Default permissions">
+                    {!mixedPermissions && (
+                      <PermissionIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                    )}
+                    <SelectValue>
+                      {mixedPermissions
+                        ? "Mixed"
+                        : runtimeModeConfig[settings.defaultRuntimeMode].label}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectPopup align="end" alignItemWithTrigger={false}>
+                    {runtimeModeOptions.map((mode) => {
+                      const option = runtimeModeConfig[mode];
+                      const Icon = option.icon;
+                      return (
+                        <SelectItem key={mode} value={mode} className="min-w-64">
+                          <div className="grid gap-0.5">
+                            <span className="inline-flex items-center gap-1.5 font-medium">
+                              <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+                              {option.label}
+                            </span>
+                            <span className="text-xs leading-4 text-muted-foreground">
+                              {option.description}
+                            </span>
+                          </div>
+                        </SelectItem>
+                      );
+                    })}
+                  </SelectPopup>
+                </Select>
+              }
+            />
+          )}
           {workspaceRow}
           <SettingsRow
             serverScoped
