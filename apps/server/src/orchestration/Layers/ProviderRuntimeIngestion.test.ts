@@ -888,6 +888,72 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBeNull();
   });
 
+  it.each([
+    {
+      name: "an error exit",
+      payload: { exitKind: "error", reason: "Stream lost; turn outcome unknown" },
+      status: "error",
+      turnState: "error",
+      lastError: "Stream lost; turn outcome unknown",
+    },
+    {
+      name: "a graceful exit",
+      payload: { exitKind: "graceful" },
+      status: "stopped",
+      turnState: "interrupted",
+      lastError: null,
+    },
+    {
+      name: "a legacy exit without a payload",
+      payload: undefined,
+      status: "stopped",
+      turnState: "interrupted",
+      lastError: null,
+    },
+  ] as const)("projects $name with an active turn", async (exit) => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-exited");
+    const provider = ProviderDriverKind.make("opencode");
+    await harness.emitAndDrain([
+      {
+        type: "turn.started",
+        eventId: asEventId("evt-start-before-exit"),
+        provider,
+        threadId,
+        turnId,
+        createdAt: "2026-01-01T00:00:01.000Z",
+      },
+    ]);
+
+    await harness.emitAndDrain([
+      {
+        type: "session.exited",
+        eventId: asEventId("evt-session-exited-with-turn"),
+        provider,
+        threadId,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        ...(exit.payload ? { payload: exit.payload } : {}),
+      },
+    ]);
+
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    expect(thread?.session).toMatchObject({
+      status: exit.status,
+      activeTurnId: null,
+      lastError: exit.lastError,
+    });
+    expect(thread?.latestTurn).toMatchObject({
+      turnId,
+      state: exit.turnState,
+      completedAt: "2026-01-01T00:00:02.000Z",
+    });
+    expect(await harness.readTurn(turnId)).toMatchObject({
+      state: exit.turnState,
+      completedAt: "2026-01-01T00:00:02.000Z",
+    });
+  });
+
   effectIt.effect(
     "keeps a reconnecting pending turn starting while ready clears stale active state",
     () =>

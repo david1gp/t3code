@@ -27,6 +27,7 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeOpenCodeAdapter } from "../Layers/OpenCodeAdapter.ts";
+import { makeOpenCodeNativeAdapter } from "../Layers/makeOpenCodeNativeAdapter.ts";
 import { readOpenCodeGoUsageLimits } from "../Layers/openCodeUsageLimits.ts";
 import {
   checkOpenCodeProviderStatus,
@@ -45,6 +46,9 @@ import {
 } from "../ProviderDriver.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import { openCodeProtocolProbe } from "../openCodeProtocolProbe.ts";
+import { openCodeNativeInventoryLoad } from "../openCodeNativeInventoryLoad.ts";
+import { openCodeNativeInventoryMap } from "../openCodeNativeInventoryMap.ts";
 import {
   enrichProviderSnapshotWithVersionAdvisory,
   makeCachedProviderMaintenanceResolution,
@@ -132,11 +136,41 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         ),
       );
 
-      const adapter = yield* makeOpenCodeAdapter(effectiveConfig, {
-        instanceId,
-        environment: processEnv,
-        ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
-      });
+      // Resolve chat separately for each external instance. Only a verified
+      // legacy server (or a local owner) may use the legacy SDK.
+      const protocol = effectiveConfig.serverUrl.trim()
+        ? yield* openCodeProtocolProbe({
+            url: effectiveConfig.serverUrl,
+            directory: serverConfig.cwd,
+            ...(effectiveConfig.serverPassword
+              ? { serverPassword: effectiveConfig.serverPassword }
+              : {}),
+          }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderDriverError({
+                  driver: DRIVER_KIND,
+                  instanceId,
+                  detail: `Failed to probe OpenCode chat protocol: ${cause.detail}`,
+                  cause,
+                }),
+            ),
+          )
+        : { protocol: "legacy" as const };
+      const adapter =
+        protocol.protocol === "native"
+          ? yield* makeOpenCodeNativeAdapter({
+              url: effectiveConfig.serverUrl,
+              instanceId,
+              ...(effectiveConfig.serverPassword
+                ? { serverPassword: effectiveConfig.serverPassword }
+                : {}),
+            })
+          : yield* makeOpenCodeAdapter(effectiveConfig, {
+              instanceId,
+              environment: processEnv,
+              ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
+            });
       const serverOwner = yield* OpenCodeServerOwner.make({
         binaryPath: effectiveConfig.binaryPath,
         directory: serverConfig.cwd,
@@ -145,13 +179,44 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
           : {}),
         environment: processEnv,
       });
-      const textGeneration = yield* makeOpenCodeTextGeneration(effectiveConfig).pipe(
-        Effect.provideService(OpenCodeServerOwner.OpenCodeServerOwner, serverOwner),
-      );
+      const textGeneration = yield* makeOpenCodeTextGeneration(
+        effectiveConfig,
+        protocol.protocol,
+      ).pipe(Effect.provideService(OpenCodeServerOwner.OpenCodeServerOwner, serverOwner));
+
+      // Resolve against this instance's URL and credentials. A failed native
+      // probe must never fall through to the legacy SDK.
+      const externalInventory = (directory: string) =>
+        openCodeProtocolProbe({
+          url: effectiveConfig.serverUrl,
+          directory,
+          ...(effectiveConfig.serverPassword
+            ? { serverPassword: effectiveConfig.serverPassword }
+            : {}),
+        }).pipe(
+          Effect.flatMap((probe) =>
+            Effect.gen(function* () {
+              if (probe.protocol === "legacy") return { protocol: "legacy" as const };
+              const inventory = yield* openCodeNativeInventoryLoad({
+                url: effectiveConfig.serverUrl,
+                directory,
+                ...(effectiveConfig.serverPassword
+                  ? { serverPassword: effectiveConfig.serverPassword }
+                  : {}),
+              });
+              return { protocol: "native" as const, inventory, version: probe.version };
+            }),
+          ),
+        );
 
       const checkProvider = Effect.all(
         {
-          provider: checkOpenCodeProviderStatus(effectiveConfig, serverConfig.cwd, processEnv),
+          provider: checkOpenCodeProviderStatus(
+            effectiveConfig,
+            serverConfig.cwd,
+            processEnv,
+            effectiveConfig.serverUrl.trim() ? externalInventory(serverConfig.cwd) : undefined,
+          ),
           usageLimits: readOpenCodeGoUsageLimits({
             enabled: effectiveConfig.enabled,
             serverUrl: effectiveConfig.serverUrl,
@@ -189,38 +254,64 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         );
       const loadWorkspaceForCwd = (cwd: string) =>
         effectiveConfig.serverUrl.trim().length > 0
-          ? Effect.scoped(
-              Effect.gen(function* () {
-                const server = yield* openCodeRuntime.connectToOpenCodeServer({
-                  binaryPath: effectiveConfig.binaryPath,
-                  directory: cwd,
-                  serverUrl: effectiveConfig.serverUrl,
-                  ...(effectiveConfig.serverPassword
-                    ? { serverPassword: effectiveConfig.serverPassword }
-                    : {}),
-                  environment: processEnv,
-                });
-                const client = openCodeRuntime.createOpenCodeSdkClient({
-                  baseUrl: server.url,
-                  directory: cwd,
-                  ...(effectiveConfig.serverPassword
-                    ? { serverPassword: effectiveConfig.serverPassword }
-                    : {}),
-                });
-                return yield* loadWorkspaceInventory(client);
-              }),
-            )
-          : serverOwner.withServer((server) =>
-              loadWorkspaceInventory(
-                openCodeRuntime.createOpenCodeSdkClient({
-                  baseUrl: server.url,
-                  directory: cwd,
-                  ...(server.serverPassword !== undefined
-                    ? { serverPassword: server.serverPassword }
-                    : {}),
+          ? openCodeProtocolProbe({
+              url: effectiveConfig.serverUrl,
+              directory: cwd,
+              ...(effectiveConfig.serverPassword
+                ? { serverPassword: effectiveConfig.serverPassword }
+                : {}),
+            }).pipe(
+              Effect.flatMap((probe) =>
+                Effect.gen(function* () {
+                  if (probe.protocol === "native") {
+                    const inventory = yield* openCodeNativeInventoryLoad({
+                      url: effectiveConfig.serverUrl,
+                      directory: cwd,
+                      workspaceOnly: true,
+                      ...(effectiveConfig.serverPassword
+                        ? { serverPassword: effectiveConfig.serverPassword }
+                        : {}),
+                    });
+                    return { protocol: "native" as const, inventory };
+                  }
+                  const inventory = yield* Effect.scoped(
+                    Effect.gen(function* () {
+                      const server = yield* openCodeRuntime.connectToOpenCodeServer({
+                        binaryPath: effectiveConfig.binaryPath,
+                        directory: cwd,
+                        serverUrl: effectiveConfig.serverUrl,
+                        ...(effectiveConfig.serverPassword
+                          ? { serverPassword: effectiveConfig.serverPassword }
+                          : {}),
+                        environment: processEnv,
+                      });
+                      const client = openCodeRuntime.createOpenCodeSdkClient({
+                        baseUrl: server.url,
+                        directory: cwd,
+                        ...(effectiveConfig.serverPassword
+                          ? { serverPassword: effectiveConfig.serverPassword }
+                          : {}),
+                      });
+                      return yield* loadWorkspaceInventory(client);
+                    }),
+                  );
+                  return { protocol: "legacy" as const, inventory };
                 }),
               ),
-            );
+            )
+          : serverOwner
+              .withServer((server) =>
+                loadWorkspaceInventory(
+                  openCodeRuntime.createOpenCodeSdkClient({
+                    baseUrl: server.url,
+                    directory: cwd,
+                    ...(server.serverPassword !== undefined
+                      ? { serverPassword: server.serverPassword }
+                      : {}),
+                  }),
+                ),
+              )
+              .pipe(Effect.map((inventory) => ({ protocol: "legacy" as const, inventory })));
 
       const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
       const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<OpenCodeSettings>>(
@@ -272,10 +363,16 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
                 snapshot.getSnapshot,
                 loadWorkspaceForCwd(cwd).pipe(Effect.timeout("20 seconds")),
               ]).pipe(
-                Effect.map(([machineSnapshot, { skills, commands }]) => ({
+                Effect.map(([machineSnapshot, workspace]) => ({
                   ...machineSnapshot,
-                  skills: openCodeSkillsToServerProviderSkills(skills),
-                  slashCommands: openCodeCommandsToServerProviderSlashCommands(commands),
+                  skills:
+                    workspace.protocol === "native"
+                      ? openCodeNativeInventoryMap(workspace.inventory).skills
+                      : openCodeSkillsToServerProviderSkills(workspace.inventory.skills),
+                  slashCommands:
+                    workspace.protocol === "native"
+                      ? openCodeNativeInventoryMap(workspace.inventory).slashCommands
+                      : openCodeCommandsToServerProviderSlashCommands(workspace.inventory.commands),
                 })),
                 Effect.mapError(
                   (cause) =>

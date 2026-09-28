@@ -973,6 +973,32 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       Effect.asVoid,
     );
 
+  // A native OpenCode turn can finish before session.prompt returns. Remember its terminal
+  // until sendTurn persists the admission; the event consumer may run on either side of that write.
+  const pendingOpenCodeAdmissions = new Map<ThreadId, Set<string>>();
+  const settleOpenCodeBinding = (threadId: ThreadId, turnId: string) =>
+    Effect.gen(function* () {
+      const binding = yield* directory.getBinding(threadId);
+      if (Option.isNone(binding) || binding.value.provider !== "opencode") return;
+      const payload = binding.value.runtimePayload;
+      if (
+        payload === null ||
+        typeof payload !== "object" ||
+        Array.isArray(payload) ||
+        !Object.hasOwn(payload, "activeTurnId") ||
+        (payload as Record<string, unknown>).activeTurnId !== turnId
+      )
+        return;
+      yield* directory.upsert({
+        threadId,
+        provider: binding.value.provider,
+        ...(binding.value.providerInstanceId
+          ? { providerInstanceId: binding.value.providerInstanceId }
+          : {}),
+        runtimePayload: { activeTurnId: null },
+      });
+    });
+
   const isCompactedEvent = (
     event: ProviderRuntimeEvent,
   ): event is Extract<ProviderRuntimeEvent, { readonly type: "thread.state.changed" }> =>
@@ -1099,6 +1125,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         canonicalEvent.type === "turn.completed" ||
         canonicalEvent.type === "turn.aborted"
       ) {
+        const nativeOpenCodeAdapter =
+          source.provider === "opencode"
+            ? yield* registry.getByInstance(source.instanceId).pipe(Effect.option)
+            : Option.none<ProviderAdapterShape<ProviderAdapterError>>();
+        if (
+          canonicalEvent.turnId !== undefined &&
+          Option.isSome(nativeOpenCodeAdapter) &&
+          nativeOpenCodeAdapter.value.capabilities.sessionModelSwitch === "unsupported"
+        ) {
+          pendingOpenCodeAdmissions.get(canonicalEvent.threadId)?.add(canonicalEvent.turnId);
+          yield* settleOpenCodeBinding(canonicalEvent.threadId, canonicalEvent.turnId).pipe(
+            Effect.catch((cause) =>
+              Effect.logWarning("failed to settle OpenCode turn binding", { cause }),
+            ),
+          );
+        }
         yield* recordTurnCompletedAnalytics(source, canonicalEvent);
         if (source.provider === "claudeAgent") {
           // Background Claude turns have no sendTurn response to persist their
@@ -1683,6 +1725,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     });
     let metricProvider = "unknown";
     let metricModel = input.modelSelection?.model;
+    let pendingTerminals: Set<string> | undefined;
     return yield* Effect.gen(function* () {
       let routed = yield* resolveRoutableSession({
         threadId: input.threadId,
@@ -1721,6 +1764,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       yield* McpSessionRegistry.touchActiveMcpThread(input.threadId);
       const analyticsModelSelection =
         input.modelSelection?.instanceId === routed.instanceId ? input.modelSelection : undefined;
+      pendingTerminals =
+        routed.adapter.provider === "opencode" &&
+        routed.adapter.capabilities.sessionModelSwitch === "unsupported"
+          ? new Set<string>()
+          : undefined;
+      if (pendingTerminals) pendingOpenCodeAdmissions.set(input.threadId, pendingTerminals);
       const turn = yield* Effect.acquireUseRelease(
         beginTurnAnalytics({
           providerInstanceId: routed.instanceId,
@@ -1764,6 +1813,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           lastRuntimeEventAt: yield* nowIso,
         },
       });
+      if (pendingTerminals?.has(turn.turnId))
+        yield* settleOpenCodeBinding(input.threadId, turn.turnId);
       yield* analytics.record("provider.turn.sent", {
         provider: routed.adapter.provider,
         model: input.modelSelection?.model,
@@ -1777,6 +1828,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
       return turn;
     }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (
+            pendingTerminals &&
+            pendingOpenCodeAdmissions.get(input.threadId) === pendingTerminals
+          )
+            pendingOpenCodeAdmissions.delete(input.threadId);
+        }),
+      ),
       withMetrics({
         counter: providerTurnsTotal,
         timer: providerTurnDuration,

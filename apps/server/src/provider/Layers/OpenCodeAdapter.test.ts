@@ -3424,7 +3424,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         if (lookups === 5) fifthLookup.resolve(undefined);
       };
       runtimeMock.state.missingSessionIds.add(childId);
-      const warning = yield* Deferred.make<string>();
+      const warning = yield* Deferred.make<{}>();
       const eventsFiber = yield* adapter.streamEvents.pipe(
         Stream.filter((event) => event.threadId === threadId),
         Stream.tap((event) => {
@@ -3451,7 +3451,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       yield* Effect.promise(() => fifthLookup.promise).pipe(Effect.timeout("1 second"));
       yield* advanceTestClock(10_000);
       const detail = yield* Deferred.await(warning).pipe(Effect.timeout("1 second"));
-      NodeAssert.match(detail, /after five unrelated ancestry lookups/);
+      NodeAssert.match(String(detail), /after five unresolved ancestry lookups/);
       NodeAssert.equal(lookups, 5);
       yield* adapter.stopSession(threadId);
       yield* Fiber.interrupt(eventsFiber);

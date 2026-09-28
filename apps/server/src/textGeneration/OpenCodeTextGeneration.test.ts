@@ -1,9 +1,14 @@
+// @effect-diagnostics nodeBuiltinImport:off - native protocol fixture uses in-process HTTP.
+import * as NodeHttp from "node:http";
+import type * as NodeNet from "node:net";
+
 import { OpenCodeSettings, ProviderInstanceId, TextGenerationError } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as NetService from "@t3tools/shared/Net";
@@ -204,11 +209,13 @@ const EXTERNAL_SERVER_WITHOUT_AUTH_OPENCODE_SETTINGS = Schema.decodeSync(OpenCod
   binaryPath: "fake-opencode",
   serverUrl: "http://127.0.0.1:9999",
 });
+const decodeOpenCodeSettings = Schema.decodeSync(OpenCodeSettings);
 
 function withOpenCodeTextGeneration<A, E, R>(
   settings: OpenCodeSettings,
   effectFn: (textGeneration: TextGeneration.TextGeneration["Service"]) => Effect.Effect<A, E, R>,
   environment?: NodeJS.ProcessEnv,
+  protocol: "legacy" | "native" = "legacy",
 ) {
   return Effect.gen(function* () {
     const serverOwner = yield* OpenCodeServerOwner.make({
@@ -217,12 +224,106 @@ function withOpenCodeTextGeneration<A, E, R>(
       ...(settings.serverPassword ? { serverPassword: settings.serverPassword } : {}),
       ...(environment ? { environment } : {}),
     });
-    const textGeneration = yield* OpenCodeTextGeneration.makeOpenCodeTextGeneration(settings).pipe(
-      Effect.provideService(OpenCodeServerOwner.OpenCodeServerOwner, serverOwner),
-    );
+    const textGeneration = yield* OpenCodeTextGeneration.makeOpenCodeTextGeneration(
+      settings,
+      protocol,
+    ).pipe(Effect.provideService(OpenCodeServerOwner.OpenCodeServerOwner, serverOwner));
     return yield* effectFn(textGeneration);
   }).pipe(Effect.scoped);
 }
+
+const nativeFixture = Effect.acquireRelease(
+  Effect.promise(async () => {
+    const requests: Array<{
+      path: string;
+      body: Record<string, unknown>;
+      authorization: string | undefined;
+    }> = [];
+    let releaseWait!: () => void;
+    let notifyWait!: () => void;
+    const waitGate = new Promise<void>((resolve) => {
+      releaseWait = resolve;
+    });
+    const waitStarted = new Promise<void>((resolve) => {
+      notifyWait = resolve;
+    });
+    let outcome: "succeeded" | "failed" = "succeeded";
+    let assistantText = '{"title":"Native title"}';
+    let waitStatus = 204;
+    let removeStatus = 204;
+    let sessionDirectory = process.cwd();
+    let promptStatus = 200;
+    const server = NodeHttp.createServer(async (req, res) => {
+      const path = req.url ?? "";
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
+      requests.push({ path, body, authorization: req.headers.authorization });
+      const send = (value: unknown, status = 200) => {
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(value));
+      };
+      if (path === "/api/session" && req.method === "POST") {
+        send({ data: { id: "ses_title", location: { directory: sessionDirectory } } });
+      } else if (path === "/api/session/ses_title/prompt") {
+        send({ data: { id: "msg_title", sessionID: "ses_title", type: "user" } }, promptStatus);
+      } else if (path === "/api/session/ses_title" && req.method === "DELETE") {
+        res.writeHead(removeStatus);
+        res.end();
+      } else if (path === "/api/experimental/session/ses_title/wait") {
+        notifyWait();
+        await waitGate;
+        res.writeHead(waitStatus);
+        res.end();
+      } else if (path === "/api/session/ses_title") {
+        send({ data: { outcome } });
+      } else if (path.startsWith("/api/session/ses_title/message")) {
+        send({
+          data: [
+            {
+              id: "msg_assistant",
+              type: "assistant",
+              time: { completed: 1 },
+              content: [{ type: "text", text: assistantText }],
+            },
+          ],
+          cursor: {},
+        });
+      } else send({ error: "Unexpected route" }, 404);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return {
+      server,
+      requests,
+      waitStarted,
+      releaseWait,
+      setOutcome: (value: "succeeded" | "failed") => {
+        outcome = value;
+      },
+      setText: (value: string) => {
+        assistantText = value;
+      },
+      setWaitStatus: (value: number) => {
+        waitStatus = value;
+      },
+      setRemoveStatus: (value: number) => {
+        removeStatus = value;
+      },
+      setSessionDirectory: (value: string) => {
+        sessionDirectory = value;
+      },
+      setPromptStatus: (value: number) => {
+        promptStatus = value;
+      },
+      url: `http://127.0.0.1:${(server.address() as NodeNet.AddressInfo).port}`,
+    };
+  }),
+  ({ server, releaseWait }) =>
+    Effect.promise(async () => {
+      releaseWait();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }),
+);
 
 beforeEach(() => {
   runtimeMock.reset();
@@ -611,6 +712,176 @@ it.layer(OpenCodeTextGenerationExistingServerTestLayer)(
           expect(runtimeMock.state.closeCalls).toEqual([]);
         }),
       ).pipe(Effect.provide(TestClock.layer())),
+    );
+
+    it.effect(
+      "waits for a native 2.x completion before reading the title without using the legacy SDK",
+      () =>
+        Effect.gen(function* () {
+          const fixture = yield* nativeFixture;
+          const settings = decodeOpenCodeSettings({
+            serverUrl: fixture.url,
+            serverPassword: "native-secret",
+          });
+          yield* withOpenCodeTextGeneration(
+            settings,
+            (textGeneration) =>
+              Effect.gen(function* () {
+                const fiber = yield* Effect.forkChild(
+                  textGeneration.generateThreadTitle({
+                    cwd: process.cwd(),
+                    message: "Create a title",
+                    modelSelection: {
+                      ...DEFAULT_TEST_MODEL_SELECTION,
+                      options: [
+                        { id: "agent", value: "build" },
+                        { id: "variant", value: "fast" },
+                      ],
+                    },
+                  }),
+                );
+                yield* Effect.promise(() => fixture.waitStarted);
+                expect(fixture.requests.map((request) => request.path)).toEqual([
+                  "/api/session",
+                  "/api/session/ses_title/prompt",
+                  "/api/experimental/session/ses_title/wait",
+                ]);
+                expect(fixture.requests[0]?.body).toMatchObject({
+                  location: { directory: process.cwd() },
+                  permissions: [{ action: "*", resource: "*", effect: "deny" }],
+                  model: { id: "gpt-5", providerID: "openai", variant: "fast" },
+                  agent: "build",
+                });
+                expect(fixture.requests[1]?.body).toMatchObject({ text: expect.any(String) });
+                fixture.releaseWait();
+                expect(yield* Fiber.join(fiber)).toEqual({ title: "Native title" });
+                expect(fixture.requests.map((request) => request.path)).toEqual([
+                  "/api/session",
+                  "/api/session/ses_title/prompt",
+                  "/api/experimental/session/ses_title/wait",
+                  "/api/session/ses_title",
+                  expect.stringContaining("/api/session/ses_title/message"),
+                  "/api/session/ses_title",
+                ]);
+                expect(fixture.requests.at(-1)?.body).toEqual({});
+                expect(
+                  fixture.requests.every(
+                    (request) =>
+                      request.authorization === `Basic ${btoa("opencode:native-secret")}`,
+                  ),
+                ).toBe(true);
+                expect(runtimeMock.state.promptUrls).toEqual([]);
+              }),
+            undefined,
+            "native",
+          );
+        }).pipe(Effect.scoped),
+    );
+
+    it.effect(
+      "fails native text generation on a failed session instead of returning stale assistant text",
+      () =>
+        Effect.gen(function* () {
+          const fixture = yield* nativeFixture;
+          fixture.setOutcome("failed");
+          fixture.setText('{"title":"Stale response"}');
+          fixture.releaseWait();
+          const settings = decodeOpenCodeSettings({ serverUrl: fixture.url });
+          const error = yield* withOpenCodeTextGeneration(
+            settings,
+            (textGeneration) =>
+              Effect.flip(
+                textGeneration.generateThreadTitle({
+                  cwd: process.cwd(),
+                  message: "Create a title",
+                  modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+                }),
+              ),
+            undefined,
+            "native",
+          );
+          expect(error).toBeInstanceOf(TextGenerationError);
+          expect(error.cause).toMatchObject({ _tag: "OpenCodeTextGenerationPromptResponseError" });
+          expect(fixture.requests.at(-1)?.path).toBe("/api/session/ses_title");
+          expect(runtimeMock.state.promptUrls).toEqual([]);
+        }).pipe(Effect.scoped),
+    );
+    it.effect("reports a native completion wait failure without reading an incomplete title", () =>
+      Effect.gen(function* () {
+        const fixture = yield* nativeFixture;
+        fixture.setWaitStatus(503);
+        fixture.releaseWait();
+        const settings = decodeOpenCodeSettings({ serverUrl: fixture.url });
+        const error = yield* withOpenCodeTextGeneration(
+          settings,
+          (textGeneration) =>
+            Effect.flip(
+              textGeneration.generateThreadTitle({
+                cwd: process.cwd(),
+                message: "Create a title",
+                modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+              }),
+            ),
+          undefined,
+          "native",
+        );
+        expect(error).toBeInstanceOf(TextGenerationError);
+        expect(error.cause).toMatchObject({ _tag: "OpenCodeTextGenerationCompletionRequestError" });
+        expect(fixture.requests.map((request) => request.path)).toEqual([
+          "/api/session",
+          "/api/session/ses_title/prompt",
+          "/api/experimental/session/ses_title/wait",
+          "/api/session/ses_title",
+        ]);
+      }).pipe(Effect.scoped),
+    );
+    it.effect("preserves a native prompt failure when temporary session removal fails", () =>
+      Effect.gen(function* () {
+        const fixture = yield* nativeFixture;
+        fixture.setPromptStatus(503);
+        fixture.setRemoveStatus(503);
+        const error = yield* withOpenCodeTextGeneration(
+          decodeOpenCodeSettings({ serverUrl: fixture.url }),
+          (textGeneration) =>
+            Effect.flip(
+              textGeneration.generateThreadTitle({
+                cwd: process.cwd(),
+                message: "Create a title",
+                modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+              }),
+            ),
+          undefined,
+          "native",
+        );
+        expect(error.cause).toMatchObject({ _tag: "OpenCodeTextGenerationPromptRequestError" });
+        expect(fixture.requests.map((request) => request.path)).toEqual([
+          "/api/session",
+          "/api/session/ses_title/prompt",
+          "/api/session/ses_title",
+        ]);
+      }).pipe(Effect.scoped),
+    );
+
+    it.effect("does not remove a session whose location does not match the temporary request", () =>
+      Effect.gen(function* () {
+        const fixture = yield* nativeFixture;
+        fixture.setSessionDirectory("/someone-else/workspace");
+        const error = yield* withOpenCodeTextGeneration(
+          decodeOpenCodeSettings({ serverUrl: fixture.url }),
+          (textGeneration) =>
+            Effect.flip(
+              textGeneration.generateThreadTitle({
+                cwd: process.cwd(),
+                message: "Create a title",
+                modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+              }),
+            ),
+          undefined,
+          "native",
+        );
+        expect(error.cause).toMatchObject({ _tag: "OpenCodeTextGenerationSessionPayloadError" });
+        expect(fixture.requests.map((request) => request.path)).toEqual(["/api/session"]);
+      }).pipe(Effect.scoped),
     );
   },
 );

@@ -1966,6 +1966,8 @@ export function makeOpenCodeAdapter(
           }),
           Effect.catchIf(
             (cause) => isOpenCodeNotFound(cause),
+            // A missing session is not evidence that its ancestry is foreign;
+            // it may have disappeared before the provider made it visible.
             () => Effect.succeed(undefined),
           ),
         );
@@ -1982,7 +1984,7 @@ export function makeOpenCodeAdapter(
         const currentSessionId: string = sessionId;
         const response = yield* getSession(currentSessionId);
         if (response === undefined) {
-          return false;
+          return undefined;
         }
         if (!response.data) {
           return yield* new OpenCodeRuntimeError({
@@ -2950,7 +2952,8 @@ export function makeOpenCodeAdapter(
       if (!context.pendingChildTaskEvents.has(sessionId)) return;
       const run = Effect.gen(function* () {
         let retryCount = 0;
-        let unrelatedCount = 0;
+        let ancestryLookups = 0;
+        let lastRelation: boolean | undefined;
         while (context.pendingChildTaskEvents.has(sessionId)) {
           const relation = yield* isRelatedOpenCodeSession(context, sessionId).pipe(
             Effect.match({
@@ -2970,25 +2973,25 @@ export function makeOpenCodeAdapter(
             );
             return;
           }
-          if (relation === false) {
-            // A child can arrive before session.get sees its new ancestor.
-            // Give that race a short window, not perpetual unrelated retries.
-            unrelatedCount += 1;
-            if (unrelatedCount >= 5) {
-              const discarded = context.pendingChildTaskEvents.get(sessionId);
-              context.pendingChildTaskEvents.delete(sessionId);
-              markUnrelatedChildSession(context, sessionId);
-              if (discarded?.some(({ event }) => isTerminalChildTaskEvent(event))) {
-                context.unrelatedChildSessionIds.set(sessionId, true);
-                yield* warnChildTaskEventsDropped(
-                  context,
-                  `Terminal events for ${sessionId} could not be routed after five unrelated ancestry lookups.`,
-                );
-              }
-              return;
+          // A complete non-matching ancestry is definitively foreign; a missing
+          // or failed lookup is unresolved and must retain its loss diagnostic.
+          ancestryLookups += 1;
+          lastRelation = relation;
+          if (ancestryLookups >= 5) {
+            const discarded = context.pendingChildTaskEvents.get(sessionId);
+            context.pendingChildTaskEvents.delete(sessionId);
+            markUnrelatedChildSession(context, sessionId);
+            if (
+              lastRelation === undefined &&
+              discarded?.some(({ event }) => isTerminalChildTaskEvent(event))
+            ) {
+              context.unrelatedChildSessionIds.set(sessionId, true);
+              yield* warnChildTaskEventsDropped(
+                context,
+                `Terminal events for ${sessionId} could not be routed after five unresolved ancestry lookups.`,
+              );
             }
-          } else {
-            unrelatedCount = 0;
+            return;
           }
           yield* Effect.sleep(`${Math.min(250 * 2 ** retryCount, 5_000)} millis`);
           retryCount += 1;

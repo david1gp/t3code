@@ -26,6 +26,7 @@ import {
 } from "./OpenCodeProvider.ts";
 import type { OpenCodeInventory } from "../opencodeRuntime.ts";
 import { readOpenCodeGoUsageLimits } from "./openCodeUsageLimits.ts";
+import type { OpenCodeNativeInventory } from "../openCodeNativeInventorySchema.ts";
 const decodeOpenCodeSettings = Schema.decodeSync(OpenCodeSettings);
 
 const DEFAULT_VERSION_STDOUT = "opencode 1.14.19\n";
@@ -561,6 +562,80 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
 });
 
 it.layer(testLayer)("checkOpenCodeProviderStatus with configured server URL", (it) => {
+  it.effect("maps a native inventory without connecting through the legacy SDK", () =>
+    Effect.gen(function* () {
+      const inventory = {
+        provider: [
+          { id: "openai", name: "OpenAI", activation: "enabled", package: "@ai-sdk/openai" },
+        ],
+        model: [
+          {
+            id: "gpt-5",
+            modelID: "gpt-5",
+            providerID: "openai",
+            name: "GPT-5",
+            enabled: true,
+            status: "active",
+            variants: [{ id: "medium" }],
+          },
+        ],
+        agent: [{ id: "build", name: "build", hidden: false, mode: "primary" }],
+        skill: [{ id: "review", name: "review", path: "/work/review/SKILL.md" }],
+        command: [{ name: "review", description: "Review" }],
+      } satisfies OpenCodeNativeInventory;
+      const snapshot = yield* checkOpenCodeProviderStatus(
+        makeOpenCodeSettings({ serverUrl: "http://127.0.0.1:9000" }),
+        "/work",
+        undefined,
+        Effect.succeed({ protocol: "native", version: "2.0.18", inventory }),
+      ).pipe(
+        Effect.provideService(
+          OpenCodeServerOwner.OpenCodeServerOwner,
+          yield* OpenCodeServerOwner.make({ binaryPath: "opencode", directory: "/work" }),
+        ),
+      );
+      NodeAssert.equal(snapshot.status, "ready");
+      NodeAssert.equal(snapshot.version, "2.0.18");
+      NodeAssert.deepEqual(
+        snapshot.models.map((model) => model.slug),
+        ["openai/gpt-5"],
+      );
+      NodeAssert.deepEqual(
+        snapshot.skills.map((skill) => skill.path),
+        ["/work/review/SKILL.md"],
+      );
+      NodeAssert.deepEqual(
+        snapshot.slashCommands.map((command) => command.name),
+        ["compact", "review"],
+      );
+      NodeAssert.equal(runtimeMock.state.sdkClientInputs.length, 0);
+    }),
+  );
+
+  it.effect("fails closed on a native protocol or inventory error", () =>
+    Effect.gen(function* () {
+      const snapshot = yield* checkOpenCodeProviderStatus(
+        makeOpenCodeSettings({ serverUrl: "http://127.0.0.1:9000" }),
+        "/work",
+        undefined,
+        Effect.fail(
+          new OpenCodeRuntimeError({
+            operation: "server.info",
+            detail: "OpenCode server info returned HTTP 401; refusing legacy fallback.",
+          }),
+        ),
+      ).pipe(
+        Effect.provideService(
+          OpenCodeServerOwner.OpenCodeServerOwner,
+          yield* OpenCodeServerOwner.make({ binaryPath: "opencode", directory: "/work" }),
+        ),
+      );
+      NodeAssert.equal(snapshot.status, "error");
+      NodeAssert.match(snapshot.message ?? "", /rejected authentication/);
+      NodeAssert.equal(runtimeMock.state.sdkClientInputs.length, 0);
+    }),
+  );
+
   it.effect("does not send a local environment password to a configured server", () =>
     Effect.gen(function* () {
       const snapshot = yield* checkProvider(

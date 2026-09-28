@@ -475,6 +475,88 @@ function makeProviderServiceLayer(
   };
 }
 
+const nativeOpenCode = makeFakeCodexAdapter(ProviderDriverKind.make("opencode"));
+makeProviderServiceLayer({
+  registry: makeStaticInstanceRegistry([
+    [
+      ProviderInstanceId.make("opencode"),
+      {
+        ...nativeOpenCode.adapter,
+        capabilities: { ...nativeOpenCode.adapter.capabilities, sessionModelSwitch: "unsupported" },
+      },
+    ],
+  ]),
+}).layer("OpenCode early terminal binding", (it) => {
+  it.effect("does not persist a turn that completed before the send receipt", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("native-early-terminal");
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("opencode"),
+        providerInstanceId: ProviderInstanceId.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* Effect.yieldNow;
+      const turnId = asTurnId(`turn-${threadId}`);
+      const terminalPublished = yield* Deferred.make<void>();
+      yield* Stream.runForEach(provider.streamEvents, (event) =>
+        event.type === "turn.completed" && event.threadId === threadId
+          ? Deferred.succeed(terminalPublished, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      nativeOpenCode.sendTurn.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          nativeOpenCode.emit({
+            type: "turn.completed",
+            eventId: asEventId("native-early-terminal"),
+            provider: ProviderDriverKind.make("opencode"),
+            createdAt: "2026-01-01T00:00:00.000Z",
+            threadId,
+            turnId,
+            payload: { state: "completed" },
+          });
+          yield* Deferred.await(terminalPublished);
+          return { threadId: input.threadId, turnId };
+        }),
+      );
+      yield* provider.sendTurn({ threadId, input: "fast", attachments: [] });
+      const binding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(binding), true);
+      if (Option.isSome(binding))
+        assert.propertyVal(binding.value.runtimePayload, "activeTurnId", null);
+
+      const nextTurnId = asTurnId("native-next-turn");
+      nativeOpenCode.sendTurn.mockImplementationOnce((input) =>
+        Effect.succeed({ threadId: input.threadId, turnId: nextTurnId }),
+      );
+      yield* provider.sendTurn({ threadId, input: "next", attachments: [] });
+      const nextTerminal = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.type === "turn.completed" && event.turnId === nextTurnId),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      nativeOpenCode.emit({
+        type: "turn.completed",
+        eventId: asEventId("native-next-terminal"),
+        provider: ProviderDriverKind.make("opencode"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: nextTurnId,
+        payload: { state: "completed" },
+      });
+      yield* Fiber.join(nextTerminal);
+      const settled = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(settled), true);
+      if (Option.isSome(settled))
+        assert.propertyVal(settled.value.runtimePayload, "activeTurnId", null);
+    }),
+  );
+});
+
 for (const [enabled, completed] of [
   [false, false],
   [true, false],

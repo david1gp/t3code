@@ -28,6 +28,7 @@ import {
 } from "./TextGenerationUtils.ts";
 import * as OpenCodeRuntime from "../provider/opencodeRuntime.ts";
 import * as OpenCodeServerOwner from "../provider/OpenCodeServerOwner.ts";
+import { openCodeNativeClientCreate } from "../provider/openCodeNativeClientCreate.ts";
 
 const OpenCodeTextGenerationOperation = Schema.Literals([
   "generateCommitMessage",
@@ -80,6 +81,15 @@ export class OpenCodeTextGenerationPromptRequestError extends Schema.TaggedError
 ) {
   override get message(): string {
     return `OpenCode prompt request failed for ${this.operation} in ${this.cwd} using ${this.providerId}/${this.modelId} (session ${this.sessionId}).`;
+  }
+}
+
+export class OpenCodeTextGenerationCompletionRequestError extends Schema.TaggedError<OpenCodeTextGenerationCompletionRequestError>()(
+  "OpenCodeTextGenerationCompletionRequestError",
+  { ...openCodePromptErrorContext, cause: Schema.Defect() },
+) {
+  override get message(): string {
+    return `OpenCode completion wait/read failed for ${this.operation} in ${this.cwd} (session ${this.sessionId}).`;
   }
 }
 
@@ -172,6 +182,7 @@ function getOpenCodeTextResponse(parts: ReadonlyArray<unknown> | undefined): str
 
 export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration")(function* (
   openCodeSettings: OpenCodeSettings,
+  protocol: "legacy" | "native" = "legacy",
 ) {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const openCodeRuntime = yield* OpenCodeRuntime.OpenCodeRuntime;
@@ -199,81 +210,223 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
         resolveAttachmentPath({ attachmentsDir: serverConfig.attachmentsDir, attachment }),
     });
 
-    const runAgainstServer = Effect.fn("runOpenCodeJson.runAgainstServer")(
-      function* (
-        server: Pick<
-          OpenCodeRuntime.OpenCodeServerConnection,
-          "url" | "serverPassword" | "version"
-        >,
-      ) {
-        const client = openCodeRuntime.createOpenCodeSdkClient({
-          baseUrl: server.url,
-          directory: input.cwd,
-          ...(server.serverPassword !== undefined ? { serverPassword: server.serverPassword } : {}),
-        });
-        const session = yield* Effect.tryPromise({
-          try: () =>
-            client.session.create({
-              title: `T3 Code ${input.operation}`,
-              permission: [{ permission: "*", pattern: "*", action: "deny" }],
-            }),
-          catch: (cause) =>
-            new OpenCodeTextGenerationSessionRequestError({
+    const promptContext = (sessionId: string) => ({
+      operation: input.operation,
+      cwd: input.cwd,
+      sessionId,
+      providerId: parsedModel.providerID,
+      modelId: parsedModel.modelID,
+    });
+    const selectedAgent = getModelSelectionStringOptionValue(input.modelSelection, "agent");
+    const selectedVariant = getModelSelectionStringOptionValue(input.modelSelection, "variant");
+
+    const runAgainstNative = Effect.gen(function* () {
+      const client = openCodeNativeClientCreate({
+        url: openCodeSettings.serverUrl,
+        ...(openCodeSettings.serverPassword
+          ? { serverPassword: openCodeSettings.serverPassword }
+          : {}),
+      });
+      const session = yield* Effect.acquireRelease(
+        Effect.gen(function* () {
+          const created = yield* Effect.tryPromise({
+            try: (signal) =>
+              client.session.create(
+                {
+                  location: { directory: input.cwd },
+                  title: `T3 Code ${input.operation}`,
+                  permissions: [{ action: "*", resource: "*", effect: "deny" }],
+                  model: {
+                    id: parsedModel.modelID,
+                    providerID: parsedModel.providerID,
+                    ...(selectedVariant ? { variant: selectedVariant } : {}),
+                  },
+                  ...(selectedAgent ? { agent: selectedAgent } : {}),
+                },
+                { signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) },
+              ),
+            catch: (cause) =>
+              new OpenCodeTextGenerationSessionRequestError({
+                operation: input.operation,
+                cwd: input.cwd,
+                cause,
+              }),
+          });
+          // Only a confirmed temporary session belongs to this request.
+          if (!created?.id || created.location?.directory !== input.cwd) {
+            return yield* new OpenCodeTextGenerationSessionPayloadError({
               operation: input.operation,
               cwd: input.cwd,
-              cause,
-            }),
+            });
+          }
+          return created;
+        }),
+        (created) =>
+          Effect.promise(() =>
+            client.session.remove(
+              { sessionID: created.id },
+              { signal: AbortSignal.timeout(15_000) },
+            ),
+          ).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Failed to remove temporary OpenCode text generation session", {
+                sessionId: created.id,
+                cause,
+              }),
+            ),
+          ),
+      );
+      const context = promptContext(session.id);
+      const receipt = yield* Effect.tryPromise({
+        try: (signal) =>
+          client.session.prompt(
+            {
+              sessionID: session.id,
+              text: input.prompt,
+              ...(fileParts.length
+                ? {
+                    files: fileParts.map((part) => ({
+                      uri: part.url,
+                      ...(part.filename === undefined ? {} : { name: part.filename }),
+                    })),
+                  }
+                : {}),
+            },
+            { signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) },
+          ),
+        catch: (cause) => new OpenCodeTextGenerationPromptRequestError({ ...context, cause }),
+      });
+      if (receipt?.type !== "user" || receipt.sessionID !== session.id || !receipt.id) {
+        return yield* new OpenCodeTextGenerationPromptResponseError({
+          ...context,
+          providerMessage: "OpenCode returned an invalid prompt admission receipt.",
         });
-        if (!session.data) {
-          return yield* new OpenCodeTextGenerationSessionPayloadError({
+      }
+      // Native prompt acknowledges admission, not completion. Wait for this fresh
+      // session to become idle before reading its persisted assistant message.
+      const result = yield* Effect.tryPromise({
+        try: async (signal) => {
+          const deadline = AbortSignal.any([signal, AbortSignal.timeout(120_000)]);
+          await client.session.wait({ sessionID: session.id }, { signal: deadline });
+          const state = await client.session.get({ sessionID: session.id }, { signal: deadline });
+          const messages = await client.message.list(
+            { sessionID: session.id, type: "assistant", order: "desc", limit: 1 },
+            { signal: deadline },
+          );
+          return { state, messages };
+        },
+        catch: (cause) => new OpenCodeTextGenerationCompletionRequestError({ ...context, cause }),
+      });
+      const assistant = result.messages?.data?.[0];
+      const failure =
+        result.state?.outcome !== "succeeded" ||
+        assistant?.type !== "assistant" ||
+        assistant.error ||
+        assistant.finish === "error" ||
+        !assistant.time.completed;
+      if (failure) {
+        return yield* new OpenCodeTextGenerationPromptResponseError({
+          ...context,
+          providerMessage:
+            (assistant?.type === "assistant" && assistant.error?.message) ||
+            `OpenCode session did not produce a completed response (${result.state?.outcome ?? "unknown"}).`,
+        });
+      }
+      const parts = assistant.content;
+      const text = getOpenCodeTextResponse(parts);
+      if (!text) {
+        return yield* new OpenCodeTextGenerationEmptyOutputError({
+          ...context,
+          responsePartCount: parts.length,
+          textPartCount: parts.filter(isOpenCodeTextPart).length,
+        });
+      }
+      return text;
+    }).pipe(Effect.scoped);
+
+    const runAgainstServer = Effect.fn("runOpenCodeJson.runAgainstServer")(function* (
+      server: Pick<OpenCodeRuntime.OpenCodeServerConnection, "url" | "serverPassword" | "version">,
+    ) {
+      const client = openCodeRuntime.createOpenCodeSdkClient({
+        baseUrl: server.url,
+        directory: input.cwd,
+        ...(server.serverPassword !== undefined ? { serverPassword: server.serverPassword } : {}),
+      });
+      const session = yield* Effect.tryPromise({
+        try: () =>
+          client.session.create({
+            title: `T3 Code ${input.operation}`,
+            permission: [{ permission: "*", pattern: "*", action: "deny" }],
+          }),
+        catch: (cause) =>
+          new OpenCodeTextGenerationSessionRequestError({
             operation: input.operation,
             cwd: input.cwd,
-          });
-        }
-        const selectedAgent = getModelSelectionStringOptionValue(input.modelSelection, "agent");
-        const selectedVariant = getModelSelectionStringOptionValue(input.modelSelection, "variant");
-        const promptContext = {
+            cause,
+          }),
+      });
+      if (!session.data) {
+        return yield* new OpenCodeTextGenerationSessionPayloadError({
           operation: input.operation,
           cwd: input.cwd,
-          sessionId: session.data.id,
-          providerId: parsedModel.providerID,
-          modelId: parsedModel.modelID,
-        };
-
-        const result = yield* Effect.tryPromise({
-          try: () =>
-            client.session.prompt({
-              sessionID: session.data.id,
-              model: parsedModel,
-              ...(selectedAgent ? { agent: selectedAgent } : {}),
-              ...(selectedVariant ? { variant: selectedVariant } : {}),
-              parts: [{ type: "text", text: input.prompt }, ...fileParts],
-            }),
-          catch: (cause) =>
-            new OpenCodeTextGenerationPromptRequestError({
-              ...promptContext,
-              cause,
-            }),
         });
-        const promptFailure = getOpenCodePromptFailure(result.data?.info?.error);
-        if (promptFailure) {
-          return yield* new OpenCodeTextGenerationPromptResponseError({
-            ...promptContext,
-            ...(promptFailure.name ? { providerErrorName: promptFailure.name } : {}),
-            providerMessage: promptFailure.message,
-          });
-        }
-        const responseParts = result.data?.parts ?? [];
-        const rawText = getOpenCodeTextResponse(responseParts);
-        if (rawText.length === 0) {
-          return yield* new OpenCodeTextGenerationEmptyOutputError({
-            ...promptContext,
-            responsePartCount: responseParts.length,
-            textPartCount: responseParts.filter(isOpenCodeTextPart).length,
-          });
-        }
-        return rawText;
-      },
+      }
+      const context = promptContext(session.data.id);
+
+      const result = yield* Effect.tryPromise({
+        try: () =>
+          client.session.prompt({
+            sessionID: session.data.id,
+            model: parsedModel,
+            ...(selectedAgent ? { agent: selectedAgent } : {}),
+            ...(selectedVariant ? { variant: selectedVariant } : {}),
+            parts: [{ type: "text", text: input.prompt }, ...fileParts],
+          }),
+        catch: (cause) =>
+          new OpenCodeTextGenerationPromptRequestError({
+            ...context,
+            cause,
+          }),
+      });
+      const promptFailure = getOpenCodePromptFailure(result.data?.info?.error);
+      if (promptFailure) {
+        return yield* new OpenCodeTextGenerationPromptResponseError({
+          ...context,
+          ...(promptFailure.name ? { providerErrorName: promptFailure.name } : {}),
+          providerMessage: promptFailure.message,
+        });
+      }
+      const responseParts = result.data?.parts ?? [];
+      const rawText = getOpenCodeTextResponse(responseParts);
+      if (rawText.length === 0) {
+        return yield* new OpenCodeTextGenerationEmptyOutputError({
+          ...context,
+          responsePartCount: responseParts.length,
+          textPartCount: responseParts.filter(isOpenCodeTextPart).length,
+        });
+      }
+      return rawText;
+    });
+
+    const runAgainstLegacy = Effect.suspend(() =>
+      openCodeSettings.serverUrl.length > 0
+        ? openCodeRuntime
+            .connectToOpenCodeServer({
+              binaryPath: openCodeSettings.binaryPath,
+              directory: input.cwd,
+              serverUrl: openCodeSettings.serverUrl,
+              ...(openCodeSettings.serverPassword
+                ? { serverPassword: openCodeSettings.serverPassword }
+                : {}),
+            })
+            .pipe(Effect.flatMap(runAgainstServer), Effect.scoped)
+        : serverOwner.withServer(runAgainstServer),
+    );
+    const serverOutput: Effect.Effect<
+      string,
+      Effect.Error<typeof runAgainstNative> | Effect.Error<typeof runAgainstLegacy>
+    > = protocol === "native" ? runAgainstNative : runAgainstLegacy;
+    const rawOutput = yield* serverOutput.pipe(
       Effect.catchTags({
         OpenCodeTextGenerationSessionRequestError: (cause) =>
           Effect.fail(
@@ -299,6 +452,14 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
               cause,
             }),
           ),
+        OpenCodeTextGenerationCompletionRequestError: (cause) =>
+          Effect.fail(
+            new TextGenerationError({
+              operation: cause.operation,
+              detail: "OpenCode session completion wait/read failed.",
+              cause,
+            }),
+          ),
         OpenCodeTextGenerationPromptResponseError: (cause) =>
           Effect.fail(
             new TextGenerationError({
@@ -315,24 +476,6 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
               cause,
             }),
           ),
-      }),
-    );
-
-    const serverOutput =
-      openCodeSettings.serverUrl.length > 0
-        ? openCodeRuntime
-            .connectToOpenCodeServer({
-              binaryPath: openCodeSettings.binaryPath,
-              directory: input.cwd,
-              serverUrl: openCodeSettings.serverUrl,
-              ...(openCodeSettings.serverPassword
-                ? { serverPassword: openCodeSettings.serverPassword }
-                : {}),
-            })
-            .pipe(Effect.flatMap(runAgainstServer), Effect.scoped)
-        : serverOwner.withServer(runAgainstServer);
-    const rawOutput = yield* serverOutput.pipe(
-      Effect.catchTags({
         OpenCodeRuntimeError: (cause) =>
           Effect.fail(
             new TextGenerationError({

@@ -28,6 +28,9 @@ import {
 } from "../opencodeRuntime.ts";
 import type { Agent, ProviderListResponse } from "@opencode-ai/sdk/v2";
 import * as OpenCodeServerOwner from "../OpenCodeServerOwner.ts";
+import type { OpenCodeNativeInventory } from "../openCodeNativeInventorySchema.ts";
+import { openCodeNativeInventoryMap } from "../openCodeNativeInventoryMap.ts";
+import { OpenCodeRuntimeError } from "../opencodeRuntime.ts";
 
 const OPENCODE_PRESENTATION = {
   displayName: "OpenCode",
@@ -386,6 +389,15 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
   openCodeSettings: OpenCodeSettings,
   cwd: string,
   environment?: NodeJS.ProcessEnv,
+  externalInventory?: Effect.Effect<
+    | {
+        readonly protocol: "native";
+        readonly inventory: OpenCodeNativeInventory;
+        readonly version: string;
+      }
+    | { readonly protocol: "legacy" },
+    OpenCodeRuntimeError
+  >,
 ): Effect.fn.Return<
   ServerProviderDraft,
   never,
@@ -510,18 +522,32 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
         }),
       )
       .pipe(Effect.map((inventory) => ({ inventory, version: server.version })));
+  const legacyExternalInventory = openCodeRuntime
+    .connectToOpenCodeServer({
+      binaryPath: openCodeSettings.binaryPath,
+      directory: cwd,
+      serverUrl: openCodeSettings.serverUrl,
+      ...(openCodeSettings.serverPassword
+        ? { serverPassword: openCodeSettings.serverPassword }
+        : {}),
+    })
+    .pipe(
+      Effect.flatMap(loadInventory),
+      Effect.scoped,
+      Effect.map((result) => ({ ...result, protocol: "legacy" as const })),
+    );
+  const localInventory = serverOwner
+    .withServer(loadInventory)
+    .pipe(Effect.map((result) => ({ ...result, protocol: "legacy" as const })));
   const inventoryEffect = isExternalServer
-    ? openCodeRuntime
-        .connectToOpenCodeServer({
-          binaryPath: openCodeSettings.binaryPath,
-          directory: cwd,
-          serverUrl: openCodeSettings.serverUrl,
-          ...(openCodeSettings.serverPassword
-            ? { serverPassword: openCodeSettings.serverPassword }
-            : {}),
+    ? externalInventory
+      ? Effect.gen(function* () {
+          const result = yield* externalInventory;
+          if (result.protocol === "native") return result;
+          return yield* legacyExternalInventory;
         })
-        .pipe(Effect.flatMap(loadInventory), Effect.scoped)
-    : serverOwner.withServer(loadInventory);
+      : legacyExternalInventory
+    : localInventory;
   const inventoryExit = yield* Effect.exit(
     inventoryEffect.pipe(
       Effect.mapError(
@@ -535,22 +561,30 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
 
   version = inventoryExit.value.version;
 
+  const mapped =
+    inventoryExit.value.protocol === "native"
+      ? openCodeNativeInventoryMap(inventoryExit.value.inventory)
+      : {
+          models: flattenOpenCodeModels(inventoryExit.value.inventory),
+          skills: openCodeSkillsToServerProviderSkills(inventoryExit.value.inventory.skills),
+          slashCommands: openCodeCommandsToServerProviderSlashCommands(
+            inventoryExit.value.inventory.commands,
+          ),
+          connectedCount: inventoryExit.value.inventory.providerList.connected.length,
+        };
   const models = providerModelsFromSettings(
-    flattenOpenCodeModels(inventoryExit.value.inventory),
+    mapped.models,
     customModels,
     DEFAULT_OPENCODE_MODEL_CAPABILITIES,
   );
-  const skills = openCodeSkillsToServerProviderSkills(inventoryExit.value.inventory.skills);
-  const connectedCount = inventoryExit.value.inventory.providerList.connected.length;
+  const connectedCount = mapped.connectedCount;
   return buildServerProvider({
     presentation: OPENCODE_PRESENTATION,
     enabled: true,
     checkedAt,
     models,
-    skills,
-    slashCommands: openCodeCommandsToServerProviderSlashCommands(
-      inventoryExit.value.inventory.commands,
-    ),
+    skills: mapped.skills,
+    slashCommands: mapped.slashCommands,
     probe: {
       installed: true,
       version,
