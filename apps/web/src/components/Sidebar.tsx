@@ -2377,6 +2377,7 @@ export default function Sidebar() {
     strict: false,
     select: (params) => resolveThreadRouteTarget(params),
   });
+  const routeDraftIdForRows = routeTarget?.kind === "draft" ? routeTarget.draftId : null;
   const routeDraftThread = useComposerDraftStore((store) =>
     routeTarget?.kind === "draft" ? store.getDraftSession(routeTarget.draftId) : null,
   );
