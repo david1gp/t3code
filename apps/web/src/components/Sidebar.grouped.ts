@@ -3,10 +3,39 @@ import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environ
 import type { SidebarProjectSnapshot } from "../sidebarProjectGrouping";
 import type { SidebarListItem, SidebarSection } from "./Sidebar.logic";
 
+export function sidebarGroupedDraftProjectKeysSelect<
+  Session extends {
+    environmentId: string;
+    projectId: string;
+    promotedTo?: unknown;
+  },
+>(input: {
+  groups: readonly SidebarProjectSnapshot[];
+  sessions: Readonly<Record<string, Session>>;
+}) {
+  const keys = new Set<string>();
+  for (const session of Object.values(input.sessions)) {
+    if (session.promotedTo != null) continue;
+    for (const group of input.groups) {
+      if (
+        group.memberProjectRefs.some(
+          (ref) =>
+            ref.environmentId === session.environmentId && ref.projectId === session.projectId,
+        )
+      ) {
+        keys.add(group.projectKey);
+        break;
+      }
+    }
+  }
+  return [...keys].sort().join("\0");
+}
+
 export function sidebarGroupedListsCreate(input: {
   groups: readonly SidebarProjectSnapshot[];
   sections: Record<SidebarSection, readonly EnvironmentThreadShell[]>;
   totals?: Partial<Record<SidebarSection, readonly EnvironmentThreadShell[]>>;
+  draftProjectKeys?: ReadonlySet<string>;
   scopeKey: string | null;
 }) {
   const byRef = new Map(
@@ -82,6 +111,6 @@ export function sidebarGroupedListsCreate(input: {
   return [...lists.values()].filter(
     (group) =>
       group.sections.pinned.length + group.sections.active.length + group.sections.snoozed.length >
-      0,
+        0 || input.draftProjectKeys?.has(group.project.projectKey) === true,
   );
 }

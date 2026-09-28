@@ -212,7 +212,7 @@ import {
 } from "./Sidebar.drag";
 import { SidebarDragLifecycle, SidebarPointerSensor } from "./Sidebar.pointer";
 import { createSidebarListMotion } from "./Sidebar.motion";
-import { sidebarGroupedListsCreate } from "./Sidebar.grouped";
+import { sidebarGroupedDraftProjectKeysSelect, sidebarGroupedListsCreate } from "./Sidebar.grouped";
 import { sidebarGroupedActiveSort } from "./sidebarGroupedActiveSort";
 import { sidebarGroupedDropResolve } from "./sidebarGroupedDropResolve";
 import { sidebarGroupedDragId } from "./sidebarGroupedDragId";
@@ -2599,7 +2599,6 @@ export default function Sidebar() {
   // re-rendering the whole sidebar. Approximates the block's row filter
   // (every non-promoted session with content); it can overcount by one for
   // an open never-left draft, which only softens the empty state.
-  const routeDraftIdForRows = routeTarget?.kind === "draft" ? routeTarget.draftId : null;
   const visibleDraftSessionCount = useComposerDraftStore((store) => {
     let count = 0;
     for (const [draftKey, session] of Object.entries(store.draftThreadsByThreadKey)) {
@@ -2618,6 +2617,15 @@ export default function Sidebar() {
       count += 1;
     }
     return count;
+  });
+  // Keep draft-only projects in grouped view without subscribing the sidebar
+  // render to composer keystrokes. This selector changes only when draft
+  // eligibility or ownership changes, not while already-contentful text edits.
+  const groupedDraftProjectKeysKey = useComposerDraftStore((store) => {
+    return sidebarGroupedDraftProjectKeysSelect({
+      groups: projectGroups,
+      sessions: store.draftThreadsByThreadKey,
+    });
   });
   // Scope flips drop the selection: rows selected under the old scope may be
   // hidden now, and bulk actions must never count or touch invisible rows.
@@ -2936,6 +2944,7 @@ export default function Sidebar() {
               settled: renderedSettledThreads,
             },
             totals: { snoozed: snoozedThreads, settled: settledThreads },
+            draftProjectKeys: new Set(groupedDraftProjectKeysKey.split("\0").filter(Boolean)),
           })
         : [],
     [
@@ -2948,6 +2957,7 @@ export default function Sidebar() {
       snoozedThreads,
       settledThreads,
       renderedSettledThreads,
+      groupedDraftProjectKeysKey,
     ],
   );
   const groupPreferenceKeys = useCallback(

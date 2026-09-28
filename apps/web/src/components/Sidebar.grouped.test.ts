@@ -1,7 +1,7 @@
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 import { describe, expect, it } from "vite-plus/test";
 import type { SidebarProjectSnapshot } from "../sidebarProjectGrouping";
-import { sidebarGroupedListsCreate } from "./Sidebar.grouped";
+import { sidebarGroupedDraftProjectKeysSelect, sidebarGroupedListsCreate } from "./Sidebar.grouped";
 import { sidebarDraftRowsSelect } from "./sidebarDraftRowsSelect";
 import { sidebarGroupedDraftBelongsToProject } from "./sidebarGroupedDraftBelongsToProject";
 import { sidebarGroupedDragId } from "./sidebarGroupedDragId";
@@ -83,6 +83,62 @@ describe("grouped sidebar ownership and drops", () => {
             ["snoozed-header", "settled-header", "settled-placeholder"].includes(item.marker),
         ),
     ).toBe(false);
+  });
+
+  it("keeps draft-only owners visible only in the matching grouped scope", () => {
+    const draftOnly = project("draft-only", [["one", "new"]]);
+    const collidingProject = project("other-environment", [["two", "new"]]);
+    const input = {
+      groups: [draftOnly, collidingProject],
+      sections: { pinned: [], active: [], snoozed: [], settled: [] },
+      draftProjectKeys: new Set(["draft-only"]),
+    };
+
+    expect(
+      sidebarGroupedListsCreate({ ...input, scopeKey: null }).map(
+        ({ project }) => project.projectKey,
+      ),
+    ).toEqual(["draft-only"]);
+    expect(sidebarGroupedListsCreate({ ...input, scopeKey: "other-environment" })).toEqual([]);
+  });
+
+  it("retains catalog groups for empty unpromoted drafts without inventing uncatalogued owners", () => {
+    const sessions = {
+      empty: { environmentId: "local", projectId: "a", promotedTo: null },
+      promoted: { environmentId: "remote", projectId: "a", promotedTo: "thread" },
+      uncatalogued: { environmentId: "missing", projectId: "project", promotedTo: null },
+    };
+    expect(sidebarGroupedDraftProjectKeysSelect({ groups, sessions })).toBe("alpha");
+    const draftRows = sidebarDraftRowsSelect({
+      sessions,
+      composers: {},
+      scope: null,
+      groupProject: groups[0]!,
+      activeDraftId: null,
+      frozenActive: { routeDraftId: null, row: null },
+      hasContent: () => false,
+    });
+    expect(draftRows.map(({ draftId }) => draftId)).toEqual(["empty"]);
+    expect(
+      sidebarDraftRowsSelect({
+        sessions,
+        composers: {},
+        scope: null,
+        activeDraftId: null,
+        frozenActive: { routeDraftId: null, row: null },
+        hasContent: () => false,
+      }),
+    ).toEqual([]);
+    expect(
+      sidebarGroupedListsCreate({
+        groups,
+        sections: { pinned: [], active: [], snoozed: [], settled: [] },
+        draftProjectKeys: new Set(
+          sidebarGroupedDraftProjectKeysSelect({ groups, sessions }).split("\0"),
+        ),
+        scopeKey: null,
+      }).map(({ project }) => project.projectKey),
+    ).toEqual(["alpha"]);
   });
 
   it("rejects cross-project and header drops but permits reorder and lifecycle moves within owner", () => {
@@ -334,7 +390,7 @@ describe("grouped sidebar ownership and drops", () => {
         other: { content: true },
       },
       scope: null,
-      activeDraftId: "empty",
+      activeDraftId: null,
       frozenActive: { routeDraftId: "empty", row: null },
       hasContent: (composer: { content: boolean } | undefined) => composer?.content === true,
     };
@@ -344,7 +400,7 @@ describe("grouped sidebar ownership and drops", () => {
         row.composer?.content ?? null,
       ]),
     ).toEqual([
-      ["empty", null],
+      ["empty", false],
       ["invested", true],
     ]);
     expect(
