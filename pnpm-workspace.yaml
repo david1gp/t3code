@@ -15,8 +15,10 @@ allowBuilds:
   electron: true
   electron-winstaller: false
   esbuild: true
+  "@google/genai": true
   msw: false
   node-pty: true
+  protobufjs: true
   sharp: true
   utf-8-validate: false
   workerd: false
