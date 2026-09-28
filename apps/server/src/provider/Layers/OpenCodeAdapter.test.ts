@@ -3329,6 +3329,135 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("ignores cached unrelated terminal events on another thread without warning", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadA = asThreadId("thread-unrelated-terminal-a");
+      const threadB = asThreadId("thread-unrelated-terminal-b");
+      const rootA = "ses_unrelated_terminal_root_a";
+      const rootB = "ses_unrelated_terminal_root_b";
+      const childA = "ses_unrelated_terminal_child_a";
+      runtimeMock.state.createdSessionIds.push(rootA, rootB);
+      runtimeMock.state.sessionParentById.set(childA, rootA);
+      const enqueue = makeOpenCodeEventQueue();
+      const firstLookup = promiseWithResolvers<void>();
+      const fifthLookup = promiseWithResolvers<void>();
+      let lookupsForB = 0;
+      runtimeMock.state.sessionGetImplementation = async (sessionId) => {
+        if (sessionId !== childA && sessionId !== rootA) return;
+        lookupsForB += 1;
+        if (lookupsForB === 1) firstLookup.resolve(undefined);
+        if (lookupsForB === 5) fifthLookup.resolve(undefined);
+      };
+      const warningsB: string[] = [];
+      const completedA = yield* Deferred.make<void>();
+      const markerB = yield* Deferred.make<void>();
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadA || event.threadId === threadB),
+        Stream.tap((event) => {
+          if (event.threadId === threadB && event.type === "runtime.warning") {
+            warningsB.push(event.payload.message);
+          }
+          if (event.threadId === threadA && event.type === "task.completed") {
+            return Deferred.succeed(completedA, undefined);
+          }
+          if (event.threadId === threadB && event.type === "thread.metadata.updated") {
+            return Deferred.succeed(markerB, undefined);
+          }
+          return Effect.void;
+        }),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId: threadA,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId: threadB,
+        runtimeMode: "full-access",
+      });
+      enqueue({
+        id: "evt-unrelated-terminal-child-created",
+        type: "session.created",
+        properties: { info: { id: childA, parentID: rootA } },
+      });
+      yield* Effect.promise(() => firstLookup.promise).pipe(Effect.timeout("1 second"));
+      yield* advanceTestClock(10_000);
+      yield* Effect.promise(() => fifthLookup.promise).pipe(Effect.timeout("1 second"));
+      yield* advanceTestClock(10_000);
+      enqueue({
+        id: "evt-unrelated-terminal-marker",
+        type: "session.updated",
+        properties: { info: { id: rootB, title: "Other root remains responsive" } },
+      });
+      yield* Deferred.await(markerB).pipe(Effect.timeout("1 second"));
+      NodeAssert.equal(lookupsForB, 10, "five failed ancestry checks cached the foreign session");
+      enqueue({
+        id: "evt-unrelated-terminal-child-idle",
+        type: "session.status",
+        properties: { sessionID: childA, status: { type: "idle" } },
+      });
+      yield* Deferred.await(completedA).pipe(Effect.timeout("1 second"));
+      NodeAssert.deepEqual(warningsB, []);
+      yield* adapter.stopSession(threadA);
+      yield* adapter.stopSession(threadB);
+      yield* Fiber.interrupt(eventsFiber);
+    }),
+  );
+
+  it.effect("warns when a terminal child event is dropped after unresolved ancestry retries", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-unresolved-terminal-child");
+      const childId = "ses_unresolved_terminal_child";
+      const enqueue = makeOpenCodeEventQueue();
+      const firstLookup = promiseWithResolvers<void>();
+      const fifthLookup = promiseWithResolvers<void>();
+      let lookups = 0;
+      runtimeMock.state.sessionGetImplementation = async (sessionId) => {
+        if (sessionId !== childId) return;
+        lookups += 1;
+        if (lookups === 1) firstLookup.resolve(undefined);
+        if (lookups === 5) fifthLookup.resolve(undefined);
+      };
+      runtimeMock.state.missingSessionIds.add(childId);
+      const warning = yield* Deferred.make<string>();
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.tap((event) => {
+          if (event.type === "runtime.warning") {
+            return Deferred.succeed(warning, event.payload.detail ?? "");
+          }
+          return Effect.void;
+        }),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      enqueue({
+        id: "evt-unresolved-terminal-child",
+        type: "session.status",
+        properties: { sessionID: childId, status: { type: "idle" } },
+      });
+      yield* Effect.promise(() => firstLookup.promise).pipe(Effect.timeout("1 second"));
+      yield* advanceTestClock(10_000);
+      yield* Effect.promise(() => fifthLookup.promise).pipe(Effect.timeout("1 second"));
+      yield* advanceTestClock(10_000);
+      const detail = yield* Deferred.await(warning).pipe(Effect.timeout("1 second"));
+      NodeAssert.match(detail, /after five unrelated ancestry lookups/);
+      NodeAssert.equal(lookups, 5);
+      yield* adapter.stopSession(threadId);
+      yield* Fiber.interrupt(eventsFiber);
+    }),
+  );
+
   it.effect("attributes delayed child start and completion to the turn that received them", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

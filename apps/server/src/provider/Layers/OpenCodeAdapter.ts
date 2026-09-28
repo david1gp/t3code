@@ -3096,16 +3096,6 @@ export function makeOpenCodeAdapter(
         }
         if (!context.relatedSessionIds.has(payloadSessionId)) {
           if (context.unrelatedChildSessionIds.has(payloadSessionId)) {
-            if (
-              isTerminalChildTaskEvent(event) &&
-              !context.unrelatedChildSessionIds.get(payloadSessionId)
-            ) {
-              context.unrelatedChildSessionIds.set(payloadSessionId, true);
-              yield* warnChildTaskEventsDropped(
-                context,
-                `Terminal event for unrelated session ${payloadSessionId} was not routed.`,
-              );
-            }
             return;
           }
           yield* queuePendingChildTaskEvent(context, payloadSessionId, event);
