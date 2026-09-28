@@ -153,6 +153,42 @@
   ],
   "packageOverrides": [
     {
+      "repositoryUrl": "https://github.com/earendil-works/pi",
+      "version": "0.87.1",
+      "sourceUrl": "https://github.com/earendil-works/pi/tree/v0.87.1",
+      "generatedNotice": {
+        "licenseId": "MIT",
+        "copyrights": ["Copyright (c) 2025 Mario Zechner"]
+      }
+    },
+    {
+      "repositoryUrl": "https://github.com/anomalyco/opencode",
+      "version": "2.0.18",
+      "sourceUrl": "https://github.com/anomalyco/opencode/tree/v2.0.18/packages",
+      "generatedNotice": {
+        "licenseId": "MIT",
+        "copyrights": ["Copyright (c) 2025 opencode"]
+      }
+    },
+    {
+      "name": "standardwebhooks",
+      "version": "1.0.0",
+      "sourceUrl": "https://github.com/standard-webhooks/standard-webhooks/tree/v1.0.0/libraries/javascript",
+      "generatedNotice": {
+        "licenseId": "MIT",
+        "copyrights": ["Copyright (c) Standard Webhooks"]
+      }
+    },
+    {
+      "name": "data-uri-to-buffer",
+      "version": "4.0.1",
+      "sourceUrl": "https://github.com/TooTallNate/node-data-uri-to-buffer/tree/4.0.1",
+      "generatedNotice": {
+        "licenseId": "MIT",
+        "copyrights": ["Copyright (c) 2014 Nathan Rajlich <nathan@tootallnate.net>"]
+      }
+    },
+    {
       "license": "MIT",
       "name": "@react-grab/cli",
       "sourceUrl": "https://github.com/aidenybai/react-grab/tree/main/packages/cli",
