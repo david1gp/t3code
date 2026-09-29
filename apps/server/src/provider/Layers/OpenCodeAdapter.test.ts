@@ -3550,6 +3550,72 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("completes running child tasks whose idle status was lost during a reconnect", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-child-lost-idle");
+      const rootId = "http://127.0.0.1:9999/session";
+      const idleChildId = "ses_lost_idle_child";
+      const busyChildId = "ses_still_busy_child";
+      runtimeMock.state.sessionParentById.set(idleChildId, rootId);
+      runtimeMock.state.sessionParentById.set(busyChildId, rootId);
+      const enqueue = makeOpenCodeEventQueue();
+      const started = yield* Deferred.make<void>();
+      const completed = yield* Deferred.make<string>();
+      let startedCount = 0;
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.tap((event) =>
+          Effect.gen(function* () {
+            if (event.type === "task.started" && ++startedCount === 2) {
+              yield* Deferred.succeed(started, undefined);
+            }
+            if (event.type === "task.completed") {
+              yield* Deferred.succeed(completed, event.payload.taskId);
+            }
+          }),
+        ),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Delegate",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+      // Busy child first: a wrongly completed busy child would win the race.
+      for (const sessionID of [busyChildId, idleChildId]) {
+        enqueue({
+          id: `evt-${sessionID}-busy`,
+          type: "session.status",
+          properties: { sessionID, status: { type: "busy" } },
+        });
+      }
+      yield* Deferred.await(started).pipe(Effect.timeout("1 second"));
+      // The idle child's terminal status fell into the dropped stream; OpenCode
+      // still reports the other child as busy.
+      runtimeMock.state.sessionStatusImplementation = async () => ({
+        data: {
+          [rootId]: { type: "busy" },
+          [busyChildId]: { type: "busy" },
+        },
+      });
+      enqueue({ id: "evt-child-reconnected", type: "server.connected", properties: {} });
+      const completedTaskId = yield* Deferred.await(completed).pipe(Effect.timeout("1 second"));
+      NodeAssert.equal(completedTaskId, idleChildId);
+      yield* adapter.stopSession(threadId);
+      yield* Fiber.interrupt(eventsFiber);
+    }),
+  );
+
   it.effect(
     "normalizes nested child sessions without mixing their transcript or usage into the parent",
     () =>

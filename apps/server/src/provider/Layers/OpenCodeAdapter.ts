@@ -3010,6 +3010,45 @@ export function makeOpenCodeAdapter(
       context.childTaskRelationRetries.set(sessionId, fiber);
     });
 
+    // A dropped event stream can swallow a child's terminal `session.status`
+    // idle. Without this, the child stays "running" forever: the Agents panel
+    // and sidebar keep counting it after the parent turn has long settled.
+    const reconcileRunningChildTasks = Effect.fn("reconcileRunningChildTasks")(function* (
+      context: OpenCodeSessionContext,
+    ) {
+      const running = [...context.childTaskStatusById]
+        .filter(([, status]) => status === "running")
+        .map(([sessionId]) => sessionId);
+      if (running.length === 0) return;
+      const response = yield* runOpenCodeSdk("session.status", (signal) =>
+        context.client.session.status(undefined, { signal }),
+      ).pipe(Effect.timeout("5 seconds"), Effect.option);
+      if (Option.isNone(response)) return;
+      const statuses = Option.getOrUndefined(decodeOpenCodeSessionStatusMap(response.value.data));
+      if (statuses === undefined) return;
+      for (const sessionId of running) {
+        if (
+          (yield* Ref.get(context.stopped)) ||
+          sessions.get(context.session.threadId) !== context
+        ) {
+          return;
+        }
+        // Absent from the status map means idle, matching the parent check.
+        const status = statuses[sessionId]?.type;
+        if (status !== undefined && status !== "idle") continue;
+        if (context.childTaskStatusById.get(sessionId) !== "running") continue;
+        yield* handleChildSessionEvent(
+          context,
+          {
+            type: "session.status",
+            properties: { sessionID: sessionId, status: { type: "idle" } },
+          } as OpenCodeSessionStatusEvent,
+          sessionId,
+          context.childOriginTurnIdBySessionId.get(sessionId),
+        );
+      }
+    });
+
     const handleSubscribedEvent = Effect.fn("handleSubscribedEvent")(function* (
       context: OpenCodeSessionContext,
       event: OpenCodeSubscribedEvent,
@@ -3044,6 +3083,10 @@ export function makeOpenCodeAdapter(
           if (context.activeTurnId !== undefined && context.promptAdmission === undefined) {
             yield* scheduleIdleReconciliation(context, context.activeTurnId, event);
           }
+          yield* reconcileRunningChildTasks(context).pipe(
+            Effect.catchCause(() => Effect.void),
+            Effect.forkIn(context.sessionScope),
+          );
         }
         return;
       }
