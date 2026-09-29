@@ -381,8 +381,9 @@ const sessionFrom = (body: unknown): Session | undefined => {
  * The experimental session log is not a safe reconnect source in this release: Bus.configured
  * defaults to persist=false (server routes only enable it when configured), and log.synced
  * reports the sequence watermark even when no event rows were retained. There is no complete
- * session-event snapshot API or retention/gap proof. An idle session may have finished a turn
- * while T3 was offline; never adopt it based on current state alone. */
+ * session-event snapshot API or retention/gap proof. Resume therefore adopts only a quiescent
+ * session (not running, empty inbox, no pending permission/form); work that finished offline is
+ * already settled, and anything still live is refused rather than silently missed. */
 export const openCodeNativeSessionEngineCreate = (input: {
   readonly url: string;
   readonly serverPassword?: string;
@@ -1104,11 +1105,6 @@ export const openCodeNativeSessionEngineCreate = (input: {
       if (abort) return fail("session.start", "Session engine already started.");
       if (!options.directory.startsWith("/") || !options.directory.trim())
         return fail("session.start", "Expected an absolute directory.");
-      if (options.resumeSessionId)
-        return fail(
-          "session.resume",
-          "Native v2.0.18 cannot verify a durable event boundary across T3 downtime; refusing to adopt the existing session.",
-        );
       const controller = new AbortController();
       abort = controller;
       let settle!: (value: Result<void>) => void;
@@ -1133,6 +1129,53 @@ export const openCodeNativeSessionEngineCreate = (input: {
         controller.abort();
         abort = undefined;
         return connectedResult;
+      }
+      const resumeID = options.resumeSessionId;
+      if (resumeID) {
+        // v2.0.18 has no durable replay cursor, so events from T3 downtime are lost.
+        // Adopt only a quiescent session: nothing running, queued or awaiting a reply.
+        // Anything that finished offline is already settled, so no live state is missed.
+        let adopted: Session | undefined;
+        try {
+          const [info, running, inbox, pendingPermissions, pendingForms] = await Promise.all([
+            requestWithDeadline(controller.signal, (signal) =>
+              client.session.get({ sessionID: resumeID }, { signal }),
+            ),
+            requestWithDeadline(controller.signal, (signal) => client.session.active({ signal })),
+            requestWithDeadline(controller.signal, (signal) =>
+              client.session.inbox.list({ sessionID: resumeID }, { signal }),
+            ),
+            requestWithDeadline(controller.signal, (signal) =>
+              client.permission.list({ sessionID: resumeID }, { signal }),
+            ),
+            requestWithDeadline(controller.signal, (signal) =>
+              client.session.form.list({ sessionID: resumeID }, { signal }),
+            ),
+          ]);
+          const found = sessionFrom(info);
+          if (
+            found?.id === resumeID &&
+            found.location.directory === options.directory &&
+            !record(running)?.[resumeID] &&
+            inbox.length === 0 &&
+            pendingPermissions.length === 0 &&
+            pendingForms.length === 0
+          )
+            adopted = found;
+        } catch {
+          adopted = undefined;
+        }
+        if (!adopted || !connected || disconnected) {
+          controller.abort();
+          abort = undefined;
+          return fail(
+            "session.resume",
+            "Native OpenCode session is busy, missing or unreachable; refusing to adopt it.",
+          );
+        }
+        session = adopted;
+        emit({ type: "session.ready", sessionID: adopted.id });
+        return { success: true, data: adopted };
       }
       let response: Session;
       try {

@@ -966,13 +966,21 @@ describe("native v2.0.18 session slice", () => {
     }
   });
 
-  it("rejects adoption even when session.get would report idle and no pending work after an offline turn", async () => {
-    const paths: string[] = [];
+  it("adopts an idle existing session and refuses one with running or pending work", async () => {
+    let running: Record<string, unknown> = {};
+    let prompted: Record<string, unknown> | undefined;
     const server = await fixture((req, res) => {
-      paths.push(`${req.method} ${req.url}`);
-      if (req.url === "/api/session/ses_fixture" && req.method === "GET")
+      if (req.url === "/api/event") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        frame(res, "server.connected", {});
+      } else if (req.url === "/api/session/ses_fixture" && req.method === "GET")
         send(res, { data: { ...session, time: { created: 1, updated: 2, idle: 2 } } });
-      else if (req.url === "/api/session/active") send(res, { data: {} });
+      else if (req.url === "/api/session/active") send(res, { data: running });
+      else if (req.url === "/api/session/ses_fixture/prompt")
+        void bodyRead(req).then((body) => {
+          prompted = body;
+          send(res, { data: { id: body.id, sessionID: session.id, type: "user" } });
+        });
       else if (
         req.url === "/api/session/ses_fixture/inbox" ||
         req.url === "/api/session/ses_fixture/permission" ||
@@ -982,13 +990,23 @@ describe("native v2.0.18 session slice", () => {
       else res.writeHead(404).end();
     });
     try {
-      const engine = openCodeNativeSessionEngineCreate({ url: server.url, onEvent: () => {} });
-      expect(await engine.start({ directory, resumeSessionId: session.id })).toMatchObject({
+      const busy = openCodeNativeSessionEngineCreate({ url: server.url, onEvent: () => {} });
+      running = { [session.id]: { type: "running" } };
+      expect(await busy.start({ directory, resumeSessionId: session.id })).toMatchObject({
         success: false,
-        error: { operation: "session.resume", detail: expect.stringContaining("durable") },
+        error: { operation: "session.resume" },
       });
-      expect((await engine.send("never send")).success).toBe(false);
-      expect(paths).toEqual([]);
+      expect((await busy.send("never send")).success).toBe(false);
+      await busy.stop();
+
+      running = {};
+      const engine = openCodeNativeSessionEngineCreate({ url: server.url, onEvent: () => {} });
+      expect(await engine.start({ directory, resumeSessionId: session.id })).toEqual({
+        success: true,
+        data: session,
+      });
+      expect((await engine.send("continue")).success).toBe(true);
+      expect(prompted).toMatchObject({ text: "continue" });
       await engine.stop();
     } finally {
       await server.close();
