@@ -143,9 +143,16 @@ export const runOpenCodeSdk = <A>(
 export const verifyOpenCodeServerVersion = Effect.fn("verifyOpenCodeServerVersion")(function* (
   client: OpencodeClient,
 ) {
-  const healthOption = yield* runOpenCodeSdk("global.health", (signal) =>
-    client.global.health({ signal }),
-  ).pipe(Effect.timeoutOption(OPENCODE_HEALTH_TIMEOUT));
+  const checkHealth = () =>
+    runOpenCodeSdk("global.health", (signal) => client.global.health({ signal })).pipe(
+      Effect.timeoutOption(OPENCODE_HEALTH_TIMEOUT),
+    );
+  let healthOption = yield* checkHealth();
+  if (Option.isNone(healthOption)) {
+    // A health request can time out transiently while the legacy server is starting up.
+    // Re-running the effect creates a new SDK request and abort signal.
+    healthOption = yield* checkHealth();
+  }
   if (Option.isNone(healthOption)) {
     return yield* new OpenCodeRuntimeError({
       operation: "global.health",

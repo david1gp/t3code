@@ -142,23 +142,52 @@ describe("verifyOpenCodeServerVersion", () => {
     }),
   );
 
-  effectIt.effect("aborts a health request when the version check times out", () =>
+  effectIt.effect("retries once after a health timeout and accepts a successful response", () =>
     Effect.gen(function* () {
-      let requestSignal: AbortSignal | undefined;
+      const requestSignals: AbortSignal[] = [];
+      let requestCount = 0;
       const checkFiber = yield* verifyOpenCodeServerVersion(
         makeHealthClient((options) => {
-          requestSignal = options?.signal;
+          if (options?.signal) requestSignals.push(options.signal);
+          requestCount += 1;
+          return requestCount === 1
+            ? new Promise(() => undefined)
+            : Promise.resolve({ data: { healthy: true, version: "1.14.19" } });
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* Effect.yieldNow;
+      expect(requestCount).toBe(1);
+      yield* TestClock.adjust("5 seconds");
+
+      expect(yield* Fiber.join(checkFiber)).toBe("1.14.19");
+      expect(requestCount).toBe(2);
+      expect(requestSignals).toHaveLength(2);
+      expect(requestSignals[0]?.aborted).toBe(true);
+      expect(requestSignals[1]?.aborted).toBe(false);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  effectIt.effect("returns the timeout error after two health request timeouts", () =>
+    Effect.gen(function* () {
+      const requestSignals: AbortSignal[] = [];
+      const checkFiber = yield* verifyOpenCodeServerVersion(
+        makeHealthClient((options) => {
+          if (options?.signal) requestSignals.push(options.signal);
           return new Promise(() => undefined);
         }),
       ).pipe(Effect.flip, Effect.forkChild);
 
       yield* Effect.yieldNow;
-      expect(requestSignal).toBeDefined();
-      yield* TestClock.adjust("6 seconds");
+      expect(requestSignals).toHaveLength(1);
+      yield* TestClock.adjust("5 seconds");
+      expect(requestSignals).toHaveLength(2);
+      yield* TestClock.adjust("5 seconds");
 
       const error = yield* Fiber.join(checkFiber);
       expect(error.detail).toBe("Timed out while checking the OpenCode server version.");
-      expect(requestSignal?.aborted).toBe(true);
+      expect(requestSignals).toHaveLength(2);
+      expect(requestSignals.every((signal) => signal.aborted)).toBe(true);
     }).pipe(Effect.provide(TestClock.layer())),
   );
 });
