@@ -3837,6 +3837,71 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
     }),
   );
 
+  it.effect("records thinkingLevel as effort without overriding existing provider options", () =>
+    Effect.gen(function* () {
+      recordedTurnAnalytics.reset();
+      const provider = yield* ProviderService.ProviderService;
+      const cases = [
+        {
+          name: "thinking-level",
+          options: [{ id: "thinkingLevel", value: "medium" }],
+        },
+        {
+          name: "effort-before-thinking-level",
+          options: [
+            { id: "effort", value: "max" },
+            { id: "thinkingLevel", value: "medium" },
+          ],
+        },
+        {
+          name: "reasoning-effort-before-others",
+          options: [
+            { id: "reasoningEffort", value: "high" },
+            { id: "effort", value: "max" },
+            { id: "thinkingLevel", value: "medium" },
+          ],
+        },
+      ];
+      const runtimeEvents = yield* Stream.take(provider.streamEvents, cases.length).pipe(
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+
+      for (const entry of cases) {
+        const threadId = asThreadId(`thread-turn-analytics-${entry.name}`);
+        yield* provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const turn = yield* provider.sendTurn({
+          threadId,
+          input: "measure effort",
+          attachments: [],
+          modelSelection: createModelSelection(codexInstanceId, "model", entry.options),
+        });
+        primaryAnalyticsCodex.emit({
+          type: "turn.completed",
+          eventId: asEventId(`evt-turn-analytics-${entry.name}`),
+          provider: CODEX_DRIVER,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          threadId,
+          turnId: turn.turnId,
+          payload: { state: "completed" },
+        });
+      }
+      yield* Fiber.join(runtimeEvents);
+
+      const completed = recordedTurnAnalytics.eventsByName("provider.turn.completed");
+      assert.deepEqual(
+        completed.map((entry) => entry.properties.effort),
+        ["medium", "max", "high"],
+      );
+    }),
+  );
+
   it.effect("does not report a generic model variant as reasoning effort", () =>
     Effect.gen(function* () {
       recordedTurnAnalytics.reset();

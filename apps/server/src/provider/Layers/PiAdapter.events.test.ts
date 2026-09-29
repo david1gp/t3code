@@ -1,9 +1,19 @@
 // @effect-diagnostics nodeBuiltinImport:off - SDK sessions persist in isolated test state.
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { createAgentSession, type AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import {
+  createAgentSession,
+  ModelRuntime,
+  type AgentSession,
+  type AgentSessionEvent,
+} from "@earendil-works/pi-coding-agent";
 import { assert, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
-import { ProviderDriverKind, ThreadId, type ProviderRuntimeEvent } from "@t3tools/contracts";
+import {
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ThreadId,
+  type ProviderRuntimeEvent,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -37,13 +47,49 @@ function sdkSession(
     readonly steer?: (text: string) => Promise<"queued" | "handled">;
     readonly abort?: () => Promise<void>;
     readonly clearQueue?: () => void;
+    readonly availableLevels?: () => Array<Parameters<AgentSession["setThinkingLevel"]>[0]>;
+    readonly setThinkingLevel?: (level: Parameters<AgentSession["setThinkingLevel"]>[0]) => void;
+    readonly modelMetadata?: (
+      provider: string,
+      id: string,
+    ) => {
+      reasoning: boolean;
+      thinkingLevelMap?: NonNullable<AgentSession["model"]>["thinkingLevelMap"];
+    };
+    readonly setModel?: () => void;
+    readonly dispose?: () => void;
+    readonly restoredModel?: AgentSession["model"];
   } = {},
 ) {
   vi.mocked(createAgentSession).mockImplementation(async (sessionOptions) => {
     let listener: (event: AgentSessionEvent) => void = () => {};
+    let model = sdkOptions.restoredModel ?? sessionOptions?.model;
+    let thinkingLevel = "high";
     return {
       session: {
-        model: undefined,
+        get model() {
+          return model;
+        },
+        get thinkingLevel() {
+          return thinkingLevel;
+        },
+        modelRuntime: {
+          getModel: (provider: string, id: string) => ({
+            provider,
+            id,
+            reasoning: id === "reasoning",
+            ...sdkOptions.modelMetadata?.(provider, id),
+          }),
+        },
+        setModel: async (selected: typeof model) => {
+          sdkOptions.setModel?.();
+          model = selected;
+        },
+        getAvailableThinkingLevels: () => sdkOptions.availableLevels?.() ?? ["off", "high"],
+        setThinkingLevel: (level: Parameters<AgentSession["setThinkingLevel"]>[0]) => {
+          thinkingLevel = level;
+          sdkOptions.setThinkingLevel?.(level);
+        },
         sessionManager: sessionOptions?.sessionManager,
         subscribe: (next: typeof listener) => {
           listener = next;
@@ -57,11 +103,291 @@ function sdkSession(
         steer: (text: string) => sdkOptions.steer?.(text) ?? Promise.resolve("queued"),
         abort: () => sdkOptions.abort?.() ?? Promise.resolve(),
         clearQueue: () => sdkOptions.clearQueue?.(),
-        dispose: () => {},
+        dispose: () => sdkOptions.dispose?.(),
       },
     } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
   });
 }
+
+it.effect("applies a selected thinking level to the new Pi session without changing defaults", () =>
+  Effect.gen(function* () {
+    const model = (yield* Effect.promise(() => ModelRuntime.create())).getAvailableSnapshot()[0]!;
+    const applied: string[] = [];
+    sdkSession(async () => {}, { setThinkingLevel: (level) => applied.push(level) });
+    const adapter = yield* makePiAdapter();
+    yield* adapter.startSession({
+      ...start,
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("pi"),
+        model: `${model.provider}/${model.id}`,
+        options: [{ id: "thinkingLevel", value: "high" }],
+      },
+    });
+    assert.deepEqual(applied, ["high"]);
+    assert.isUndefined(vi.mocked(createAgentSession).mock.lastCall?.[0]?.thinkingLevel);
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("uses the advertised medium default instead of SDK high when no level is sent", () =>
+  Effect.gen(function* () {
+    const model = (yield* Effect.promise(() => ModelRuntime.create()))
+      .getModels()
+      .find(
+        (candidate) =>
+          candidate.reasoning &&
+          candidate.thinkingLevelMap?.medium !== null &&
+          candidate.thinkingLevelMap?.high !== null,
+      )!;
+    let currentLevel = "high"; // The SDK restored/configured level.
+    const applied: string[] = [];
+    const prompts: string[] = [];
+    sdkSession(
+      async (emit, preflight) => {
+        prompts.push(currentLevel);
+        preflight(true);
+        emit({ type: "agent_settled" });
+      },
+      {
+        availableLevels: () => ["off", "minimal", "low", "medium", "high"],
+        setThinkingLevel: (level) => {
+          currentLevel = level;
+          applied.push(level);
+        },
+      },
+    );
+    const adapter = yield* makePiAdapter();
+    const events: ProviderRuntimeEvent[] = [];
+    yield* adapter.streamEvents.pipe(
+      Stream.runForEach((event) =>
+        Effect.sync(() => {
+          events.push(event);
+        }),
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("pi"),
+      model: `${model.provider}/${model.id}`,
+    };
+    yield* adapter.startSession({ ...start, modelSelection });
+    assert.deepEqual(applied, ["medium"]);
+    assert.isUndefined(vi.mocked(createAgentSession).mock.lastCall?.[0]?.thinkingLevel);
+    yield* adapter.sendTurn({ threadId, input: "first", modelSelection });
+    yield* adapter.sendTurn({
+      threadId,
+      input: "explicit high",
+      modelSelection: { ...modelSelection, options: [{ id: "thinkingLevel", value: "high" }] },
+    });
+    yield* adapter.sendTurn({ threadId, input: "default again" });
+    assert.deepEqual(prompts, ["medium", "high", "medium"]);
+    assert.deepEqual(applied, ["medium", "medium", "high", "medium"]);
+    assert.deepEqual(
+      events.filter((event) => event.type === "turn.started").map((event) => event.payload.effort),
+      ["medium", "high", "medium"],
+    );
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("keeps restored off-only models off with no thinking option", () =>
+  Effect.gen(function* () {
+    const model = (yield* Effect.promise(() => ModelRuntime.create()))
+      .getAvailableSnapshot()
+      .find((candidate) => candidate.reasoning)!;
+    for (const reasoning of [true, false]) {
+      const applied: string[] = [];
+      let currentLevel = "high";
+      const prompts: string[] = [];
+      sdkSession(
+        async (emit, preflight) => {
+          prompts.push(currentLevel);
+          preflight(true);
+          emit({ type: "agent_settled" });
+        },
+        {
+          restoredModel: {
+            ...model,
+            reasoning,
+            thinkingLevelMap: {
+              minimal: null,
+              low: null,
+              medium: null,
+              high: null,
+              xhigh: null,
+              max: null,
+            },
+          },
+          availableLevels: () => ["off"],
+          setThinkingLevel: (level) => {
+            currentLevel = level;
+            applied.push(level);
+          },
+        },
+      );
+      const adapter = yield* makePiAdapter();
+      yield* adapter.startSession(start);
+      yield* adapter.sendTurn({ threadId, input: "off-only" });
+      assert.deepEqual(applied, ["off", "off"]);
+      assert.deepEqual(prompts, ["off"]);
+      yield* adapter.stopSession(threadId);
+    }
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("rejects an unsupported explicit start level before opening or stopping a session", () =>
+  Effect.gen(function* () {
+    const model = (yield* Effect.promise(() => ModelRuntime.create()))
+      .getModels()
+      .find((candidate) => !candidate.reasoning)!;
+    let stopped = 0;
+    sdkSession(async () => {}, { dispose: () => stopped++ });
+    const adapter = yield* makePiAdapter();
+    const previous = yield* adapter.startSession(start);
+    const opens = vi.mocked(createAgentSession).mock.calls.length;
+    const error = yield* adapter
+      .startSession({
+        ...start,
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("pi"),
+          model: `${model.provider}/${model.id}`,
+          options: [{ id: "thinkingLevel", value: "high" }],
+        },
+      })
+      .pipe(Effect.flip);
+    assert.equal(error._tag, "ProviderAdapterValidationError");
+    assert.equal(vi.mocked(createAgentSession).mock.calls.length, opens);
+    assert.equal(stopped, 0);
+    assert.deepEqual((yield* adapter.listSessions())[0], previous);
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect(
+  "sets explicit thinking after switching models and restores the default for an absent option",
+  () =>
+    Effect.gen(function* () {
+      const calls: string[] = [];
+      sdkSession(
+        async (emit, preflight) => {
+          calls.push("prompt");
+          preflight(true);
+          emit({ type: "agent_settled" });
+        },
+        {
+          setModel: () => calls.push("model"),
+          setThinkingLevel: (level) => calls.push(`thinking:${level}`),
+        },
+      );
+      const adapter = yield* makePiAdapter();
+      yield* adapter.startSession(start);
+      yield* adapter.sendTurn({
+        threadId,
+        input: "first",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("pi"),
+          model: "test/reasoning",
+          options: [{ id: "thinkingLevel", value: "off" }],
+        },
+      });
+      yield* adapter.sendTurn({ threadId, input: "second" });
+      assert.deepEqual(calls, ["model", "thinking:off", "prompt", "thinking:medium", "prompt"]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("clamps absent thinking levels using the selected model's SDK mapping", () =>
+  Effect.gen(function* () {
+    const calls: string[] = [];
+    let currentLevel = "high";
+    sdkSession(
+      async (emit, preflight) => {
+        calls.push(`prompt:${currentLevel}`);
+        preflight(true);
+        emit({ type: "agent_settled" });
+      },
+      {
+        setModel: () => calls.push("model"),
+        setThinkingLevel: (level) => {
+          currentLevel = level;
+          calls.push(`thinking:${level}`);
+        },
+        modelMetadata: (_provider, id) => ({
+          reasoning: true,
+          thinkingLevelMap:
+            id === "upward"
+              ? { medium: null, high: "native-high" }
+              : id === "downward"
+                ? { medium: null, high: null, xhigh: null, max: null }
+                : id === "extra-high"
+                  ? { medium: null, high: null, xhigh: "native-extra", max: null }
+                  : { minimal: null, low: null, medium: null, high: null, xhigh: null, max: null },
+        }),
+      },
+    );
+    const adapter = yield* makePiAdapter();
+    yield* adapter.startSession(start);
+    for (const [model, expected] of [
+      ["upward", "high"],
+      ["downward", "low"],
+      ["extra-high", "xhigh"],
+      ["off-only", "off"],
+    ] as const) {
+      calls.length = 0;
+      yield* adapter.sendTurn({
+        threadId,
+        input: model,
+        modelSelection: { instanceId: ProviderInstanceId.make("pi"), model: `test/${model}` },
+      });
+      assert.deepEqual(calls, ["model", `thinking:${expected}`, `prompt:${expected}`]);
+    }
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect(
+  "rejects a level unsupported by the candidate model without switching the active model",
+  () =>
+    Effect.gen(function* () {
+      const model = (yield* Effect.promise(() => ModelRuntime.create()))
+        .getAvailableSnapshot()
+        .find((candidate) => candidate.reasoning)!;
+      const calls: string[] = [];
+      sdkSession(
+        async () => {
+          calls.push("prompt");
+        },
+        {
+          availableLevels: () => ["off", "high"],
+          setModel: () => calls.push("model"),
+          setThinkingLevel: () => calls.push("thinking"),
+        },
+      );
+      const adapter = yield* makePiAdapter();
+      const previous = yield* adapter.startSession({
+        ...start,
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("pi"),
+          model: `${model.provider}/${model.id}`,
+        },
+      });
+      calls.length = 0;
+      const error = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "hello",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("pi"),
+            model: "test/plain",
+            options: [{ id: "thinkingLevel", value: "high" }],
+          },
+        })
+        .pipe(Effect.flip);
+      assert.equal(error._tag, "ProviderAdapterValidationError");
+      assert.deepEqual(calls, []);
+      assert.deepEqual((yield* adapter.listSessions())[0], previous);
+      assert.deepEqual(yield* adapter.readThread(threadId), { threadId, turns: [] });
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
 
 it.effect(
   "completes a Pi turn only after the SDK agent_settled event and closes streamed items",

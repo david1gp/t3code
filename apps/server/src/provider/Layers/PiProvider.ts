@@ -1,3 +1,4 @@
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { type PiSettings, type ServerProvider, type ServerProviderModel } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -14,9 +15,61 @@ const PRESENTATION = {
   showInteractionModeToggle: false,
 } as const;
 const EMPTY_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
+type PiSdkModel = Pick<
+  ReturnType<ModelRuntime["getModels"]>[number],
+  "provider" | "id" | "name" | "reasoning" | "thinkingLevelMap"
+>;
+const THINKING_LEVELS = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const satisfies ReadonlyArray<keyof NonNullable<PiSdkModel["thinkingLevelMap"]>>;
+const THINKING_LEVEL_LABELS = {
+  off: "Off",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra High",
+  max: "Max",
+};
+
+function piModelCapabilities(model: PiSdkModel) {
+  if (!model.reasoning) return EMPTY_CAPABILITIES;
+  // Match the SDK: null disables a level; xhigh/max require an explicit mapping.
+  const levels = THINKING_LEVELS.filter((level) => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null) return false;
+    return level === "xhigh" || level === "max" ? mapped !== undefined : true;
+  });
+  // Pi defaults to medium, clamping upward first and then downward when unsupported.
+  const defaultLevel =
+    levels.find((level) => THINKING_LEVELS.indexOf(level) >= THINKING_LEVELS.indexOf("medium")) ??
+    levels.at(-1);
+  if (!defaultLevel) return EMPTY_CAPABILITIES;
+  return createModelCapabilities({
+    optionDescriptors: [
+      {
+        id: "thinkingLevel",
+        label: "Reasoning",
+        type: "select",
+        options: levels.map((level) => ({
+          id: level,
+          label: THINKING_LEVEL_LABELS[level],
+          ...(level === defaultLevel ? { isDefault: true } : {}),
+        })),
+        currentValue: defaultLevel,
+      },
+    ],
+  });
+}
 
 export function piModelsFromSdk(
-  models: ReadonlyArray<{ readonly provider: string; readonly id: string; readonly name: string }>,
+  models: ReadonlyArray<PiSdkModel>,
 ): ReadonlyArray<ServerProviderModel> {
   const seen = new Set<string>();
   return models.flatMap((model): ServerProviderModel[] => {
@@ -24,7 +77,7 @@ export function piModelsFromSdk(
     if (seen.has(slug)) return [];
     seen.add(slug);
     const name = model.name.trim() || model.id;
-    return [{ slug, name, isCustom: false, capabilities: EMPTY_CAPABILITIES }];
+    return [{ slug, name, isCustom: false, capabilities: piModelCapabilities(model) }];
   });
 }
 

@@ -1,29 +1,239 @@
 import { describe, expect, it } from "@effect/vitest";
-import { PiSettings } from "@t3tools/contracts";
+import { PiSettings, ProviderDriverKind, ProviderInstanceId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import {
   buildInitialPiProviderSnapshot,
   buildPiProviderSnapshot,
+  enrichPiSnapshot,
   piAuthFromSdk,
   piModelsFromSdk,
 } from "./PiProvider.ts";
 
 const decodePiSettings = Schema.decodeSync(PiSettings);
+const customCapabilities = {
+  optionDescriptors: [
+    {
+      id: "thinkingLevel",
+      label: "Reasoning",
+      type: "select",
+      options: [{ id: "low", label: "Low", isDefault: true }],
+      currentValue: "low",
+    },
+  ],
+} as const;
 
 describe("Pi provider catalog", () => {
-  it("converts valid distinct provider/model records and ignores malformed entries", () => {
+  it("deduplicates provider/model records without changing their slugs or names", () => {
     expect(
       piModelsFromSdk([
-        { provider: "anthropic", id: "claude-3", name: "Claude 3" },
-        { provider: "anthropic", id: "claude-3", name: "duplicate" },
-        { provider: "openai", id: "gpt-5", name: "GPT-5" },
+        { provider: "anthropic", id: "claude-3", name: "Claude 3", reasoning: false },
+        { provider: "anthropic", id: "claude-3", name: "duplicate", reasoning: false },
+        { provider: "openai", id: "gpt-5", name: "GPT-5", reasoning: true },
       ]).map(({ slug, name }) => ({ slug, name })),
     ).toEqual([
       { slug: "anthropic/claude-3", name: "Claude 3" },
       { slug: "openai/gpt-5", name: "GPT-5" },
     ]);
   });
+
+  it("advertises standard SDK thinking levels with medium as the default", () => {
+    const [model] = piModelsFromSdk([
+      { provider: "openai", id: "gpt-5", name: "GPT-5", reasoning: true },
+    ]);
+    expect(model?.capabilities).toEqual({
+      optionDescriptors: [
+        {
+          id: "thinkingLevel",
+          label: "Reasoning",
+          type: "select",
+          options: [
+            { id: "off", label: "Off" },
+            { id: "minimal", label: "Minimal" },
+            { id: "low", label: "Low" },
+            { id: "medium", label: "Medium", isDefault: true },
+            { id: "high", label: "High" },
+          ],
+          currentValue: "medium",
+        },
+      ],
+    });
+  });
+
+  it.each([
+    {
+      behavior: "opts into mapped xhigh/max and excludes null levels",
+      thinkingLevelMap: {
+        off: null,
+        minimal: null,
+        low: "native-low",
+        xhigh: "native-extra",
+        max: "native-max",
+      },
+      levels: ["low", "medium", "high", "xhigh", "max"],
+      defaultLevel: "medium",
+    },
+    {
+      behavior: "clamps the medium default upward before considering lower levels",
+      thinkingLevelMap: {
+        off: null,
+        minimal: null,
+        medium: null,
+        high: "native-high",
+        xhigh: null,
+        max: "native-max",
+      },
+      levels: ["low", "high", "max"],
+      defaultLevel: "high",
+    },
+    {
+      behavior: "clamps the medium default downward when no higher level is supported",
+      thinkingLevelMap: {
+        off: null,
+        minimal: null,
+        medium: null,
+        high: null,
+        xhigh: null,
+        max: null,
+      },
+      levels: ["low"],
+      defaultLevel: "low",
+    },
+    {
+      behavior: "uses off as the default when it is the only supported level",
+      thinkingLevelMap: {
+        minimal: null,
+        low: null,
+        medium: null,
+        high: null,
+        xhigh: null,
+        max: null,
+      },
+      levels: ["off"],
+      defaultLevel: "off",
+    },
+  ])("$behavior for custom SDK model metadata", ({ thinkingLevelMap, levels, defaultLevel }) => {
+    const [model] = piModelsFromSdk([
+      { provider: "custom", id: "reasoner", name: "Reasoner", reasoning: true, thinkingLevelMap },
+    ]);
+    const descriptor = model?.capabilities?.optionDescriptors?.[0];
+    expect(descriptor).toMatchObject({
+      id: "thinkingLevel",
+      type: "select",
+      currentValue: defaultLevel,
+    });
+    if (descriptor?.type !== "select") return;
+    expect(descriptor.options.map((option) => option.id)).toEqual(levels);
+    expect(
+      descriptor.options.filter((option) => option.isDefault).map((option) => option.id),
+    ).toEqual([defaultLevel]);
+  });
+
+  it("does not advertise reasoning for non-reasoning models even with a thinking map", () => {
+    const [model] = piModelsFromSdk([
+      {
+        provider: "custom",
+        id: "plain",
+        name: "Plain",
+        reasoning: false,
+        thinkingLevelMap: { xhigh: "native-extra", max: "native-max" },
+      },
+    ]);
+    expect(model?.capabilities).toEqual({ optionDescriptors: [] });
+  });
+
+  it("omits the selector when a reasoning model disables every SDK level", () => {
+    const [model] = piModelsFromSdk([
+      {
+        provider: "custom",
+        id: "disabled",
+        name: "Disabled",
+        reasoning: true,
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          low: null,
+          medium: null,
+          high: null,
+          xhigh: null,
+          max: null,
+        },
+      },
+    ]);
+    expect(model?.capabilities).toEqual({ optionDescriptors: [] });
+  });
+
+  it.effect(
+    "preserves SDK reasoning capabilities and explicit custom capabilities in snapshots",
+    () =>
+      Effect.gen(function* () {
+        const models = piModelsFromSdk([
+          { provider: "custom", id: "reasoner", name: "Reasoner", reasoning: true },
+          { provider: "custom", id: "plain", name: "Plain", reasoning: false },
+        ]);
+        const settings = decodePiSettings({
+          customModels: [
+            "custom/reasoner",
+            { slug: "custom/plain", capabilities: customCapabilities },
+            "custom/unlisted",
+            { slug: "custom/declared", name: "Declared", capabilities: customCapabilities },
+          ],
+        });
+        const snapshot = yield* buildPiProviderSnapshot({ settings, models, installed: true });
+        expect(snapshot.models).toEqual([
+          ...models,
+          {
+            slug: "custom/unlisted",
+            name: "custom/unlisted",
+            isCustom: true,
+            capabilities: { optionDescriptors: [] },
+          },
+          {
+            slug: "custom/declared",
+            name: "Declared",
+            isCustom: true,
+            capabilities: customCapabilities,
+          },
+        ]);
+
+        const initial = yield* buildInitialPiProviderSnapshot(decodePiSettings({}));
+        const initialSnapshot = {
+          ...initial,
+          instanceId: ProviderInstanceId.make("pi"),
+          driver: ProviderDriverKind.make("pi"),
+        };
+        expect(enrichPiSnapshot(initialSnapshot, snapshot.models)).toEqual({
+          ...initialSnapshot,
+          models: snapshot.models,
+        });
+      }),
+  );
+
+  it.effect("does not invent reasoning metadata for custom slugs before SDK discovery", () =>
+    Effect.gen(function* () {
+      const settings = decodePiSettings({
+        customModels: [
+          "openai/gpt-5",
+          { slug: "custom/declared", name: "Declared", capabilities: customCapabilities },
+        ],
+      });
+      const snapshot = yield* buildInitialPiProviderSnapshot(settings);
+      expect(snapshot.models).toEqual([
+        {
+          slug: "openai/gpt-5",
+          name: "openai/gpt-5",
+          isCustom: true,
+          capabilities: { optionDescriptors: [] },
+        },
+        {
+          slug: "custom/declared",
+          name: "Declared",
+          isCustom: true,
+          capabilities: customCapabilities,
+        },
+      ]);
+    }),
+  );
 
   it.effect(
     "keeps an unavailable SDK warning and unknown auth without inventing model availability",

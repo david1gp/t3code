@@ -20,6 +20,7 @@ import {
   TurnId,
   type ProviderRuntimeEvent,
   type ProviderSession,
+  type ProviderSessionStartInput,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
@@ -61,6 +62,68 @@ function modelParts(model: string): { provider: string; modelId: string } | unde
   const separator = model.indexOf("/");
   if (separator <= 0 || separator === model.length - 1) return undefined;
   return { provider: model.slice(0, separator), modelId: model.slice(separator + 1) };
+}
+
+const thinkingLevels = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const satisfies ReadonlyArray<Parameters<AgentSession["setThinkingLevel"]>[0]>;
+
+function modelSupportsThinkingLevel(
+  model: NonNullable<AgentSession["model"]>,
+  level: (typeof thinkingLevels)[number],
+): boolean {
+  if (!model.reasoning) return level === "off";
+  const mapped = model.thinkingLevelMap?.[level];
+  if (mapped === null) return false;
+  return level !== "xhigh" && level !== "max" ? true : mapped !== undefined;
+}
+
+function defaultThinkingLevel(
+  model: AgentSession["model"],
+): (typeof thinkingLevels)[number] | null {
+  if (!model) return null;
+  if (!model.reasoning) return "off";
+  // Match the advertised default: start at medium, clamp upward, then downward.
+  const supported = thinkingLevels.filter((level) => modelSupportsThinkingLevel(model, level));
+  return (
+    supported.find((level) => thinkingLevels.indexOf(level) >= thinkingLevels.indexOf("medium")) ??
+    supported.at(-1) ??
+    null
+  );
+}
+
+function selectedThinkingLevel(
+  selection: ProviderSessionStartInput["modelSelection"],
+  instanceId: ProviderInstanceId,
+  operation: "startSession" | "sendTurn",
+) {
+  if (selection?.instanceId !== instanceId || !selection.options?.length)
+    return Effect.succeed(null);
+  const options = selection.options;
+  if (options.length !== 1 || options[0]?.id !== "thinkingLevel")
+    return Effect.fail(
+      new ProviderAdapterValidationError({
+        provider,
+        operation,
+        issue: "Pi only supports the thinkingLevel model option.",
+      }),
+    );
+  const level = thinkingLevels.find((value) => value === options[0]?.value);
+  if (!level)
+    return Effect.fail(
+      new ProviderAdapterValidationError({
+        provider,
+        operation,
+        issue: `Invalid Pi thinking level: ${options[0]?.value}.`,
+      }),
+    );
+  return Effect.succeed(level);
 }
 
 function snapshotFromMessages(
@@ -126,7 +189,11 @@ export const makePiAdapter = (
         catch: (cause) =>
           new ProviderAdapterRequestError({ provider, method, detail: String(cause), cause }),
       });
-    const setModel = (ctx: Session, model: string) =>
+    const setModel = (
+      ctx: Session,
+      model: string,
+      thinkingLevel: (typeof thinkingLevels)[number] | null,
+    ) =>
       Effect.gen(function* () {
         const parts = modelParts(model);
         if (!parts)
@@ -141,6 +208,12 @@ export const makePiAdapter = (
             provider,
             method: "set_model",
             detail: `Pi model ${model} was not found.`,
+          });
+        if (thinkingLevel && !modelSupportsThinkingLevel(selected, thinkingLevel))
+          return yield* new ProviderAdapterValidationError({
+            provider,
+            operation: "sendTurn",
+            issue: `Pi thinking level ${thinkingLevel} is not supported by this model.`,
           });
         yield* request("set_model", () => ctx.sdk.setModel(selected));
         ctx.session = { ...ctx.session, model };
@@ -364,18 +437,11 @@ export const makePiAdapter = (
             issue: "Invalid Pi resume cursor.",
           });
         }
-        if (
-          input.modelSelection?.instanceId === instanceId &&
-          input.modelSelection.options?.length
-        ) {
-          return yield* new ProviderAdapterValidationError({
-            provider,
-            operation: "startSession",
-            issue: "Pi model options are not supported by this adapter.",
-          });
-        }
-        const previous = sessions.get(input.threadId);
-        if (previous) yield* stop(previous);
+        const thinkingLevel = yield* selectedThinkingLevel(
+          input.modelSelection,
+          instanceId,
+          "startSession",
+        );
         const resumedId = sessionIdFromCursor(input.resumeCursor);
         const sessionId = resumedId ?? NodeCrypto.randomUUID();
         const cwd = NodePath.resolve(input.cwd.trim());
@@ -384,6 +450,43 @@ export const makePiAdapter = (
           encodeURIComponent(instanceId),
           encodeURIComponent(input.threadId),
         );
+        const files = resumedId
+          ? yield* fs.readDirectory(ownedDirectory).pipe(Effect.orElseSucceed(() => [] as string[]))
+          : [];
+        const filename = files.find((name) => name.endsWith(`_${sessionId}.jsonl`));
+        const sessionFile = filename ? NodePath.join(ownedDirectory, filename) : undefined;
+        if (resumedId && !sessionFile)
+          return yield* new ProviderAdapterSessionNotFoundError({
+            provider,
+            threadId: input.threadId,
+          });
+        const { modelRuntime, model } = yield* Effect.tryPromise({
+          try: async () => {
+            const modelRuntime = await ModelRuntime.create();
+            const selection =
+              input.modelSelection?.instanceId === instanceId
+                ? input.modelSelection.model
+                : undefined;
+            const parts = selection ? modelParts(selection) : undefined;
+            if (selection && !parts) throw new Error("Pi model must be provider/modelId.");
+            const model = parts ? modelRuntime.getModel(parts.provider, parts.modelId) : undefined;
+            if (parts && !model) throw new Error(`Pi model ${selection} was not found.`);
+            return { modelRuntime, model };
+          },
+          catch: (cause) =>
+            new ProviderAdapterProcessError({
+              provider,
+              threadId: input.threadId,
+              detail: String(cause),
+              cause,
+            }),
+        });
+        if (thinkingLevel && model && !modelSupportsThinkingLevel(model, thinkingLevel))
+          return yield* new ProviderAdapterValidationError({
+            provider,
+            operation: "startSession",
+            issue: `Pi thinking level ${thinkingLevel} is not supported by this model.`,
+          });
         if (!resumedId)
           yield* fs.makeDirectory(ownedDirectory, { recursive: true }).pipe(
             Effect.mapError(
@@ -396,16 +499,6 @@ export const makePiAdapter = (
                 }),
             ),
           );
-        const files = resumedId
-          ? yield* fs.readDirectory(ownedDirectory).pipe(Effect.orElseSucceed(() => [] as string[]))
-          : [];
-        const filename = files.find((name) => name.endsWith(`_${sessionId}.jsonl`));
-        const sessionFile = filename ? NodePath.join(ownedDirectory, filename) : undefined;
-        if (resumedId && !sessionFile)
-          return yield* new ProviderAdapterSessionNotFoundError({
-            provider,
-            threadId: input.threadId,
-          });
         const opened = yield* Effect.tryPromise({
           try: async () => {
             const manager = sessionFile
@@ -423,15 +516,6 @@ export const makePiAdapter = (
               noExtensions: true,
             });
             await loader.reload();
-            const modelRuntime = await ModelRuntime.create();
-            const selection =
-              input.modelSelection?.instanceId === instanceId
-                ? input.modelSelection.model
-                : undefined;
-            const parts = selection ? modelParts(selection) : undefined;
-            if (selection && !parts) throw new Error("Pi model must be provider/modelId.");
-            const model = parts ? modelRuntime.getModel(parts.provider, parts.modelId) : undefined;
-            if (parts && !model) throw new Error(`Pi model ${selection} was not found.`);
             const result = await createAgentSession({
               cwd,
               sessionManager: manager,
@@ -450,6 +534,10 @@ export const makePiAdapter = (
               cause,
             }),
         });
+        const previous = sessions.get(input.threadId);
+        if (previous) yield* stop(previous);
+        const initialThinkingLevel = thinkingLevel ?? defaultThinkingLevel(opened.model);
+        if (initialThinkingLevel) opened.setThinkingLevel(initialThinkingLevel);
         const scope = yield* Scope.make("sequential");
         const cursor = { schemaVersion: resumeVersion, sessionId };
         const now = nowIso();
@@ -523,15 +611,23 @@ export const makePiAdapter = (
         }
         const selection =
           input.modelSelection?.instanceId === instanceId ? input.modelSelection.model : undefined;
-        if (selection && input.modelSelection?.options?.length) {
+        const thinkingLevel = yield* selectedThinkingLevel(
+          input.modelSelection,
+          instanceId,
+          "sendTurn",
+        );
+        if (
+          thinkingLevel &&
+          (!selection || selection === ctx.session.model) &&
+          !ctx.sdk.getAvailableThinkingLevels().includes(thinkingLevel)
+        )
           return yield* new ProviderAdapterValidationError({
             provider,
             operation: "sendTurn",
-            issue: "Pi model options are not supported by this adapter.",
+            issue: `Pi thinking level ${thinkingLevel} is not supported by this model.`,
           });
-        }
         if (selection && selection !== ctx.session.model) {
-          yield* setModel(ctx, selection);
+          yield* setModel(ctx, selection, thinkingLevel);
         }
         const images: Array<{ type: "image"; data: string; mimeType: string }> = [];
         for (const attachment of input.attachments ?? []) {
@@ -568,6 +664,8 @@ export const makePiAdapter = (
             method: "steer",
             detail: "Pi is still preparing the active turn; send again once it starts.",
           });
+        const promptThinkingLevel = thinkingLevel ?? defaultThinkingLevel(ctx.sdk.model);
+        if (promptThinkingLevel) ctx.sdk.setThinkingLevel(promptThinkingLevel);
         const count = ctx.sdk.sessionManager
           .getEntries()
           .filter((entry) => entry.type === "message" && entry.message.role === "user").length;
@@ -592,7 +690,7 @@ export const makePiAdapter = (
           yield* emit({
             type: "turn.started",
             ...base(ctx, turn.id),
-            payload: { model: ctx.session.model },
+            payload: { model: ctx.session.model, effort: ctx.sdk.thinkingLevel },
           });
         }
         let accepted = false;

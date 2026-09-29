@@ -145,6 +145,63 @@ it.effect("uses SDK model validation before prompting and never records an unava
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );
 
+it.effect(
+  "rejects unknown and invalid Pi thinking options at start without opening a session",
+  () =>
+    Effect.gen(function* () {
+      const adapter = yield* makePiAdapter();
+      for (const options of [
+        [{ id: "unknown", value: "high" }],
+        [{ id: "thinkingLevel", value: "ultra" }],
+        [{ id: "thinkingLevel", value: true }],
+        [
+          { id: "thinkingLevel", value: "low" },
+          { id: "thinkingLevel", value: "high" },
+        ],
+      ]) {
+        const error = yield* adapter
+          .startSession({
+            ...start,
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("pi"),
+              model: "test/model",
+              options,
+            },
+          })
+          .pipe(Effect.flip);
+        assert.equal(error._tag, "ProviderAdapterValidationError");
+        assert.isFalse(yield* adapter.hasSession(threadId));
+      }
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("rejects unknown and invalid Pi thinking options on send without prompting", () =>
+  Effect.gen(function* () {
+    const adapter = yield* makePiAdapter();
+    yield* adapter.startSession(start);
+    for (const options of [
+      [{ id: "unknown", value: "high" }],
+      [{ id: "thinkingLevel", value: "ultra" }],
+      [{ id: "thinkingLevel", value: true }],
+    ]) {
+      const error = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "hello",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("pi"),
+            model: "test/model",
+            options,
+          },
+        })
+        .pipe(Effect.flip);
+      assert.equal(error._tag, "ProviderAdapterValidationError");
+    }
+    assert.deepStrictEqual(yield* adapter.readThread(threadId), { threadId, turns: [] });
+    assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
 it.effect("rejects non-image attachments instead of silently dropping them", () =>
   Effect.gen(function* () {
     const adapter = yield* makePiAdapter();
