@@ -109,7 +109,11 @@ to that environment's machine, even when you connect from a phone or another
 computer.
 
 To use Pi, enable it for the environment here, then choose a Pi model in the
-thread's model picker.
+thread's model and provider options. To use primary presets, configure Pi presets
+and install or enable a working custom Pi extension that registers `/preset`; T3
+applies your selection through that command. The `@tintinweb/pi-subagents`
+extension handles spawned subagents, not primary presets. On mobile, find the
+thread's model and provider options in thread settings.
 
 | Provider    | Install and authenticate                                                                      |
 | ----------- | --------------------------------------------------------------------------------------------- |
