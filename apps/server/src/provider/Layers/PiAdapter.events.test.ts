@@ -14,6 +14,7 @@ import {
   ThreadId,
   type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -59,6 +60,7 @@ function sdkSession(
     readonly setModel?: () => void;
     readonly dispose?: () => void;
     readonly restoredModel?: AgentSession["model"];
+    readonly listen?: (emit: (event: AgentSessionEvent) => void) => void;
   } = {},
 ) {
   vi.mocked(createAgentSession).mockImplementation(async (sessionOptions) => {
@@ -93,8 +95,11 @@ function sdkSession(
         sessionManager: sessionOptions?.sessionManager,
         subscribe: (next: typeof listener) => {
           listener = next;
+          sdkOptions.listen?.(next);
           return () => {};
         },
+        bindExtensions: async () => {},
+        extensionRunner: { hasHandlers: () => false, emit: async () => undefined },
         prompt: (_text: string, config: { preflightResult: (success: boolean) => void }) =>
           prompt(listener, config.preflightResult),
         get isStreaming() {
@@ -777,5 +782,95 @@ it.effect("interrupts a streaming Pi run and restores a ready session", () =>
       events.filter((event) => event.type === "turn.completed").map((event) => event.payload.state),
       ["cancelled"],
     );
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("reports an extension-triggered Pi run after the user turn as its own turn", () =>
+  Effect.gen(function* () {
+    let emitSdk: (event: AgentSessionEvent) => void = () => {};
+    sdkSession(
+      async (emit, preflight) => {
+        preflight(true);
+        emit({ type: "agent_settled" });
+      },
+      { listen: (emit) => (emitSdk = emit) },
+    );
+    const adapter = yield* makePiAdapter();
+    const events: ProviderRuntimeEvent[] = [];
+    const followUpSettled = yield* Deferred.make<void>();
+    yield* adapter.streamEvents.pipe(
+      Stream.runForEach((event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (events.filter((entry) => entry.type === "turn.completed").length === 2)
+            yield* Deferred.succeed(followUpSettled, undefined);
+        }),
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    yield* adapter.startSession(start);
+    const user = yield* adapter.sendTurn({ threadId, input: "spawn a background subagent" });
+    // A background subagent finishes; pi-subagents calls sendMessage({ triggerTurn: true }).
+    emitSdk({ type: "agent_start" });
+    emitSdk({
+      type: "tool_execution_start",
+      toolCallId: "call-result",
+      toolName: "get_subagent_result",
+      args: {},
+    });
+    emitSdk({ type: "agent_settled" });
+    yield* Deferred.await(followUpSettled);
+    const turns = events.filter(
+      (event) => event.type === "turn.started" || event.type === "turn.completed",
+    );
+    assert.equal(turns.length, 4);
+    const followUp = turns[2]!.turnId;
+    assert.notEqual(followUp, user.turnId);
+    assert.deepEqual(
+      turns.map((event) => [event.type, event.turnId === followUp]),
+      [
+        ["turn.started", false],
+        ["turn.completed", false],
+        ["turn.started", true],
+        ["turn.completed", true],
+      ],
+    );
+    assert.equal(events.find((event) => event.type === "item.started")?.turnId, followUp);
+    assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("maps the Pi Agent tool to a subagent tool call", () =>
+  Effect.gen(function* () {
+    sdkSession(async (emit, preflight) => {
+      preflight(true);
+      emit({ type: "agent_start" });
+      emit({
+        type: "tool_execution_start",
+        toolCallId: "call-agent",
+        toolName: "Agent",
+        args: { subagent_type: "explore", prompt: "look" },
+      });
+      emit({ type: "agent_settled" });
+    });
+    const adapter = yield* makePiAdapter();
+    const events: ProviderRuntimeEvent[] = [];
+    yield* adapter.streamEvents.pipe(
+      Stream.runForEach((event) =>
+        Effect.sync(() => {
+          events.push(event);
+        }),
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    yield* adapter.startSession(start);
+    yield* adapter.sendTurn({ threadId, input: "delegate" });
+    const started = events.find((event) => event.type === "item.started");
+    assert.equal(
+      started?.type === "item.started" ? started.payload.itemType : undefined,
+      "collab_agent_tool_call",
+    );
+    yield* adapter.stopSession(threadId);
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );

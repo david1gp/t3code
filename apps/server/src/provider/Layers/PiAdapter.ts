@@ -241,6 +241,11 @@ export const makePiAdapter = (
           ctx.active = undefined;
         }
         ctx.unsubscribe();
+        // Lets extensions (pi-subagents) stop their child sessions before dispose.
+        if (ctx.sdk.extensionRunner.hasHandlers("session_shutdown"))
+          yield* Effect.promise(() =>
+            ctx.sdk.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }),
+          ).pipe(Effect.ignore);
         ctx.sdk.dispose();
         yield* Scope.close(ctx.scope, Exit.void);
         yield* emit({ type: "session.exited", ...base(ctx), payload: { exitKind: "graceful" } });
@@ -261,9 +266,42 @@ export const makePiAdapter = (
         });
         turn.assistantItem = undefined;
       });
+    const turnBegin = (ctx: Session, id: TurnId) =>
+      Effect.gen(function* () {
+        const turn: Turn = {
+          id,
+          settled: yield* Deferred.make<void, ProviderAdapterRequestError>(),
+          interrupted: false,
+          failure: undefined,
+          segment: 0,
+          assistantItem: undefined,
+        };
+        ctx.active = turn;
+        ctx.session = {
+          ...ctx.session,
+          activeTurnId: turn.id,
+          status: "running",
+          updatedAt: nowIso(),
+        };
+        yield* emit({
+          type: "turn.started",
+          ...base(ctx, turn.id),
+          payload: { model: ctx.session.model, effort: ctx.sdk.thinkingLevel },
+        });
+        return turn;
+      });
     const consume = (ctx: Session, event: AgentSessionEvent) =>
       Effect.gen(function* () {
-        const turn = ctx.active;
+        // Extensions (e.g. background subagent completions) can start a run with
+        // sendMessage({ triggerTurn: true }) after the user's turn settled.
+        const turn =
+          ctx.active ??
+          (event.type === "agent_start"
+            ? yield* turnBegin(
+                ctx,
+                TurnId.make(`pi:${ctx.sessionId}:ext:${NodeCrypto.randomUUID()}`),
+              )
+            : undefined);
         if (!turn) return;
         // An interrupt can arrive while Pi is still running prompt preflight.
         if (event.type === "agent_start" && turn.interrupted) {
@@ -327,7 +365,9 @@ export const makePiAdapter = (
               ? "command_execution"
               : toolName === "edit" || toolName === "write"
                 ? "file_change"
-                : "dynamic_tool_call";
+                : toolName === "Agent" || toolName === "SubagentWorkflow"
+                  ? "collab_agent_tool_call"
+                  : "dynamic_tool_call";
           const completed = event.type === "tool_execution_end";
           yield* emit({
             type:
@@ -512,8 +552,6 @@ export const makePiAdapter = (
               cwd,
               agentDir,
               settingsManager,
-              // Extensions have an interactive UI contract; do not load them without one.
-              noExtensions: true,
             });
             await loader.reload();
             const result = await createAgentSession({
@@ -524,6 +562,22 @@ export const makePiAdapter = (
               modelRuntime,
               ...(model ? { model } : {}),
             });
+            // Headless binding, as in Pi's print mode: extensions see hasUI === false.
+            // This emits session_start, so extension tools (e.g. pi-subagents) register.
+            await result.session.bindExtensions({
+              mode: "rpc",
+              onError: (error) =>
+                Effect.runFork(
+                  Effect.logWarning("Pi extension error", {
+                    extension: error.extensionPath,
+                    error: String(error.error),
+                  }),
+                ),
+            });
+            // A session_start extension (e.g. a preset) may switch models; T3's selection wins.
+            const current = result.session.model;
+            if (model && (current?.provider !== model.provider || current.id !== model.id))
+              await result.session.setModel(model);
             return result.session;
           },
           catch: (cause) =>
@@ -664,35 +718,21 @@ export const makePiAdapter = (
             method: "steer",
             detail: "Pi is still preparing the active turn; send again once it starts.",
           });
+        // An extension-triggered run whose agent_start has not been consumed yet.
+        if (!steering && ctx.sdk.isStreaming)
+          return yield* new ProviderAdapterRequestError({
+            provider,
+            method: "prompt",
+            detail:
+              "Pi is starting a follow-up run (e.g. a subagent result); send again once it starts.",
+          });
         const promptThinkingLevel = thinkingLevel ?? defaultThinkingLevel(ctx.sdk.model);
         if (promptThinkingLevel) ctx.sdk.setThinkingLevel(promptThinkingLevel);
         const count = ctx.sdk.sessionManager
           .getEntries()
           .filter((entry) => entry.type === "message" && entry.message.role === "user").length;
-        const turn: Turn = steering ?? {
-          id: TurnId.make(`pi:${ctx.sessionId}:${count}`),
-          settled: yield* Deferred.make<void, ProviderAdapterRequestError>(),
-          interrupted: false,
-          failure: undefined,
-          segment: 0,
-          assistantItem: undefined,
-        };
-        if (!steering) {
-          ctx.active = turn;
-          ctx.session = {
-            ...ctx.session,
-            activeTurnId: turn.id,
-            status: "running",
-            updatedAt: nowIso(),
-          };
-        }
-        if (!steering) {
-          yield* emit({
-            type: "turn.started",
-            ...base(ctx, turn.id),
-            payload: { model: ctx.session.model, effort: ctx.sdk.thinkingLevel },
-          });
-        }
+        const turn =
+          steering ?? (yield* turnBegin(ctx, TurnId.make(`pi:${ctx.sessionId}:${count}`)));
         let accepted = false;
         const prompt = steering
           ? ctx.sdk.steer(message, images.length ? images : undefined)
