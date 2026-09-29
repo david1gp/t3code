@@ -478,7 +478,8 @@ export function runtimeEventToActivities(
   })();
   switch (event.type) {
     case "turn.completed": {
-      if (event.provider !== "opencode") return [];
+      // API-priced providers only; subscription harnesses report their own totals.
+      if (event.provider !== "opencode" && event.provider !== "pi") return [];
       const totalCostUsd = event.payload.totalCostUsd;
       if (totalCostUsd === undefined || !Number.isFinite(totalCostUsd) || totalCostUsd < 0) {
         return [];

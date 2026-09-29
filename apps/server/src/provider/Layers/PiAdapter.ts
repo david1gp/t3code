@@ -3,6 +3,7 @@ import * as NodePath from "node:path";
 import * as NodeCrypto from "node:crypto";
 import {
   createAgentSession,
+  createEventBus,
   DefaultResourceLoader,
   getAgentDir,
   ModelRuntime,
@@ -17,6 +18,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeItemId,
+  RuntimeTaskId,
   TurnId,
   type ProviderRuntimeEvent,
   type ProviderSession,
@@ -149,7 +151,66 @@ type Turn = {
   failure: string | undefined;
   assistantItem: RuntimeItemId | undefined;
   segment: number;
+  readonly usage: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    reasoning: number;
+    costUsd: number;
+    messages: number;
+  };
 };
+
+type AssistantUsage = {
+  readonly input: number;
+  readonly output: number;
+  readonly cacheRead: number;
+  readonly cacheWrite: number;
+  readonly reasoning?: number;
+  readonly cost?: { readonly total?: number };
+};
+
+const count = (value: unknown) =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : 0;
+
+/** pi-subagents lifecycle payloads on `pi.events` (subagents:started/completed/failed). */
+type SubagentEvent = {
+  readonly id?: unknown;
+  readonly type?: unknown;
+  readonly description?: unknown;
+  readonly result?: unknown;
+  readonly error?: unknown;
+  readonly toolUses?: unknown;
+  readonly durationMs?: unknown;
+  readonly usage?: {
+    readonly input?: unknown;
+    readonly output?: unknown;
+    readonly cacheRead?: unknown;
+    readonly cacheWrite?: unknown;
+    readonly totalTokens?: unknown;
+    readonly cost?: { readonly total?: unknown };
+  };
+};
+
+const text = (value: unknown) =>
+  typeof value === "string" && value.trim() ? value.trim() : undefined;
+
+function subagentUsage(event: SubagentEvent) {
+  const usage = event.usage;
+  if (!usage) return undefined;
+  const cacheRead = count(usage.cacheRead);
+  const cost = usage.cost?.total;
+  return {
+    totalTokens: count(usage.totalTokens),
+    inputTokens: count(usage.input) + cacheRead + count(usage.cacheWrite),
+    cachedInputTokens: cacheRead,
+    outputTokens: count(usage.output),
+    ...(typeof event.toolUses === "number" ? { toolUses: count(event.toolUses) } : {}),
+    ...(typeof event.durationMs === "number" ? { durationMs: count(event.durationMs) } : {}),
+    ...(typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? { costUsd: cost } : {}),
+  };
+}
 type Session = {
   session: ProviderSession;
   readonly sessionId: string;
@@ -157,6 +218,9 @@ type Session = {
   unsubscribe: () => void;
   readonly scope: Scope.Closeable;
   active: Turn | undefined;
+  /** Background subagents settle after their spawning turn. */
+  lastTurnId: TurnId | undefined;
+  readonly subagents: Set<string>;
   stopped: boolean;
 };
 
@@ -266,6 +330,112 @@ export const makePiAdapter = (
         });
         turn.assistantItem = undefined;
       });
+    // Main-agent usage only: pi-subagents children report through task events.
+    const recordUsage = (ctx: Session, turn: Turn, usage: AssistantUsage | undefined) =>
+      Effect.gen(function* () {
+        if (!usage) return;
+        const totals = turn.usage;
+        totals.messages += 1;
+        totals.input += count(usage.input);
+        totals.output += count(usage.output);
+        totals.cacheRead += count(usage.cacheRead);
+        totals.cacheWrite += count(usage.cacheWrite);
+        totals.reasoning += count(usage.reasoning);
+        const cost = usage.cost?.total;
+        if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) totals.costUsd += cost;
+        const context = ctx.sdk.getContextUsage();
+        const input = count(usage.input) + count(usage.cacheRead) + count(usage.cacheWrite);
+        const usedTokens =
+          context?.tokens !== null && context?.tokens !== undefined
+            ? count(context.tokens)
+            : input + count(usage.output);
+        if (usedTokens <= 0) return;
+        yield* emit({
+          type: "thread.token-usage.updated",
+          ...base(ctx, turn.id),
+          payload: {
+            usage: {
+              usedTokens,
+              lastUsedTokens: usedTokens,
+              ...(context && context.contextWindow > 0
+                ? { maxTokens: Math.floor(context.contextWindow) }
+                : {}),
+              inputTokens: input,
+              cachedInputTokens: count(usage.cacheRead),
+              outputTokens: count(usage.output),
+              ...(usage.reasoning !== undefined
+                ? { reasoningOutputTokens: count(usage.reasoning) }
+                : {}),
+              lastInputTokens: input,
+              lastCachedInputTokens: count(usage.cacheRead),
+              lastOutputTokens: count(usage.output),
+              compactsAutomatically: true,
+            },
+          },
+        });
+      });
+    const turnAccounting = (ctx: Session, turn: Turn) => {
+      const totals = turn.usage;
+      if (!totals.messages) return {};
+      return {
+        tokenUsage: {
+          usageScope: "main_agent" as const,
+          usageStatus: "complete" as const,
+          hasSubagents: false,
+          inputTokens: totals.input + totals.cacheRead + totals.cacheWrite,
+          outputTokens: totals.output,
+          cachedInputTokens: totals.cacheRead,
+          cacheCreationTokens: totals.cacheWrite,
+          reasoningTokens: Math.min(totals.output, totals.reasoning),
+        },
+        totalCostUsd: totals.costUsd,
+        ...(ctx.session.model ? { costModel: ctx.session.model } : {}),
+        costSessionId: ctx.sessionId,
+      };
+    };
+    const subagentEvent = (
+      ctx: Session,
+      kind: "started" | "completed" | "failed",
+      data: SubagentEvent,
+    ) =>
+      Effect.gen(function* () {
+        const id = text(data.id);
+        if (!id || ctx.stopped) return;
+        const turnId = ctx.active?.id ?? ctx.lastTurnId;
+        const role = text(data.type);
+        const description = text(data.description) ?? role ?? "Pi subagent";
+        const linkage = {
+          taskType: "subagent",
+          agentKind: "agent" as const,
+          title: description,
+          ...(role ? { role } : {}),
+        };
+        const taskId = RuntimeTaskId.make(`pi:${id}`);
+        if (kind === "started") {
+          if (ctx.subagents.has(id)) return;
+          ctx.subagents.add(id);
+          yield* emit({
+            type: "task.started",
+            ...base(ctx, turnId),
+            payload: { taskId, description, ...linkage },
+          });
+          return;
+        }
+        ctx.subagents.delete(id);
+        const typedUsage = subagentUsage(data);
+        const summary = kind === "failed" ? text(data.error) : text(data.result);
+        yield* emit({
+          type: "task.completed",
+          ...base(ctx, turnId),
+          payload: {
+            taskId,
+            status: kind,
+            ...(summary ? { summary: summary.slice(0, 2_000) } : {}),
+            ...(typedUsage ? { typedUsage } : {}),
+            ...linkage,
+          },
+        });
+      });
     const turnBegin = (ctx: Session, id: TurnId) =>
       Effect.gen(function* () {
         const turn: Turn = {
@@ -275,8 +445,18 @@ export const makePiAdapter = (
           failure: undefined,
           segment: 0,
           assistantItem: undefined,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 0,
+            costUsd: 0,
+            messages: 0,
+          },
         };
         ctx.active = turn;
+        ctx.lastTurnId = turn.id;
         ctx.session = {
           ...ctx.session,
           activeTurnId: turn.id,
@@ -317,6 +497,7 @@ export const makePiAdapter = (
                 ? String(message.errorMessage ?? "Pi model failed")
                 : undefined;
             if (message.stopReason === "aborted") turn.interrupted = true;
+            yield* recordUsage(ctx, turn, message.usage);
             yield* closeAssistant(
               ctx,
               turn,
@@ -415,6 +596,7 @@ export const makePiAdapter = (
             state: turn.interrupted ? "cancelled" : turn.failure ? "failed" : "completed",
             stopReason: turn.interrupted ? "cancelled" : turn.failure ? "error" : null,
             ...(turn.failure ? { errorMessage: turn.failure } : {}),
+            ...turnAccounting(ctx, turn),
           },
         });
         yield* Deferred.succeed(turn.settled, undefined).pipe(Effect.ignore);
@@ -435,9 +617,12 @@ export const makePiAdapter = (
         yield* emit({
           type: "turn.completed",
           ...base(ctx, turn.id),
-          payload: turn.interrupted
-            ? { state: "cancelled", stopReason: "cancelled" }
-            : { state: "failed", stopReason: "error", errorMessage: detail },
+          payload: {
+            ...(turn.interrupted
+              ? { state: "cancelled" as const, stopReason: "cancelled" }
+              : { state: "failed" as const, stopReason: "error", errorMessage: detail }),
+            ...turnAccounting(ctx, turn),
+          },
         });
         if (turn.interrupted) {
           yield* Deferred.succeed(turn.settled, undefined).pipe(Effect.ignore);
@@ -539,6 +724,8 @@ export const makePiAdapter = (
                 }),
             ),
           );
+        // Extensions publish on this bus; pi-subagents reports child lifecycle here.
+        const eventBus = createEventBus();
         const opened = yield* Effect.tryPromise({
           try: async () => {
             const manager = sessionFile
@@ -552,6 +739,7 @@ export const makePiAdapter = (
               cwd,
               agentDir,
               settingsManager,
+              eventBus,
             });
             await loader.reload();
             const result = await createAgentSession({
@@ -602,6 +790,8 @@ export const makePiAdapter = (
           scope,
           stopped: false,
           active: undefined,
+          lastTurnId: undefined,
+          subagents: new Set(),
           session: {
             provider,
             providerInstanceId: instanceId,
@@ -618,13 +808,38 @@ export const makePiAdapter = (
           ...ctx.session,
           model: opened.model ? `${opened.model.provider}/${opened.model.id}` : undefined,
         };
-        const events = yield* Queue.unbounded<AgentSessionEvent>();
-        ctx.unsubscribe = opened.subscribe((event) => {
-          Effect.runSync(Queue.offer(events, event));
+        type Queued =
+          | { readonly source: "sdk"; readonly event: AgentSessionEvent }
+          | {
+              readonly source: "subagent";
+              readonly kind: "started" | "completed" | "failed";
+              readonly data: SubagentEvent;
+            };
+        const events = yield* Queue.unbounded<Queued>();
+        const unsubscribeSdk = opened.subscribe((event) => {
+          Effect.runSync(Queue.offer(events, { source: "sdk", event }));
         });
+        const unsubscribeBus = (["started", "completed", "failed"] as const).map((kind) =>
+          eventBus.on(`subagents:${kind}`, (data) => {
+            if (data !== null && typeof data === "object")
+              Effect.runSync(
+                Queue.offer(events, { source: "subagent", kind, data: data as SubagentEvent }),
+              );
+          }),
+        );
+        ctx.unsubscribe = () => {
+          unsubscribeSdk();
+          for (const off of unsubscribeBus) off();
+        };
         sessions.set(input.threadId, ctx);
         yield* Stream.fromQueue(events).pipe(
-          Stream.runForEach((event) => (ctx.stopped ? Effect.void : consume(ctx, event))),
+          Stream.runForEach((item) =>
+            ctx.stopped
+              ? Effect.void
+              : item.source === "sdk"
+                ? consume(ctx, item.event)
+                : subagentEvent(ctx, item.kind, item.data),
+          ),
           Effect.forkIn(scope),
         );
         yield* emit({ type: "session.started", ...base(ctx), payload: { resume: cursor } });

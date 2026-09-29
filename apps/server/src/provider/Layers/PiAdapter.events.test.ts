@@ -2,6 +2,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   createAgentSession,
+  createEventBus,
   ModelRuntime,
   type AgentSession,
   type AgentSessionEvent,
@@ -11,6 +12,7 @@ import { vi } from "vite-plus/test";
 import {
   ProviderDriverKind,
   ProviderInstanceId,
+  RuntimeTaskId,
   ThreadId,
   type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
@@ -22,10 +24,14 @@ import * as Stream from "effect/Stream";
 import { ServerConfig } from "../../config.ts";
 import { makePiAdapter } from "./PiAdapter.ts";
 
-vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@earendil-works/pi-coding-agent")>()),
-  createAgentSession: vi.fn(),
-}));
+vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@earendil-works/pi-coding-agent")>();
+  return {
+    ...actual,
+    createAgentSession: vi.fn(),
+    createEventBus: vi.fn(actual.createEventBus),
+  };
+});
 
 const testLayer = ServerConfig.layerTest(process.cwd(), { prefix: "pi-sdk-events-test-" }).pipe(
   Layer.provideMerge(NodeServices.layer),
@@ -61,6 +67,7 @@ function sdkSession(
     readonly dispose?: () => void;
     readonly restoredModel?: AgentSession["model"];
     readonly listen?: (emit: (event: AgentSessionEvent) => void) => void;
+    readonly contextUsage?: () => ReturnType<AgentSession["getContextUsage"]>;
   } = {},
 ) {
   vi.mocked(createAgentSession).mockImplementation(async (sessionOptions) => {
@@ -109,6 +116,7 @@ function sdkSession(
         abort: () => sdkOptions.abort?.() ?? Promise.resolve(),
         clearQueue: () => sdkOptions.clearQueue?.(),
         dispose: () => sdkOptions.dispose?.(),
+        getContextUsage: () => sdkOptions.contextUsage?.(),
       },
     } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
   });
@@ -873,4 +881,130 @@ it.effect("maps the Pi Agent tool to a subagent tool call", () =>
     );
     yield* adapter.stopSession(threadId);
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect(
+  "reports Pi context size, API-equivalent turn cost and pi-subagents lifecycle as tasks",
+  () =>
+    Effect.gen(function* () {
+      sdkSession(
+        async (emit, preflight) => {
+          preflight(true);
+          // The extension bus the adapter handed to Pi's resource loader.
+          const bus = vi.mocked(createEventBus).mock.results.at(-1)?.value as ReturnType<
+            typeof createEventBus
+          >;
+          // A pi-subagents Agent tool call launches a child during the turn.
+          bus.emit("subagents:started", { id: "agent-1", type: "explore", description: "Scan" });
+          emit({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              stopReason: "stop",
+              usage: {
+                input: 100,
+                output: 20,
+                cacheRead: 400,
+                cacheWrite: 10,
+                reasoning: 5,
+                totalTokens: 530,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.0125 },
+              },
+            },
+          } as AgentSessionEvent);
+          bus.emit("subagents:completed", {
+            id: "agent-1",
+            type: "explore",
+            description: "Scan",
+            result: "found it",
+            toolUses: 3,
+            durationMs: 900,
+            usage: {
+              input: 50,
+              output: 10,
+              cacheRead: 40,
+              cacheWrite: 0,
+              totalTokens: 100,
+              cost: { total: 0.002 },
+            },
+          });
+          emit({ type: "agent_settled" });
+        },
+        { contextUsage: () => ({ tokens: 530, contextWindow: 200_000, percent: 0.265 }) },
+      );
+      const adapter = yield* makePiAdapter();
+      const events: ProviderRuntimeEvent[] = [];
+      const settled = yield* Deferred.make<void>();
+      yield* adapter.streamEvents.pipe(
+        Stream.runForEach((event) =>
+          Effect.gen(function* () {
+            events.push(event);
+            if (event.type === "turn.completed") yield* Deferred.succeed(settled, undefined);
+          }),
+        ),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* adapter.startSession(start);
+      const turn = yield* adapter.sendTurn({ threadId, input: "hello" });
+      yield* Deferred.await(settled);
+
+      const context = events.find((event) => event.type === "thread.token-usage.updated");
+      assert.deepEqual(context?.type === "thread.token-usage.updated" && context.payload.usage, {
+        usedTokens: 530,
+        lastUsedTokens: 530,
+        maxTokens: 200_000,
+        inputTokens: 510,
+        cachedInputTokens: 400,
+        outputTokens: 20,
+        reasoningOutputTokens: 5,
+        lastInputTokens: 510,
+        lastCachedInputTokens: 400,
+        lastOutputTokens: 20,
+        compactsAutomatically: true,
+      });
+      const completed = events.find((event) => event.type === "turn.completed");
+      assert.equal(completed?.type === "turn.completed" && completed.payload.totalCostUsd, 0.0125);
+      assert.deepEqual(
+        events
+          .filter((event) => event.type === "task.started" || event.type === "task.completed")
+          .map((event) => ({ type: event.type, turnId: event.turnId, payload: event.payload })),
+        [
+          {
+            type: "task.started",
+            turnId: turn.turnId,
+            payload: {
+              taskId: RuntimeTaskId.make("pi:agent-1"),
+              description: "Scan",
+              taskType: "subagent",
+              agentKind: "agent",
+              title: "Scan",
+              role: "explore",
+            },
+          },
+          {
+            type: "task.completed",
+            turnId: turn.turnId,
+            payload: {
+              taskId: RuntimeTaskId.make("pi:agent-1"),
+              status: "completed",
+              summary: "found it",
+              // Child spend stays on the task, not the parent turn's cost.
+              typedUsage: {
+                totalTokens: 100,
+                inputTokens: 90,
+                cachedInputTokens: 40,
+                outputTokens: 10,
+                toolUses: 3,
+                durationMs: 900,
+                costUsd: 0.002,
+              },
+              taskType: "subagent",
+              agentKind: "agent",
+              title: "Scan",
+              role: "explore",
+            },
+          },
+        ],
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );
