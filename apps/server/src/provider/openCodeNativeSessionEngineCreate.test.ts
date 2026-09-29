@@ -326,7 +326,10 @@ describe("native v2.0.18 session slice", () => {
       const reconciling = test.engine.reconcilePending();
       await vi.advanceTimersByTimeAsync(15_000);
       expect((await reconciling).success).toBe(false);
-      expect((await test.engine.send("do not retry")).success).toBe(false);
+      // A steer still has to reconcile pending requests, so it stays fail-closed.
+      const steering = test.engine.send("do not retry");
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect((await steering).success).toBe(false);
     } finally {
       vi.useRealTimers();
       await test.close();
@@ -369,15 +372,14 @@ describe("native v2.0.18 session slice", () => {
       await test.admit();
       test.setInterrupted(false);
       expect(await test.engine.interrupt()).toEqual({ success: true, data: false });
-      expect(await test.engine.send("still active")).toMatchObject({
-        success: false,
-        rejected: true,
-      });
+      const turn = test.engine.send("still active");
+      // A send during a running turn steers it instead of starting a new turn.
+      expect((await turn).success).toBe(true);
       test.write("session.execution.started");
       test.write("session.execution.succeeded");
       await test.wait((event) => event.type === "turn.completed");
       expect((await test.engine.send("next turn")).success).toBe(true);
-      expect(test.promptCount()).toBe(2);
+      expect(test.promptCount()).toBe(3);
     } finally {
       await test.close();
     }
@@ -845,6 +847,7 @@ describe("native v2.0.18 session slice", () => {
     const { events } = capture;
     let stream: NodeHttp.ServerResponse | undefined;
     let admission: Record<string, unknown> | undefined;
+    let steer: Record<string, unknown> | undefined;
     const server = await fixture((req, res) => {
       expect(req.headers.authorization).toBe(
         `Basic ${Buffer.from("opencode:secret").toString("base64")}`,
@@ -872,8 +875,9 @@ describe("native v2.0.18 session slice", () => {
       if (req.url === "/api/session/ses_fixture/prompt") {
         // The new client reconciles pending interactions after admission.
         void bodyRead(req).then((body) => {
-          admission = body;
-          expect(body).toMatchObject({ text: "hello" });
+          if (body.text === "second") steer = body;
+          else admission = body;
+          expect(body).toMatchObject({ text: steer === body ? "second" : "hello" });
           expect(body.id).toMatch(/^msg_/);
           send(res, {
             data: {
@@ -918,7 +922,12 @@ describe("native v2.0.18 session slice", () => {
       expect(turn.success).toBe(true);
       if (!turn.success) return;
       expect(admission?.id).toBe(turn.data.turnID);
-      expect(await engine.send("second")).toMatchObject({ success: false, rejected: true });
+      // A send during the running turn steers it and keeps the same turn id.
+      expect(await engine.send("second")).toEqual({
+        success: true,
+        data: { turnID: turn.data.turnID },
+      });
+      expect(steer).toMatchObject({ delivery: "steer" });
       frame(stream!, "session.execution.started", { sessionID: session.id });
       frame(stream!, "session.text.delta", {
         sessionID: session.id,
@@ -1148,7 +1157,10 @@ describe("native v2.0.18 session slice", () => {
       test.write("session.step.streamed", { assistantMessageID: "msg_first" });
       test.write("session.step.streamed", { assistantMessageID: "msg_first" });
       await test.wait((event) => event.type === "step.streamed");
-      expect((await test.engine.send("streamed is not settled")).success).toBe(false);
+      expect(await test.engine.send("streamed is not settled")).toEqual({
+        success: true,
+        data: { turnID },
+      });
       test.write("session.step.ended", {
         ...stepEnd("msg_first", "tool-calls"),
         rawFinish: "tool_use",
@@ -1373,7 +1385,10 @@ describe("native v2.0.18 session slice", () => {
           (event) => event.type === "turn.failed" || event.type === "turn.completed",
         ),
       ).toBe(false);
-      expect((await test.engine.send("retry still active")).success).toBe(false);
+      expect(await test.engine.send("retry still active")).toEqual({
+        success: true,
+        data: { turnID },
+      });
       test.write("session.reasoning.delta", {
         assistantMessageID: "msg_attempt",
         ordinal: 0,
@@ -1619,7 +1634,10 @@ describe("native v2.0.18 session slice", () => {
         { type: "usage.updated", sessionID: "ses_background", scope: "session", ...usage },
       ]);
       expect(test.events.filter((event) => event.type === "turn.failed")).toEqual([]);
-      expect((await test.engine.send("next turn is still pending")).success).toBe(false);
+      expect(await test.engine.send("next turn is still pending")).toEqual({
+        success: true,
+        data: { turnID: nextID },
+      });
       test.write("session.execution.started");
       test.write("session.execution.succeeded");
       await test.wait((event) => event.type === "turn.completed" && event.turnID === nextID);
@@ -1929,9 +1947,10 @@ describe("native v2.0.18 session slice", () => {
         error: { type: "tool.error", message: "bad status", status: 999 },
       });
       await test.drain();
-      expect((await test.engine.send("malformed terminals did not free admission")).success).toBe(
-        false,
-      );
+      expect(await test.engine.send("malformed terminals did not free admission")).toEqual({
+        success: true,
+        data: { turnID },
+      });
       expect(test.events.filter((event) => event.type === "text.delta")).toHaveLength(1);
       expect(
         test.events.some(

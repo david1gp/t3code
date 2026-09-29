@@ -1180,20 +1180,31 @@ export const openCodeNativeSessionEngineCreate = (input: {
       const currentSession = session;
       if (uncertain)
         return fail("session.prompt", "Session already has pending or uncertain work.");
-      if (active || admitting)
-        return rejectSend(
-          "OpenCode v2 cannot steer a running turn. Queue the message or wait for the turn to finish.",
-        );
+      if (admitting) return rejectSend("A message is still being admitted. Try again in a moment.");
       if (!text.trim()) return rejectSend("Prompt text is required.");
       admitting = true;
       const id = `msg_${NodeCrypto.randomUUID().replaceAll("-", "")}`;
-      active = workCreate({ turnID: id, sessionID: session.id });
-      lastTurnID = id;
+      // A send while a turn runs is a steer: OpenCode injects it into the running
+      // execution, and the message continues the same T3 turn.
+      const steering = active;
+      if (!steering) {
+        active = workCreate({ turnID: id, sessionID: session.id });
+        lastTurnID = id;
+      }
+      const turnID = steering?.scope.turnID ?? id;
       const controller = abort;
       let receipt: unknown;
       try {
         receipt = await requestWithDeadline(controller.signal, (signal) =>
-          client.session.prompt({ sessionID: currentSession.id, id, text }, { signal }),
+          client.session.prompt(
+            {
+              sessionID: currentSession.id,
+              id,
+              text,
+              ...(steering ? { delivery: "steer" as const } : {}),
+            },
+            { signal },
+          ),
         );
       } catch (cause) {
         // A failed HTTP response may still have admitted the durable inbox item.
@@ -1238,7 +1249,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
         uncertain = true;
         return reconciled;
       }
-      return { success: true, data: { turnID: id } };
+      return { success: true, data: { turnID } };
     },
     reconcilePending: () => reconcilePending(),
     replyPermission: async (
