@@ -34,6 +34,7 @@ const start = {
 // before the provider can be called. Nothing here reads or writes the user's Pi home.
 const agentDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pi-preset-test-"));
 const emptyAgentDir = NodePath.join(agentDir, "without-command");
+const noPresetAgentDir = NodePath.join(agentDir, "without-presets-or-extension");
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 const prompts: string[] = [];
 const promptModels: Array<string | undefined> = [];
@@ -46,6 +47,7 @@ let presetModel: string;
 beforeAll(async () => {
   NodeFS.mkdirSync(NodePath.join(agentDir, "extensions"));
   NodeFS.mkdirSync(emptyAgentDir);
+  NodeFS.mkdirSync(noPresetAgentDir);
   NodeFS.writeFileSync(
     NodePath.join(agentDir, "presets.json"),
     '{"build":{"model":"test/build"},"delegate":{"model":"test/delegate"},"broken":{},"noisy":{}}',
@@ -651,6 +653,34 @@ it.effect("rejects a configured preset when the extension command is missing", (
     assert.equal(error._tag, "ProviderAdapterRequestError");
     assert.isFalse(yield* adapter.hasSession(threadId));
     assert.deepEqual(prompts, []);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("sends one ordinary user turn with no preset config or extension", () =>
+  Effect.gen(function* () {
+    process.env.PI_CODING_AGENT_DIR = noPresetAgentDir;
+    const fs = yield* FileSystem.FileSystem;
+    assert.deepEqual(yield* fs.readDirectory(noPresetAgentDir), []);
+
+    const adapter = yield* makePiAdapter();
+    const completed: string[] = [];
+    yield* adapter.streamEvents.pipe(
+      Stream.runForEach((event) =>
+        Effect.sync(() => {
+          if (event.type === "turn.completed") completed.push(event.turnId);
+        }),
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+
+    const session = yield* adapter.startSession(start);
+    assert.equal(session.status, "ready");
+    yield* adapter.sendTurn({ threadId, input: "ordinary user message" });
+
+    assert.deepEqual(prompts, ["ordinary user message"]);
+    assert.deepEqual(commandEntries, []);
+    assert.equal(completed.length, 1);
+    assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );
 
