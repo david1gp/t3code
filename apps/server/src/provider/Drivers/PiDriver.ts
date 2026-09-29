@@ -78,9 +78,10 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
               refreshOnCreate: false,
               allowModelNetwork: false,
             });
+            const sdkModels = runtime.getModels();
             return {
-              models: piModelsFromSdk(runtime.getModels()),
-              auth: piAuthFromSdk(runtime),
+              models: piModelsFromSdk(sdkModels),
+              auth: piAuthFromSdk(runtime, sdkModels),
             };
           },
           catch: (cause) =>

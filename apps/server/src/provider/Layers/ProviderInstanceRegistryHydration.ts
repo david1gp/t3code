@@ -16,8 +16,9 @@
  * mutable registry. For every built-in driver whose id is not already
  * present in `providerInstances` (keyed on
  * `defaultInstanceIdForDriver(driverKind)` — literally the driver kind as a
- * routing slug), we synthesize an envelope from the legacy field. The
- * registry decodes both flavours through the same `configSchema` and ends
+ * routing slug), we synthesize an envelope from the legacy field. Pi has no
+ * legacy settings field; ServerSettings backfills its default instance.
+ * The registry decodes all envelopes through the same `configSchema` and ends
  * up with one uniform `ProviderInstance` per entry.
  *
  * Explicit `providerInstances` entries always win — users can already

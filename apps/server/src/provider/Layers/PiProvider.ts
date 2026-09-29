@@ -1,5 +1,4 @@
 import { type PiSettings, type ServerProvider, type ServerProviderModel } from "@t3tools/contracts";
-import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import { createModelCapabilities } from "@t3tools/shared/model";
@@ -30,11 +29,20 @@ export function piModelsFromSdk(
 }
 
 export function piAuthFromSdk(
-  runtime: Pick<ModelRuntime, "getRegisteredProviderIds" | "getProviderAuthStatus">,
+  runtime: {
+    readonly getModels: () => ReadonlyArray<{ readonly provider: string }>;
+    readonly getRegisteredProviderIds: () => ReadonlyArray<string>;
+    readonly getProviderAuthStatus: (provider: string) => { readonly configured: boolean };
+  },
+  models: ReadonlyArray<{ readonly provider: string }> = runtime.getModels(),
 ) {
-  const configured = runtime
-    .getRegisteredProviderIds()
-    .some((provider) => runtime.getProviderAuthStatus(provider).configured);
+  const providerIds = new Set([
+    ...runtime.getRegisteredProviderIds(),
+    ...models.map((model) => model.provider),
+  ]);
+  const configured = [...providerIds].some(
+    (provider) => runtime.getProviderAuthStatus(provider).configured,
+  );
   return { status: configured ? "authenticated" : "unauthenticated" } as const;
 }
 

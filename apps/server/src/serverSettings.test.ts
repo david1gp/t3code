@@ -610,6 +610,85 @@ it.layer(NodeServices.layer)("server settings", (it) => {
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
+  it.effect("backfills and persists an enabled Pi instance for existing sparse settings", () =>
+    Effect.gen(function* () {
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      yield* fileSystem.writeFileString(serverConfig.settingsPath, "{}");
+
+      const settings = yield* serverSettings.getSettings;
+      assert.deepEqual(settings.providerInstances[ProviderInstanceId.make("pi")], {
+        driver: ProviderDriverKind.make("pi"),
+        enabled: true,
+        config: {},
+      });
+      assert.isFalse(settings.providers.grok.enabled);
+      assert.isFalse(settings.providers.opencode.enabled);
+      assert.isFalse(settings.providers.cursor.enabled);
+
+      const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      assert.deepEqual(JSON.parse(raw).providerInstances, {
+        pi: settings.providerInstances[ProviderInstanceId.make("pi")],
+      });
+      yield* serverSettings.updateSettings({ addProjectBaseDirectory: "~/Development" });
+      const updated = yield* serverSettings.getSettings;
+      assert.deepEqual(updated.providerInstances, settings.providerInstances);
+      const updatedRaw = yield* fileSystem.readFileString(serverConfig.settingsPath);
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      assert.deepEqual(JSON.parse(updatedRaw).providerInstances, {
+        pi: settings.providerInstances[ProviderInstanceId.make("pi")],
+      });
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("keeps an explicitly disabled default Pi instance disabled", () =>
+    Effect.gen(function* () {
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const original = '{"providerInstances":{"pi":{"driver":"pi","enabled":false,"config":{}}}}';
+      yield* fileSystem.writeFileString(serverConfig.settingsPath, original);
+
+      const settings = yield* serverSettings.getSettings;
+      assert.deepEqual(settings.providerInstances[ProviderInstanceId.make("pi")], {
+        driver: ProviderDriverKind.make("pi"),
+        enabled: false,
+        config: {},
+      });
+      assert.equal(yield* fileSystem.readFileString(serverConfig.settingsPath), original);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("preserves an explicitly disabled or custom Pi instance on load", () =>
+    Effect.gen(function* () {
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const original =
+        '{"providerInstances":{"pi_work":{"driver":"pi","enabled":false,"config":{"customModels":["custom/model"]}}}}';
+      yield* fileSystem.writeFileString(serverConfig.settingsPath, original);
+
+      const settings = yield* serverSettings.getSettings;
+      assert.isUndefined(settings.providerInstances[ProviderInstanceId.make("pi")]);
+      assert.deepEqual(settings.providerInstances[ProviderInstanceId.make("pi_work")], {
+        driver: ProviderDriverKind.make("pi"),
+        enabled: false,
+        config: { customModels: ["custom/model"] },
+      });
+      assert.equal(yield* fileSystem.readFileString(serverConfig.settingsPath), original);
+      const updated = yield* serverSettings.updateSettings({
+        addProjectBaseDirectory: "~/Development",
+      });
+      assert.isUndefined(updated.providerInstances[ProviderInstanceId.make("pi")]);
+      assert.deepEqual(
+        updated.providerInstances[ProviderInstanceId.make("pi_work")],
+        settings.providerInstances[ProviderInstanceId.make("pi_work")],
+      );
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
   it.effect("preserves existing provider instances without explicit enabled flags", () =>
     Effect.gen(function* () {
       const serverConfig = yield* ServerConfig.ServerConfig;
@@ -1051,6 +1130,9 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             serverPassword: "secret-password",
           },
         },
+        providerInstances: {
+          pi: { driver: "pi", enabled: true, config: {} },
+        },
         backgroundActivity: {
           schemaVersion: 1,
           profile: "custom",
@@ -1095,6 +1177,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       const original =
         '{"providerInstances":{"codex_personal":{"driver":"codex","environment":[{"name":"API_TOKEN","value":"inline-test-token","sensitive":true}],"config":{}}}}';
       yield* fs.writeFileString(config.settingsPath, original);
+      yield* service.getSettings;
+      const beforeUpdate = yield* fs.readFileString(config.settingsPath);
       const error = yield* Effect.flip(
         service.updateSettings({
           providerInstances: {
@@ -1108,7 +1192,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       );
       assert.equal(error.operation, "write-secret");
       assert.strictEqual(error.cause, cause);
-      assert.equal(yield* fs.readFileString(config.settingsPath), original);
+      assert.equal(yield* fs.readFileString(config.settingsPath), beforeUpdate);
       const settings = yield* service.getSettings;
       assert.equal(
         settings.providerInstances[instanceId]?.environment?.[0]?.value,

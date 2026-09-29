@@ -10,7 +10,7 @@ describe("Pi built-in driver", () => {
   it("registers Pi with SDK-only settings", () => {
     expect(BUILT_IN_DRIVERS.some((driver) => driver.driverKind === "pi")).toBe(true);
     expect(decodePiSettings({})).toMatchObject({
-      enabled: false,
+      enabled: true,
       customModels: [],
     });
     expect(PiSettings.fields).not.toHaveProperty("binaryPath");

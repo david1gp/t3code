@@ -15,6 +15,7 @@ import {
   DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_SERVER_SETTINGS,
+  defaultInstanceIdForDriver,
   ModelSelection,
   ProjectScript,
   type ProjectSettingsOverrides,
@@ -115,12 +116,28 @@ const foldProviderInstanceEnabledFlags = (settings: ServerSettings): ServerSetti
   };
 };
 
+/** Give Pi a durable default slot without overriding any user-configured Pi instance. */
+const backfillPiInstance = (settings: ServerSettings): ServerSettings => {
+  if (Object.values(settings.providerInstances).some((instance) => instance.driver === "pi")) {
+    return settings;
+  }
+  const driver = ProviderDriverKind.make("pi");
+  return {
+    ...settings,
+    providerInstances: {
+      ...settings.providerInstances,
+      [defaultInstanceIdForDriver(driver)]: { driver, enabled: true, config: {} },
+    },
+  };
+};
+
 const normalizeServerSettings = (
   settings: ServerSettings,
 ): Effect.Effect<ServerSettings, ServerSettingsError> =>
   encodeServerSettings(settings).pipe(
     Effect.flatMap(decodeServerSettings),
     Effect.map(foldProviderInstanceEnabledFlags),
+    Effect.map(backfillPiInstance),
     Effect.map((next) => ({ ...next, ...deriveLegacyProjectOverrides(next) })),
     Effect.mapError(
       (cause) =>
@@ -639,10 +656,11 @@ const make = Effect.gen(function* () {
     const folded = settingsFileTrusted
       ? foldLegacyProjectSettings(loaded, legacyProjectRows)
       : loaded;
-    if (folded !== loaded) {
-      yield* writeSettingsAtomically(folded);
+    const backfilled = backfillPiInstance(folded);
+    if (settingsFileTrusted && (folded !== loaded || backfilled !== folded)) {
+      yield* writeSettingsAtomically(backfilled);
     }
-    return folded;
+    return backfilled;
   });
 
   const settingsCache = yield* Cache.make<typeof cacheKey, ServerSettings, ServerSettingsError>({

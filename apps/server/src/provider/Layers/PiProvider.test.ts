@@ -47,10 +47,17 @@ describe("Pi provider catalog", () => {
       }),
   );
 
-  it("maps SDK credential availability to provider auth without exposing credentials", () => {
+  it("counts configured custom model providers and ignores catalog-only providers", () => {
     const runtime = {
       getRegisteredProviderIds: () => ["anthropic", "openai"],
-      getProviderAuthStatus: (provider: string) => ({ configured: provider === "anthropic" }),
+      getModels: () => [
+        { provider: "codex-lb", id: "gpt-6-luna" },
+        { provider: "catalog-only", id: "model" },
+      ],
+      getProviderAuthStatus: (provider: string) => ({
+        configured: provider === "codex-lb",
+        ...(provider === "codex-lb" ? { source: "environment" as const } : {}),
+      }),
     };
     expect(piAuthFromSdk(runtime)).toEqual({ status: "authenticated" });
     expect(
@@ -61,15 +68,16 @@ describe("Pi provider catalog", () => {
     ).toEqual({ status: "unauthenticated" });
   });
 
-  it.effect("defaults Pi to disabled with no fabricated catalog", () =>
+  it.effect("starts enabled while checking the SDK without fabricating a catalog", () =>
     Effect.gen(function* () {
       const settings = decodePiSettings({});
       const snapshot = yield* buildInitialPiProviderSnapshot(settings);
       expect(snapshot).toMatchObject({
-        enabled: false,
-        status: "disabled",
+        enabled: true,
+        status: "warning",
         auth: { status: "unknown" },
         models: [],
+        message: "Checking embedded Pi SDK availability...",
       });
     }),
   );

@@ -768,7 +768,7 @@ export type GrokSettings = typeof GrokSettings.Type;
 
 export const PiSettings = makeProviderSettingsSchema({
   enabled: Schema.Boolean.pipe(
-    Schema.withDecodingDefault(Effect.succeed(false)),
+    Schema.withDecodingDefault(Effect.succeed(true)),
     Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
   ),
   customModels: Schema.Array(CustomModelSetting).pipe(
