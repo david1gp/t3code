@@ -1353,6 +1353,34 @@ export const openCodeNativeSessionEngineCreate = (input: {
         );
       }
     },
+    /** Context window of a model, or undefined when the server does not report one. */
+    contextLimit: async (model: {
+      readonly id: string;
+      readonly providerID: string;
+    }): Promise<number | undefined> => {
+      if (!session) return undefined;
+      try {
+        const response = await requestWithDeadline(abort?.signal, (signal) =>
+          client.model.list({ location: { directory: session!.location.directory } }, { signal }),
+        );
+        const models = (response as { readonly data?: ReadonlyArray<unknown> }).data ?? [];
+        for (const entry of models) {
+          const info = record(entry);
+          if (
+            info?.providerID !== model.providerID ||
+            (info.id !== model.id && info.modelID !== model.id)
+          )
+            continue;
+          const limit = record(info.limit)?.context;
+          return typeof limit === "number" && Number.isFinite(limit) && limit > 0
+            ? Math.floor(limit)
+            : undefined;
+        }
+      } catch {
+        // The meter is optional; a missing limit only drops the percentage.
+      }
+      return undefined;
+    },
     recover: async (): Promise<Result<void>> =>
       fail(
         "session.recover",

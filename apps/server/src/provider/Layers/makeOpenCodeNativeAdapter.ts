@@ -142,6 +142,7 @@ type ChildEvent = Extract<NativeEvent, { type: "child.attached" | "child.updated
 type Child = {
   readonly turnId: TurnId;
   readonly parentId: string;
+  parentToolKey: string | undefined;
   info: ChildEvent["info"];
   status: "running" | "completed" | "failed" | "stopped";
   readonly steps: Map<
@@ -173,6 +174,8 @@ type Context = {
     }
   >;
   readonly children: Map<string, Child>;
+  /** undefined = not looked up yet, null = server reported no limit. */
+  contextLimit: number | null | undefined;
   readonly permissions: Map<string, Extract<NativeEvent, { type: "permission.asked" }>["request"]>;
   readonly forms: Map<string, NativeForm>;
   readonly settledRequests: Set<string>;
@@ -281,6 +284,8 @@ export const makeOpenCodeNativeAdapter = (options: {
         taskType: "subagent",
         agentKind: "agent" as const,
         runHandles: { sessionUrl: url.toString() },
+        // Lets clients replace the launch tool row with the agent row.
+        ...(child.parentToolKey ? { toolUseId: `opencode:${child.parentToolKey}` } : {}),
         ...(child.info.title?.trim() ? { title: child.info.title } : {}),
         ...(child.info.agent?.trim() ? { role: child.info.agent } : {}),
         ...(child.info.model
@@ -306,6 +311,52 @@ export const makeOpenCodeNativeAdapter = (options: {
         toolUses: child.tools.size,
         costUsd: steps.reduce((n, step) => n + step.cost, 0),
       };
+    };
+    // The last step's prompt size is the live context size (same rule as the legacy adapter).
+    const contextUsageEmit = (
+      ctx: Context,
+      turnId: TurnId,
+      tokens: {
+        input: number;
+        output: number;
+        reasoning: number;
+        cache: { read: number; write: number };
+      },
+    ) => {
+      const n = (value: number) => (Number.isFinite(value) && value > 0 ? Math.round(value) : 0);
+      const inputTokens = n(tokens.input) + n(tokens.cache.read) + n(tokens.cache.write);
+      const usedTokens = inputTokens + n(tokens.output);
+      if (usedTokens <= 0) return;
+      const emitUsage = () =>
+        emit({
+          type: "thread.token-usage.updated",
+          ...base(ctx, turnId),
+          payload: {
+            usage: {
+              usedTokens,
+              lastUsedTokens: usedTokens,
+              ...(ctx.contextLimit ? { maxTokens: ctx.contextLimit } : {}),
+              inputTokens,
+              cachedInputTokens: n(tokens.cache.read),
+              outputTokens: n(tokens.output),
+              reasoningOutputTokens: n(tokens.reasoning),
+              lastInputTokens: inputTokens,
+              lastCachedInputTokens: n(tokens.cache.read),
+              lastOutputTokens: n(tokens.output),
+              lastReasoningOutputTokens: n(tokens.reasoning),
+            },
+          },
+        });
+      const [providerID, ...rest] = ctx.session.model?.split("/") ?? [];
+      if (ctx.contextLimit !== undefined || !providerID || !rest.length) return emitUsage();
+      void ctx.engine
+        .contextLimit({ providerID, id: rest.join("/") })
+        .then((limit) => {
+          ctx.contextLimit = limit ?? null;
+        })
+        .finally(() => {
+          if (!ctx.lost) emitUsage();
+        });
     };
     const onEvent = (ctx: Context, event: NativeEvent) => {
       if (event.type === "session.ready") return;
@@ -450,6 +501,7 @@ export const makeOpenCodeNativeAdapter = (options: {
           const next: Child = {
             turnId: parent?.turnId ?? TurnId.make(childEvent.turnID),
             parentId: childEvent.parentSessionID,
+            parentToolKey: childEvent.parentToolKey,
             info,
             status: "running",
             steps: new Map(),
@@ -475,6 +527,7 @@ export const makeOpenCodeNativeAdapter = (options: {
           child.status !== "running"
         )
           return;
+        child.parentToolKey ??= childEvent.parentToolKey;
         if (childEvent.type === "child.updated") {
           child.info = { ...child.info, ...childEvent.info };
           emit({
@@ -593,11 +646,13 @@ export const makeOpenCodeNativeAdapter = (options: {
         return;
       }
       if (event.type === "step.completed") {
-        if (turnId && event.sessionID === ctx.sessionId)
+        if (turnId && event.sessionID === ctx.sessionId) {
           ctx.usage.set(event.step.assistantMessageID, {
             ...event.step.tokens,
             cost: event.step.cost,
           });
+          contextUsageEmit(ctx, turnId, event.step.tokens);
+        }
         return;
       }
       // Session totals are cumulative, not turn totals; child events have separate ancestry.
@@ -674,7 +729,9 @@ export const makeOpenCodeNativeAdapter = (options: {
             ? "command_execution"
             : event.tool.name === "edit" || event.tool.name === "write"
               ? "file_change"
-              : "dynamic_tool_call";
+              : event.tool.name === "subagent" || event.tool.name === "task"
+                ? "collab_agent_tool_call"
+                : "dynamic_tool_call";
         emit({
           type:
             event.type === "tool.started"
@@ -807,6 +864,7 @@ export const makeOpenCodeNativeAdapter = (options: {
             fragments: new Map(),
             usage: new Map(),
             children: new Map(),
+            contextLimit: undefined,
             permissions: new Map(),
             forms: new Map(),
             settledRequests: new Set(),

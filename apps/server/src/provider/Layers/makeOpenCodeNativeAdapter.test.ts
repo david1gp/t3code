@@ -89,6 +89,8 @@ function fakeEngine() {
           : { success: true as const, data: undefined };
       },
       recover: async () => ({ success: false as const, error: { detail: "Not supported" } }),
+      contextLimit: async (_model: { readonly id: string; readonly providerID: string }) =>
+        200_000 as number | undefined,
       reconcilePending: async () => ({ success: true as const, data: undefined }),
       replyPermission: async (id: string, decision: string) => {
         calls.push(`permission:${id}:${decision}`);
@@ -381,8 +383,19 @@ it.effect(
           "item.started",
           "item.updated",
           "item.completed",
+          "thread.token-usage.updated",
           "turn.completed",
         ],
+      );
+      const context = events.find((event) => event.type === "thread.token-usage.updated");
+      assert.deepStrictEqual(
+        context?.type === "thread.token-usage.updated" && {
+          usedTokens: context.payload.usage.usedTokens,
+          inputTokens: context.payload.usage.inputTokens,
+          turnId: context.turnId,
+        },
+        // The step's prompt (input + cache) plus its output is the live context size.
+        { usedTokens: 19, inputTokens: 14, turnId: turn.turnId },
       );
       assert.deepStrictEqual(
         events.filter((event) => event.type === "content.delta").map((event) => event.payload),
