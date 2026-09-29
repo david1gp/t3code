@@ -38,6 +38,9 @@ function fakeEngine() {
   let rejectStop = false;
   let rejectInterrupt = false;
   let rejectNextStopDirectory: string | undefined;
+  let rejectSwitch = false;
+  let uncertainSwitch = false;
+  let running: string | undefined;
   let sends = 0;
   const create = ((input: Parameters<typeof openCodeNativeSessionEngineCreate>[0]) => {
     receive = input.onEvent;
@@ -55,6 +58,35 @@ function fakeEngine() {
           success: true as const,
           data: { id: "ses_native", location: { directory: options.directory } },
         };
+      },
+      switchSelection: async (selection: {
+        readonly model?: {
+          readonly id: string;
+          readonly providerID: string;
+          readonly variant?: string;
+        };
+        readonly agent?: string;
+      }) => {
+        calls.push(
+          `switch:${selection.model ? `${selection.model.providerID}/${selection.model.id}@${selection.model.variant ?? ""}` : ""}:${selection.agent ?? ""}`,
+        );
+        if (uncertainSwitch)
+          return { success: false as const, error: { detail: "Interrupt outcome uncertain." } };
+        if (rejectSwitch)
+          return {
+            success: false as const,
+            rejected: true as const,
+            error: { detail: "Switch failed." },
+          };
+        // The real engine interrupts a running turn and waits for its terminal.
+        if (running)
+          receive({
+            type: "turn.failed",
+            turnID: running,
+            reason: "interrupted",
+            interruptionReason: "user",
+          });
+        return { success: true as const, data: undefined };
       },
       send: async (text: string) => {
         calls.push(`send:${text}`);
@@ -125,6 +157,15 @@ function fakeEngine() {
     },
     failStop: () => {
       rejectStop = true;
+    },
+    failSwitch: () => {
+      rejectSwitch = true;
+    },
+    failSwitchUncertain: () => {
+      uncertainSwitch = true;
+    },
+    setRunning: (turnID: string | undefined) => {
+      running = turnID;
     },
     failInterrupt: () => {
       rejectInterrupt = true;
@@ -253,6 +294,186 @@ it.effect("removes a stopped session locally and reports uncertain remote interr
     );
     assert.equal(yield* adapter.hasSession(threadId), false);
     assert.deepStrictEqual(yield* adapter.listSessions(), []);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("switches model and agent inside the existing native session", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const instanceId = ProviderInstanceId.make("opencode");
+    yield* adapter.startSession({
+      ...start,
+      modelSelection: {
+        instanceId,
+        model: "openai/gpt-5",
+        options: [
+          { id: "variant", value: "high" },
+          { id: "agent", value: "build" },
+        ],
+      },
+    });
+    // Same selection, options reordered: no switch.
+    const first = yield* adapter.sendTurn({
+      threadId,
+      input: "same",
+      modelSelection: {
+        instanceId,
+        model: "openai/gpt-5",
+        options: [
+          { id: "agent", value: "build" },
+          { id: "variant", value: "high" },
+        ],
+      },
+    });
+    fake.emit({ type: "turn.started", turnID: first.turnId });
+    fake.emit({ type: "turn.completed", turnID: first.turnId });
+    // Agent only.
+    const second = yield* adapter.sendTurn({
+      threadId,
+      input: "plan it",
+      modelSelection: {
+        instanceId,
+        model: "openai/gpt-5",
+        options: [
+          { id: "variant", value: "high" },
+          { id: "agent", value: "plan" },
+        ],
+      },
+    });
+    fake.emit({ type: "turn.started", turnID: second.turnId });
+    fake.emit({ type: "turn.completed", turnID: second.turnId });
+    // Model only.
+    yield* adapter.sendTurn({
+      threadId,
+      input: "build it",
+      modelSelection: {
+        instanceId,
+        model: "anthropic/claude-sonnet",
+        options: [
+          { id: "variant", value: "high" },
+          { id: "agent", value: "plan" },
+        ],
+      },
+    });
+    assert.deepStrictEqual(fake.calls, [
+      "start:/tmp/native-v2",
+      "send:same",
+      "switch::plan",
+      "send:plan it",
+      "switch:anthropic/claude-sonnet@high:",
+      "send:build it",
+    ]);
+    const [session] = yield* adapter.listSessions();
+    assert.equal(session?.model, "anthropic/claude-sonnet");
+    assert.deepStrictEqual(session?.resumeCursor, { schemaVersion: 1, sessionId: "ses_native" });
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("interrupts the running turn and starts a new one when switching mid-turn", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const events: Array<ProviderRuntimeEvent> = [];
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.sync(() => void events.push(event)),
+    ).pipe(Effect.forkChild);
+    const instanceId = ProviderInstanceId.make("opencode");
+    yield* adapter.startSession({
+      ...start,
+      modelSelection: { instanceId, model: "openai/gpt-5" },
+    });
+    const first = yield* adapter.sendTurn({ threadId, input: "long job" });
+    fake.emit({ type: "turn.started", turnID: first.turnId });
+    fake.setRunning(first.turnId);
+    const next = yield* adapter.sendTurn({
+      threadId,
+      input: "do this instead",
+      modelSelection: { instanceId, model: "anthropic/claude-sonnet" },
+    });
+    assert.notEqual(next.turnId, first.turnId);
+    yield* Effect.yieldNow;
+    assert.deepStrictEqual(
+      events
+        .filter((event) => event.type === "turn.completed" && event.turnId === first.turnId)
+        .map((event) => event.type === "turn.completed" && event.payload.state),
+      ["interrupted"],
+    );
+    assert.deepStrictEqual(fake.calls, [
+      "start:/tmp/native-v2",
+      "send:long job",
+      "switch:anthropic/claude-sonnet@:",
+      "send:do this instead",
+    ]);
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("takes the session offline when a mid-turn switch cannot confirm the interrupt", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const instanceId = ProviderInstanceId.make("opencode");
+    yield* adapter.startSession({
+      ...start,
+      modelSelection: { instanceId, model: "openai/gpt-5" },
+    });
+    fake.failSwitchUncertain();
+    const error = yield* adapter
+      .sendTurn({
+        threadId,
+        input: "switch",
+        modelSelection: { instanceId, model: "anthropic/claude-sonnet" },
+      })
+      .pipe(Effect.flip);
+    assert.equal(error._tag, "ProviderAdapterRequestError");
+    assert.equal(yield* adapter.hasSession(threadId), false);
+    assert.deepStrictEqual(fake.calls, [
+      "start:/tmp/native-v2",
+      "switch:anthropic/claude-sonnet@:",
+    ]);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("does not send the prompt when the native switch is rejected", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const instanceId = ProviderInstanceId.make("opencode");
+    yield* adapter.startSession({
+      ...start,
+      modelSelection: { instanceId, model: "openai/gpt-5" },
+    });
+    fake.failSwitch();
+    const error = yield* adapter
+      .sendTurn({
+        threadId,
+        input: "switch",
+        modelSelection: {
+          instanceId,
+          model: "openai/gpt-5",
+          options: [{ id: "agent", value: "plan" }],
+        },
+      })
+      .pipe(Effect.flip);
+    assert.equal(error._tag, "ProviderAdapterRequestError");
+    assert.equal(yield* adapter.hasSession(threadId), true);
+    assert.equal((yield* adapter.listSessions())[0]?.model, "openai/gpt-5");
+    assert.deepStrictEqual(fake.calls, ["start:/tmp/native-v2", "switch::plan"]);
+    yield* adapter.stopSession(threadId);
   }).pipe(Effect.provide(testLayer)),
 );
 
@@ -499,7 +720,7 @@ it.effect(
             threadId,
             input: "hello",
             modelSelection: {
-              instanceId: ProviderInstanceId.make("opencode"),
+              instanceId: ProviderInstanceId.make("other"),
               model: "openai/gpt",
             },
           })
@@ -667,7 +888,7 @@ it.effect("reports a failed interrupt as session loss without completing the tur
 );
 
 it.effect(
-  "starts the reactor's first-turn model selection on the native session and sends without switching models",
+  "starts the reactor's first-turn model selection on the native session and switches variants in place",
   () =>
     Effect.gen(function* () {
       const fake = fakeEngine();
@@ -710,20 +931,25 @@ it.effect(
       ]);
       const turn = yield* adapter.sendTurn({ threadId, input: "hello", modelSelection: selection });
       assert.equal(turn.turnId, "msg_user_1");
-      assert.equal(
-        (yield* adapter
-          .sendTurn({
-            threadId,
-            input: "switch",
-            modelSelection: {
-              ...selection,
-              options: [{ id: "variant", value: "low" }],
-            },
-          })
-          .pipe(Effect.flip))._tag,
-        "ProviderAdapterValidationError",
-      );
-      assert.deepStrictEqual(fake.calls, ["start:/tmp/native-v2", "send:hello"]);
+      fake.emit({ type: "turn.started", turnID: turn.turnId });
+      fake.emit({ type: "turn.completed", turnID: turn.turnId });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "switch",
+        modelSelection: {
+          ...selection,
+          options: [
+            { id: "variant", value: "low" },
+            { id: "agent", value: "build" },
+          ],
+        },
+      });
+      assert.deepStrictEqual(fake.calls, [
+        "start:/tmp/native-v2",
+        "send:hello",
+        "switch:openai/gpt-5.2/codex@low:",
+        "send:switch",
+      ]);
       yield* adapter.stopSession(threadId);
     }).pipe(Effect.provide(testLayer)),
 );

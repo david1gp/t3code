@@ -1126,15 +1126,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         canonicalEvent.type === "turn.completed" ||
         canonicalEvent.type === "turn.aborted"
       ) {
-        const nativeOpenCodeAdapter =
-          source.provider === "opencode"
-            ? yield* registry.getByInstance(source.instanceId).pipe(Effect.option)
-            : Option.none<ProviderAdapterShape<ProviderAdapterError>>();
-        if (
-          canonicalEvent.turnId !== undefined &&
-          Option.isSome(nativeOpenCodeAdapter) &&
-          nativeOpenCodeAdapter.value.capabilities.sessionModelSwitch === "unsupported"
-        ) {
+        if (canonicalEvent.turnId !== undefined && source.provider === "opencode") {
           pendingOpenCodeAdmissions.get(canonicalEvent.threadId)?.add(canonicalEvent.turnId);
           yield* settleOpenCodeBinding(canonicalEvent.threadId, canonicalEvent.turnId).pipe(
             Effect.catch((cause) =>
@@ -1765,11 +1757,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       yield* McpSessionRegistry.touchActiveMcpThread(input.threadId);
       const analyticsModelSelection =
         input.modelSelection?.instanceId === routed.instanceId ? input.modelSelection : undefined;
-      pendingTerminals =
-        routed.adapter.provider === "opencode" &&
-        routed.adapter.capabilities.sessionModelSwitch === "unsupported"
-          ? new Set<string>()
-          : undefined;
+      pendingTerminals = routed.adapter.provider === "opencode" ? new Set<string>() : undefined;
       if (pendingTerminals) pendingOpenCodeAdmissions.set(input.threadId, pendingTerminals);
       const turn = yield* Effect.acquireUseRelease(
         beginTurnAnalytics({

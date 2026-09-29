@@ -89,10 +89,12 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
   let pendingPermissions: Record<string, unknown>[] = [];
   let pendingForms: Record<string, unknown>[] = [];
   const replies: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const switches: Array<{ path: string; body: Record<string, unknown> }> = [];
   let rejectReplies = false;
   let rejectInterrupt = false;
   let interrupted = true;
   let prompts = 0;
+  let interrupts = 0;
   let heldPermissionList: NodeHttp.ServerResponse | undefined;
   let permissionListRequested: (() => void) | undefined;
   let heldFormList: NodeHttp.ServerResponse | undefined;
@@ -156,7 +158,15 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
       );
       return;
     }
+    if (req.url?.endsWith("/model") || req.url?.endsWith("/agent")) {
+      void bodyRead(req).then((body) => {
+        switches.push({ path: req.url!, body });
+        res.writeHead(204).end();
+      });
+      return;
+    }
     if (req.url?.endsWith("/interrupt")) {
+      interrupts++;
       if (rejectInterrupt) res.writeHead(503).end();
       else send(res, { interrupted });
       return;
@@ -177,9 +187,11 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
     engine,
     write,
     promptCount: () => prompts,
+    interrupts: () => interrupts,
     disconnect: () => stream!.end(),
     logReads: () => logReads,
     replies,
+    switches,
     setPending: (permissions: Record<string, unknown>[], forms: Record<string, unknown>[]) => {
       pendingPermissions = permissions;
       pendingForms = forms;
@@ -362,6 +374,66 @@ describe("native v2.0.18 session slice", () => {
     } finally {
       vi.useRealTimers();
       stalled.resume();
+      await test.close();
+    }
+  });
+
+  it("switches model and agent on an idle session without interrupting", async () => {
+    const test = await sessionFixture();
+    try {
+      const model = { id: "claude-sonnet", providerID: "anthropic", variant: "high" };
+      expect(await test.engine.switchSelection({ model, agent: "plan" })).toEqual({
+        success: true,
+        data: undefined,
+      });
+      expect(test.switches).toEqual([
+        { path: "/api/session/ses_fixture/model", body: { model } },
+        { path: "/api/session/ses_fixture/agent", body: { agent: "plan" } },
+      ]);
+      expect(test.interrupts()).toBe(0);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("interrupts a running turn, waits for its terminal, then switches and starts a new turn", async () => {
+    const test = await sessionFixture();
+    try {
+      const first = await test.admit();
+      test.write("session.execution.started");
+      const switching = test.engine.switchSelection({ agent: "plan" });
+      // Sends are held while the old turn winds down, so nothing steers into it.
+      expect(await test.engine.send("too early")).toMatchObject({ success: false, rejected: true });
+      test.write("session.execution.interrupted", { reason: "user" });
+      expect(await switching).toEqual({ success: true, data: undefined });
+      expect(test.interrupts()).toBe(1);
+      expect(test.switches).toEqual([
+        { path: "/api/session/ses_fixture/agent", body: { agent: "plan" } },
+      ]);
+      expect(
+        test.events.find((event) => event.type === "turn.failed" && event.turnID === first),
+      ).toMatchObject({ reason: "interrupted" });
+      const next = await test.engine.send("after switch");
+      expect(next.success && next.data.turnID).not.toBe(first);
+      expect(test.promptCount()).toBe(2);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("fails closed when an interrupt for a switch never confirms", async () => {
+    const test = await sessionFixture();
+    try {
+      await test.admit();
+      test.write("session.execution.started");
+      test.failInterrupt();
+      expect(await test.engine.switchSelection({ agent: "plan" })).toMatchObject({
+        success: false,
+        error: { operation: "session.interrupt" },
+      });
+      expect(test.switches).toEqual([]);
+      expect(await test.engine.send("blocked")).toMatchObject({ success: false });
+    } finally {
       await test.close();
     }
   });

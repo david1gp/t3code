@@ -478,13 +478,7 @@ function makeProviderServiceLayer(
 const nativeOpenCode = makeFakeCodexAdapter(ProviderDriverKind.make("opencode"));
 makeProviderServiceLayer({
   registry: makeStaticInstanceRegistry([
-    [
-      ProviderInstanceId.make("opencode"),
-      {
-        ...nativeOpenCode.adapter,
-        capabilities: { ...nativeOpenCode.adapter.capabilities, sessionModelSwitch: "unsupported" },
-      },
-    ],
+    [ProviderInstanceId.make("opencode"), nativeOpenCode.adapter],
   ]),
 }).layer("OpenCode early terminal binding", (it) => {
   it.effect("does not persist a turn that completed before the send receipt", () =>

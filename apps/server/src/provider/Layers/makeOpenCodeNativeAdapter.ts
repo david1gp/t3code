@@ -35,6 +35,15 @@ type NativeEvent = Parameters<
   Parameters<typeof openCodeNativeSessionEngineCreate>[0]["onEvent"]
 >[0];
 type Engine = ReturnType<typeof openCodeNativeSessionEngineCreate>;
+type Selection = ProviderSessionStartInput["modelSelection"];
+const selectionEquals = (a: NonNullable<Selection>, b: Selection) =>
+  b !== undefined &&
+  a.instanceId === b.instanceId &&
+  a.model === b.model &&
+  (a.options ?? []).length === (b.options ?? []).length &&
+  (a.options ?? []).every((option) =>
+    (b.options ?? []).some((prior) => prior.id === option.id && prior.value === option.value),
+  );
 type NativeForm = Extract<NativeEvent, { type: "form.created" }>["form"];
 type NativeField = NativeForm["fields"][number];
 const requestType = (action: string) =>
@@ -161,7 +170,7 @@ type Context = {
   session: ProviderSession;
   readonly engine: Engine;
   readonly sessionId: string;
-  readonly modelSelection: ProviderSessionStartInput["modelSelection"];
+  modelSelection: ProviderSessionStartInput["modelSelection"];
   readonly fragments: Map<string, string>;
   readonly usage: Map<
     string,
@@ -237,6 +246,43 @@ export const makeOpenCodeNativeAdapter = (options: {
           detail: "Native OpenCode v2 does not yet support this T3 operation.",
         }),
       );
+    /** Splits a T3 selection into the native model ref and agent, rejecting anything else. */
+    const nativeSelection = (
+      operation: "startSession" | "sendTurn",
+      selection: ProviderSessionStartInput["modelSelection"],
+    ) => {
+      if (!selection) return Effect.succeed(undefined);
+      const [providerID, ...modelParts] = selection.model.split("/");
+      const id = modelParts.join("/");
+      const options = selection.options ?? [];
+      const variant = options.find((option) => option.id === "variant")?.value;
+      const agent = options.find((option) => option.id === "agent")?.value;
+      if (
+        selection.instanceId !== instanceId ||
+        !providerID?.trim() ||
+        !id.trim() ||
+        options.some((option) => option.id !== "variant" && option.id !== "agent") ||
+        new Set(options.map((option) => option.id)).size !== options.length ||
+        (variant !== undefined && (typeof variant !== "string" || !variant.trim())) ||
+        (agent !== undefined && (typeof agent !== "string" || !agent.trim()))
+      )
+        return Effect.fail(
+          new ProviderAdapterValidationError({
+            provider,
+            operation,
+            issue:
+              "Native v2 model selection requires a bound provider/model and supported string options.",
+          }),
+        );
+      return Effect.succeed({
+        model: {
+          id,
+          providerID,
+          ...(typeof variant === "string" ? { variant } : {}),
+        },
+        ...(typeof agent === "string" ? { agent } : {}),
+      });
+    };
     const requireSession = (threadId: ThreadId) => {
       const ctx = sessions.get(threadId);
       return ctx && !ctx.lost
@@ -772,7 +818,7 @@ export const makeOpenCodeNativeAdapter = (options: {
     > = {
       provider,
       capabilities: {
-        sessionModelSwitch: "unsupported",
+        sessionModelSwitch: "in-session",
         supportsConversationRollback: false,
       } as const,
       startSession: (input) =>
@@ -801,28 +847,7 @@ export const makeOpenCodeNativeAdapter = (options: {
             });
           const resumeSessionId = cursor?.sessionId as string | undefined;
           const selection = input.modelSelection;
-          const [providerID, ...modelParts] = selection?.model.split("/") ?? [];
-          const modelId = modelParts.join("/");
-          const selectionOptions = selection?.options ?? [];
-          const variant = selectionOptions.find((option) => option.id === "variant")?.value;
-          const agent = selectionOptions.find((option) => option.id === "agent")?.value;
-          if (
-            selection &&
-            (selection.instanceId !== instanceId ||
-              !providerID?.trim() ||
-              !modelId.trim() ||
-              selectionOptions.some((option) => option.id !== "variant" && option.id !== "agent") ||
-              new Set(selectionOptions.map((option) => option.id)).size !==
-                selectionOptions.length ||
-              (variant !== undefined && (typeof variant !== "string" || !variant.trim())) ||
-              (agent !== undefined && (typeof agent !== "string" || !agent.trim())))
-          )
-            return yield* new ProviderAdapterValidationError({
-              provider,
-              operation: "startSession",
-              issue:
-                "Native v2 model selection requires a bound provider/model and supported string options.",
-            });
+          const parsed = yield* nativeSelection("startSession", selection);
           if (sessions.has(input.threadId))
             return yield* new ProviderAdapterValidationError({
               provider,
@@ -844,16 +869,8 @@ export const makeOpenCodeNativeAdapter = (options: {
               directory: cwd,
               ...(resumeSessionId ? { resumeSessionId } : {}),
               ...(input.title ? { title: input.title } : {}),
-              ...(selection && providerID
-                ? {
-                    model: {
-                      id: modelId,
-                      providerID,
-                      ...(typeof variant === "string" ? { variant } : {}),
-                    },
-                  }
-                : {}),
-              ...(typeof agent === "string" ? { agent } : {}),
+              ...(parsed?.model ? { model: parsed.model } : {}),
+              ...(parsed?.agent ? { agent: parsed.agent } : {}),
             }),
           );
           const timestamp = now();
@@ -907,22 +924,48 @@ export const makeOpenCodeNativeAdapter = (options: {
               issue:
                 "Native v2 currently supports plain text turns only (no attachments, plan mode or continuation).",
             });
-          if (
-            input.modelSelection &&
-            (input.modelSelection.instanceId !== instanceId ||
-              input.modelSelection.model !== ctx.session.model ||
-              (input.modelSelection.options ?? []).length !==
-                (ctx.modelSelection?.options ?? []).length ||
-              !(input.modelSelection.options ?? []).every((option, index) => {
-                const prior = ctx.modelSelection?.options?.[index];
-                return option.id === prior?.id && option.value === prior.value;
-              }))
-          )
-            return yield* new ProviderAdapterValidationError({
-              provider,
-              operation: "sendTurn",
-              issue: "Native v2 cannot change models in an existing session.",
-            });
+          const next = input.modelSelection;
+          if (next && !selectionEquals(next, ctx.modelSelection)) {
+            const parsed = yield* nativeSelection("sendTurn", next);
+            const prior = ctx.modelSelection;
+            const priorVariant = prior?.options?.find((option) => option.id === "variant")?.value;
+            const priorAgent = prior?.options?.find((option) => option.id === "agent")?.value;
+            // OpenCode switches are sticky setters: only send the parts that changed. A running
+            // turn is interrupted first, so this prompt starts a new turn on the new selection.
+            const switchModel =
+              parsed?.model &&
+              (next.model !== ctx.session.model || parsed.model.variant !== priorVariant)
+                ? parsed.model
+                : undefined;
+            const switchAgent =
+              parsed?.agent && parsed.agent !== priorAgent ? parsed.agent : undefined;
+            if (switchModel || switchAgent) {
+              const switched = yield* Effect.promise(() =>
+                ctx.engine.switchSelection({
+                  ...(switchModel ? { model: switchModel } : {}),
+                  ...(switchAgent ? { agent: switchAgent } : {}),
+                }),
+              );
+              if (!switched.success) {
+                // An unconfirmed interrupt may leave the old turn running; fail closed.
+                if (!switched.rejected)
+                  markLost(
+                    ctx,
+                    "Native interrupt outcome is uncertain; do not retry in this session.",
+                  );
+                return yield* new ProviderAdapterRequestError({
+                  provider,
+                  method: "session.switch",
+                  detail: switched.error.detail,
+                });
+              }
+            }
+            ctx.modelSelection = next;
+            if (switchModel) {
+              ctx.contextLimit = undefined;
+              ctx.session = { ...ctx.session, model: next.model, updatedAt: now() };
+            }
+          }
           const admission = yield* Effect.promise(() => ctx.engine.send(text));
           if (!admission.success) {
             if (!admission.rejected)

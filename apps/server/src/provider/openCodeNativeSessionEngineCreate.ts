@@ -358,11 +358,13 @@ const fail = (operation: string, detail: string): Result<never> => ({
   success: false,
   error: new OpenCodeRuntimeError({ operation, detail }),
 });
-const rejectSend = (detail: string): Result<never> => ({
+/** A failure the server definitely did not apply, so the session stays usable. */
+const reject = (operation: string, detail: string): Result<never> => ({
   success: false,
-  error: new OpenCodeRuntimeError({ operation: "session.prompt", detail }),
+  error: new OpenCodeRuntimeError({ operation, detail }),
   rejected: true,
 });
+const rejectSend = (detail: string) => reject("session.prompt", detail);
 
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value)
@@ -400,9 +402,16 @@ export const openCodeNativeSessionEngineCreate = (input: {
   const childParents = new Map<string, string>();
   const retiredMessages = new Set<string>();
   let admitting = false;
+  let switching = false;
   let uncertain = false;
   let disconnected = false;
   let admissionEvents: V2Event[] = [];
+  // Woken whenever the main turn settles or the engine loses its stream.
+  const idleWaiters = new Set<() => void>();
+  const idleNotify = () => {
+    for (const wake of idleWaiters) wake();
+    idleWaiters.clear();
+  };
   const permissions = new Map<
     string,
     { request: PermissionRequest; turnID: string; replying: boolean }
@@ -769,6 +778,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
         return;
       }
       active = undefined;
+      idleNotify();
       if (error) emit({ type: "turn.failed", turnID: scope.turnID, reason: "failed", error });
       else if (interruption)
         emit({
@@ -993,6 +1003,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
     disconnected = true;
     connected = false;
     admissionEvents = [];
+    idleNotify();
     if (session && abort && !abort.signal.aborted)
       emit({ type: "stream.lost", sessionID: session.id });
   };
@@ -1088,6 +1099,78 @@ export const openCodeNativeSessionEngineCreate = (input: {
       }
     };
     void pump();
+  };
+
+  type Selection = {
+    readonly model?: {
+      readonly id: string;
+      readonly providerID: string;
+      readonly variant?: string;
+    };
+    readonly agent?: string;
+  };
+  const switchNow = async (selection: Selection): Promise<Result<void>> => {
+    const controller = abort!;
+    const sessionID = session!.id;
+    if (active) {
+      const idle = new Promise<void>((resolve) => idleWaiters.add(resolve));
+      let response: { readonly interrupted: boolean };
+      try {
+        response = await requestWithDeadline(controller.signal, (signal) =>
+          client.session.interrupt({ sessionID }, { signal }),
+        );
+      } catch (cause) {
+        uncertain = true;
+        return fail(
+          "session.interrupt",
+          cause instanceof Error ? cause.message : "Native interrupt request failed.",
+        );
+      }
+      if (typeof response.interrupted !== "boolean") {
+        uncertain = true;
+        return fail("session.interrupt", "Invalid native interrupt response.");
+      }
+      // Only the execution terminal proves the old turn stopped. A false response means it
+      // was already settling, so the same terminal is still on its way.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settled = await Promise.race([
+        idle.then(() => true),
+        new Promise<false>((resolve) => {
+          // @effect-diagnostics-next-line globalTimers:off -- The standalone client waits for its event stream, outside an Effect runtime.
+          timer = setTimeout(() => resolve(false), REQUEST_TIMEOUT_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+      if (!session || session.id !== sessionID || !abort || !connected || disconnected)
+        return fail("session.interrupt", "Native session closed while interrupting.");
+      if (!settled || active) {
+        uncertain = true;
+        return fail(
+          "session.interrupt",
+          "Native turn did not confirm interruption; outcome uncertain.",
+        );
+      }
+    }
+    try {
+      if (selection.model) {
+        const model = selection.model;
+        await requestWithDeadline(controller.signal, (signal) =>
+          client.session.switchModel({ sessionID, model }, { signal }),
+        );
+      }
+      if (selection.agent) {
+        const agent = selection.agent;
+        await requestWithDeadline(controller.signal, (signal) =>
+          client.session.switchAgent({ sessionID, agent }, { signal }),
+        );
+      }
+    } catch (cause) {
+      return reject(
+        "session.switch",
+        cause instanceof Error ? cause.message : "Native model or agent switch failed.",
+      );
+    }
+    return { success: true, data: undefined };
   };
 
   return {
@@ -1217,13 +1300,41 @@ export const openCodeNativeSessionEngineCreate = (input: {
       emit({ type: "session.ready", sessionID: found.id });
       return { success: true, data: found };
     },
+    /** Switches model and/or agent. A running turn is interrupted first and the switch waits
+        for its confirmed terminal, so the next prompt starts a fresh turn on the new selection.
+        The switch calls are idempotent setters: their failure leaves the session usable. */
+    switchSelection: async (selection: {
+      readonly model?: {
+        readonly id: string;
+        readonly providerID: string;
+        readonly variant?: string;
+      };
+      readonly agent?: string;
+    }): Promise<Result<void>> => {
+      if (!session || !connected || disconnected || !abort || abort.signal.aborted)
+        return fail("session.switch", "Session event stream is not ready.");
+      if (uncertain)
+        return fail("session.switch", "Session already has pending or uncertain work.");
+      if (admitting || switching)
+        return reject(
+          "session.switch",
+          "A message is still being admitted. Try again in a moment.",
+        );
+      switching = true;
+      try {
+        return await switchNow(selection);
+      } finally {
+        switching = false;
+      }
+    },
     send: async (text: string): Promise<Result<{ readonly turnID: string }>> => {
       if (!session || !connected || disconnected || !abort || abort.signal.aborted)
         return fail("session.prompt", "Session event stream is not ready.");
       const currentSession = session;
       if (uncertain)
         return fail("session.prompt", "Session already has pending or uncertain work.");
-      if (admitting) return rejectSend("A message is still being admitted. Try again in a moment.");
+      if (admitting || switching)
+        return rejectSend("A message is still being admitted. Try again in a moment.");
       if (!text.trim()) return rejectSend("Prompt text is required.");
       admitting = true;
       const id = `msg_${NodeCrypto.randomUUID().replaceAll("-", "")}`;
@@ -1445,6 +1556,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
       admissionEvents = [];
       disconnected = false;
       session = undefined;
+      idleNotify();
       return stopFailure ?? { success: true, data: undefined };
     },
   };
