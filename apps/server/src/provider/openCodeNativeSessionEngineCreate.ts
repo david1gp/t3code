@@ -1181,7 +1181,9 @@ export const openCodeNativeSessionEngineCreate = (input: {
       if (uncertain)
         return fail("session.prompt", "Session already has pending or uncertain work.");
       if (active || admitting)
-        return rejectSend("Session already has pending work; wait for its terminal event.");
+        return rejectSend(
+          "OpenCode v2 cannot steer a running turn. Queue the message or wait for the turn to finish.",
+        );
       if (!text.trim()) return rejectSend("Prompt text is required.");
       admitting = true;
       const id = `msg_${NodeCrypto.randomUUID().replaceAll("-", "")}`;

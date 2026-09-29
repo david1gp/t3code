@@ -414,13 +414,9 @@ const make = Effect.gen(function* () {
       return;
     }
     const session = thread.session;
-    // A rejected steering message must not clear the still-running provider turn.
-    if (
-      session?.providerName === "pi" &&
-      session.status === "running" &&
-      session.activeTurnId !== null
-    )
-      return;
+    // A rejected steering message must not clear the still-running provider turn;
+    // the turn's own terminal or session.exited event settles the session.
+    if (session?.status === "running" && session.activeTurnId !== null) return;
     yield* setThreadSession({
       threadId: input.threadId,
       session: {

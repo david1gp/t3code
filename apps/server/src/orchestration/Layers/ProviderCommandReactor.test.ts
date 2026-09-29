@@ -3049,65 +3049,71 @@ describe("ProviderCommandReactor", () => {
     expect(harness.stopSession.mock.calls.length).toBe(0);
   });
 
-  it("keeps a Pi turn running when a steering send is rejected", async () => {
-    const harness = await createHarness({
-      threadModelSelection: { instanceId: ProviderInstanceId.make("pi"), model: "anthropic/test" },
-    });
-    const threadId = ThreadId.make("thread-1");
-    const now = "2026-01-01T00:00:00.000Z";
-    const startTurn = (id: string, text: string) =>
-      harness.engine.dispatch({
-        type: "thread.turn.start",
-        commandId: CommandId.make(`cmd-pi-${id}`),
-        threadId,
-        message: {
-          messageId: asMessageId(`message-pi-${id}`),
-          role: "user",
-          text,
-          attachments: [],
+  it.each(["pi", "opencode"])(
+    "keeps a %s turn running when a steering send is rejected",
+    async (instance) => {
+      const harness = await createHarness({
+        threadModelSelection: {
+          instanceId: ProviderInstanceId.make(instance),
+          model: "anthropic/test",
         },
-        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-        runtimeMode: "full-access",
-        createdAt: now,
       });
+      const threadId = ThreadId.make("thread-1");
+      const now = "2026-01-01T00:00:00.000Z";
+      const startTurn = (id: string, text: string) =>
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(`cmd-pi-${id}`),
+          threadId,
+          message: {
+            messageId: asMessageId(`message-pi-${id}`),
+            role: "user",
+            text,
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          createdAt: now,
+        });
 
-    await Effect.runPromise(startTurn("first", "first"));
-    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
-    const before = (await harness.readModel()).threads.find((thread) => thread.id === threadId);
-    expect(before?.session?.providerName).toBe("pi");
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-pi-running"),
-        threadId,
-        session: { ...before!.session!, status: "running", activeTurnId: asTurnId("pi-active") },
-        createdAt: now,
-      }),
-    );
-    harness.sendTurn.mockImplementationOnce(() =>
-      Effect.fail(
-        new ProviderAdapterRequestError({
-          provider: "pi",
-          method: "steer",
-          detail: "steer rejected by Pi",
+      await Effect.runPromise(startTurn("first", "first"));
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+      const before = (await harness.readModel()).threads.find((thread) => thread.id === threadId);
+      expect(before?.session?.providerName).toBe(instance);
+      await Effect.runPromise(
+        harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-pi-running"),
+          threadId,
+          session: { ...before!.session!, status: "running", activeTurnId: asTurnId("pi-active") },
+          createdAt: now,
         }),
-      ),
-    );
-    await Effect.runPromise(startTurn("steer", "second"));
-    await waitFor(async () => {
-      const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
-      return (
-        thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ??
-        false
       );
-    });
-    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
-    expect(thread?.session).toMatchObject({
-      status: "running",
-      activeTurnId: asTurnId("pi-active"),
-    });
-    expect(harness.startSession).toHaveBeenCalledTimes(1);
-  });
+      harness.sendTurn.mockImplementationOnce(() =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: ProviderDriverKind.make(instance),
+            method: "steer",
+            detail: "steer rejected",
+          }),
+        ),
+      );
+      await Effect.runPromise(startTurn("steer", "second"));
+      await waitFor(async () => {
+        const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+        return (
+          thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ??
+          false
+        );
+      });
+      const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+      expect(thread?.session).toMatchObject({
+        status: "running",
+        activeTurnId: asTurnId("pi-active"),
+      });
+      expect(harness.startSession).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("restarts an existing Codex thread on a compatible requested instance", async () => {
     const harness = await createHarness();
