@@ -32,7 +32,8 @@ export const openCodeNativeInventoryMap = (
   const agents = inventory.agent.filter(
     (agent) => !agent.hidden && (agent.mode === "primary" || agent.mode === "all"),
   );
-  const defaultAgent = agents.find((agent) => agent.name === "build")?.name ?? agents[0]?.name;
+  // v2 resolves agents by `id`; `name` is a display label (e.g. "Build").
+  const defaultAgent = agents.find((agent) => agent.id === "build")?.id ?? agents[0]?.id;
   const models: ServerProviderModel[] = [];
   for (const model of inventory.model) {
     const provider = providers.get(model.providerID);
@@ -65,9 +66,9 @@ export const openCodeNativeInventoryMap = (
                   label: "Agent",
                   type: "select" as const,
                   options: agents.map((agent) => ({
-                    id: agent.name,
-                    label: label(agent.name),
-                    ...(agent.name === defaultAgent ? { isDefault: true as const } : {}),
+                    id: agent.id,
+                    label: trimmed(agent.name) ?? label(agent.id),
+                    ...(agent.id === defaultAgent ? { isDefault: true as const } : {}),
                   })),
                   ...(defaultAgent ? { currentValue: defaultAgent } : {}),
                 },

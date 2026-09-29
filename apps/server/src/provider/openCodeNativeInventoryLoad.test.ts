@@ -48,7 +48,8 @@ const fixtures = {
   agent: {
     location,
     data: [
-      { id: "build", name: "build", mode: "primary", hidden: false },
+      // v2 names are display labels; sessions must be created with the id.
+      { id: "build", name: "Build", mode: "primary", hidden: false },
       { id: "hidden", name: "hidden", mode: "primary", hidden: true },
     ],
   },
@@ -105,9 +106,10 @@ it.effect("loads typed v2 inventory envelopes with per-request cwd and credentia
     );
     NodeAssert.ok(agents?.type === "select");
     NodeAssert.deepEqual(
-      agents.options.map((entry) => entry.id),
-      ["build"],
+      agents.options.map((entry) => [entry.id, entry.label]),
+      [["build", "Build"]],
     );
+    NodeAssert.equal(agents.currentValue, "build");
     const reasoning = mapped.models[0]?.capabilities?.optionDescriptors?.find(
       (entry) => entry.id === "variant",
     );
