@@ -2239,33 +2239,7 @@ export function GeneralSettingsPanel() {
     <SettingsPageContainer>
       <ProjectDefaultsSettings category="general" />
       <SettingsSection id="display" title="Display" variant="plain">
-        <SettingsSection title="Sidebar" className="py-2">
-          <SettingsRow
-            {...searchableSetting("show-usage")}
-            description="Show the Usage shortcut in the sidebar."
-            resetAction={
-              settings.sidebarShowUsage !== DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage ? (
-                <SettingResetButton
-                  label="Usage shortcut"
-                  onClick={() =>
-                    updateSettings({ sidebarShowUsage: DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage })
-                  }
-                />
-              ) : null
-            }
-            control={
-              <Switch
-                checked={settings.sidebarShowUsage}
-                onCheckedChange={(checked) =>
-                  updateSettings({ sidebarShowUsage: Boolean(checked) })
-                }
-                aria-label="Show sidebar Usage shortcut"
-              />
-            }
-          />
-        </SettingsSection>
-
-        <SettingsSection title="Chat area / toolbar" className="py-2">
+        <SettingsSection title="Chat toolbar" className="py-2">
           <SettingsRow
             {...searchableSetting("show-checkout-selector")}
             description="Show the checkout selector in the chat toolbar."
@@ -2320,7 +2294,8 @@ export function GeneralSettingsPanel() {
 
           <SettingsRow
             {...searchableSetting("legacy-context-window-indicator")}
-            description="Show the text context meter in the chat toolbar and choose how it is displayed. Simple shows the current token size."
+            title="Show context meter (tokens)"
+            description="Show token usage in the chat toolbar (or composer footer when the context strip is hidden). Simple shows used tokens; Detailed adds the percentage and used/maximum tokens."
             control={
               <div className="flex items-center gap-3">
                 <Select
@@ -2351,9 +2326,39 @@ export function GeneralSettingsPanel() {
               </div>
             }
           />
+        </SettingsSection>
+
+        <SettingsSection title="Sidebar" className="py-2">
+          <SettingsRow
+            {...searchableSetting("show-usage")}
+            description="Show the Usage shortcut in the sidebar."
+            resetAction={
+              settings.sidebarShowUsage !== DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage ? (
+                <SettingResetButton
+                  label="Usage shortcut"
+                  onClick={() =>
+                    updateSettings({ sidebarShowUsage: DEFAULT_UNIFIED_SETTINGS.sidebarShowUsage })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <Switch
+                checked={settings.sidebarShowUsage}
+                onCheckedChange={(checked) =>
+                  updateSettings({ sidebarShowUsage: Boolean(checked) })
+                }
+                aria-label="Show sidebar Usage shortcut"
+              />
+            }
+          />
+        </SettingsSection>
+
+        <SettingsSection title="Chat area" className="py-2">
           <SettingsRow
             {...searchableSetting("show-thread-cost-in-context-strip")}
-            description="Show the thread cost in the strip below the composer."
+            title="Show thread cost below composer"
+            description="Show the thread's monetary cost in the context strip below the composer."
             resetAction={
               settings.showThreadCostInContextStrip !==
               DEFAULT_UNIFIED_SETTINGS.showThreadCostInContextStrip ? (
@@ -2380,7 +2385,7 @@ export function GeneralSettingsPanel() {
           />
         </SettingsSection>
 
-        <SettingsSection title="Chat composer" className="py-2">
+        <SettingsSection title="Composer" className="py-2">
           <SettingsRow
             {...searchableSetting("show-inline-access-mode")}
             description="Show the access-mode control beside the composer."
@@ -2406,12 +2411,10 @@ export function GeneralSettingsPanel() {
               />
             }
           />
-        </SettingsSection>
-
-        <SettingsSection title="Chat composer footer" className="py-2">
           <SettingsRow
             {...searchableSetting("show-thread-cost-in-composer-footer")}
-            description="Show the thread cost in the composer footer when the context strip is hidden."
+            title="Show thread cost in composer footer"
+            description="Show the thread's monetary cost in the composer footer only when the context strip below the composer is hidden."
             resetAction={
               settings.showThreadCostInComposerFooter !==
               DEFAULT_UNIFIED_SETTINGS.showThreadCostInComposerFooter ? (
