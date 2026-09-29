@@ -91,6 +91,12 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
   const replies: Array<{ path: string; body: Record<string, unknown> }> = [];
   let rejectReplies = false;
   let rejectInterrupt = false;
+  let interrupted = true;
+  let prompts = 0;
+  let heldPermissionList: NodeHttp.ServerResponse | undefined;
+  let permissionListRequested: (() => void) | undefined;
+  let heldFormList: NodeHttp.ServerResponse | undefined;
+  let formListRequested: (() => void) | undefined;
   const server = await fixture((req, res) => {
     if (req.url === "/api/event") {
       stream = res;
@@ -103,10 +109,22 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
       return;
     }
     if (req.url === "/api/session/ses_fixture/permission") {
+      if (permissionListRequested) {
+        heldPermissionList = res;
+        permissionListRequested();
+        permissionListRequested = undefined;
+        return;
+      }
       send(res, { data: pendingPermissions });
       return;
     }
     if (req.url === "/api/session/ses_fixture/form") {
+      if (formListRequested) {
+        heldFormList = res;
+        formListRequested();
+        formListRequested = undefined;
+        return;
+      }
       send(res, { data: pendingForms });
       return;
     }
@@ -132,6 +150,7 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
       return;
     }
     if (req.url?.endsWith("/prompt")) {
+      prompts++;
       void bodyRead(req).then((body) =>
         send(res, { data: { id: body.id, sessionID: session.id, type: "user" } }),
       );
@@ -139,7 +158,7 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
     }
     if (req.url?.endsWith("/interrupt")) {
       if (rejectInterrupt) res.writeHead(503).end();
-      else send(res, { interrupted: true });
+      else send(res, { interrupted });
       return;
     }
     res.writeHead(404).end();
@@ -157,6 +176,7 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
     ...capture,
     engine,
     write,
+    promptCount: () => prompts,
     disconnect: () => stream!.end(),
     logReads: () => logReads,
     replies,
@@ -164,11 +184,40 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
       pendingPermissions = permissions;
       pendingForms = forms;
     },
+    holdNextPermissionList: () => {
+      const requested = new Promise<void>((resolve) => {
+        permissionListRequested = resolve;
+      });
+      return {
+        requested,
+        release: () => {
+          if (!heldPermissionList) throw new Error("No permission list request to release");
+          send(heldPermissionList, { data: pendingPermissions });
+          heldPermissionList = undefined;
+        },
+      };
+    },
+    holdNextFormList: () => {
+      const requested = new Promise<void>((resolve) => {
+        formListRequested = resolve;
+      });
+      return {
+        requested,
+        release: () => {
+          if (!heldFormList) throw new Error("No form list request to release");
+          send(heldFormList, { data: pendingForms });
+          heldFormList = undefined;
+        },
+      };
+    },
     failReplies: () => {
       rejectReplies = true;
     },
     failInterrupt: () => {
       rejectInterrupt = true;
+    },
+    setInterrupted: (value: boolean) => {
+      interrupted = value;
     },
     admit: async () => {
       const result = await engine.send("fixture prompt");
@@ -204,7 +253,7 @@ const stalledFetch = (stalledPath: string) => {
       signal.addEventListener("abort", () => reject(signal.reason), { once: true });
     });
   }) as typeof globalThis.fetch;
-  return { fetch: fetchImpl, stall: () => (stalled = true) };
+  return { fetch: fetchImpl, stall: () => (stalled = true), resume: () => (stalled = false) };
 };
 
 const stepStart = (assistantMessageID: string) => ({
@@ -280,6 +329,117 @@ describe("native v2.0.18 session slice", () => {
       expect((await test.engine.send("do not retry")).success).toBe(false);
     } finally {
       vi.useRealTimers();
+      await test.close();
+    }
+  });
+
+  it("bounds an ambiguous interrupt and never admits another prompt after its turn's terminal SSE", async () => {
+    const stalled = stalledFetch("/api/session/ses_fixture/interrupt");
+    const test = await sessionFixture(stalled.fetch);
+    try {
+      await test.admit();
+      stalled.stall();
+      vi.useFakeTimers();
+      let result: Awaited<ReturnType<typeof test.engine.interrupt>> | undefined;
+      const interrupting = test.engine.interrupt().then((value) => {
+        result = value;
+      });
+      test.write("session.execution.started");
+      test.write("session.execution.interrupted", { reason: "user" });
+      await test.wait((event) => event.type === "turn.failed");
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(result).toMatchObject({ success: false, error: { operation: "session.interrupt" } });
+      await interrupting;
+      test.write("session.execution.succeeded");
+      expect(await test.engine.send("do not admit after ambiguous interrupt")).toMatchObject({
+        success: false,
+        error: { operation: "session.prompt" },
+      });
+      expect(test.promptCount()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+      stalled.resume();
+      await test.close();
+    }
+  });
+
+  it("allows the next prompt after a definite interrupt no-op and a settled turn", async () => {
+    const test = await sessionFixture();
+    try {
+      await test.admit();
+      test.setInterrupted(false);
+      expect(await test.engine.interrupt()).toEqual({ success: true, data: false });
+      expect(await test.engine.send("still active")).toMatchObject({
+        success: false,
+        rejected: true,
+      });
+      test.write("session.execution.started");
+      test.write("session.execution.succeeded");
+      await test.wait((event) => event.type === "turn.completed");
+      expect((await test.engine.send("next turn")).success).toBe(true);
+      expect(test.promptCount()).toBe(2);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("keeps prompt admission closed after an ambiguous interrupt HTTP failure", async () => {
+    const test = await sessionFixture();
+    try {
+      await test.admit();
+      test.write("session.execution.started");
+      test.write("session.execution.succeeded");
+      await test.wait((event) => event.type === "turn.completed");
+      test.failInterrupt();
+      expect(await test.engine.interrupt()).toMatchObject({
+        success: false,
+        error: { operation: "session.interrupt" },
+      });
+      expect((await test.engine.send("no second prompt")).success).toBe(false);
+      expect(test.promptCount()).toBe(1);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("does not resolve live requests omitted from an older pending-list snapshot", async () => {
+    const test = await sessionFixture();
+    try {
+      const turnID = await test.admit();
+      const pendingPermission = test.holdNextPermissionList();
+      const pendingForm = test.holdNextFormList();
+      const reconciling = test.engine.reconcilePending();
+      await Promise.all([pendingPermission.requested, pendingForm.requested]);
+      const request = {
+        id: "per_racing",
+        sessionID: session.id,
+        action: "edit",
+        resources: ["src/a.ts"],
+      };
+      const form = {
+        id: "frm_racing",
+        sessionID: session.id,
+        title: "Choose",
+        fields: [{ key: "choice", type: "string", options: [{ label: "Yes", value: "yes" }] }],
+      };
+      test.write("permission.asked", request);
+      test.write("form.created", { form });
+      await test.wait(
+        (event) => event.type === "permission.asked" && event.request.id === request.id,
+      );
+      await test.wait((event) => event.type === "form.created" && event.form.id === form.id);
+      pendingPermission.release();
+      pendingForm.release();
+      expect(await reconciling).toEqual({ success: true, data: undefined });
+      expect(test.events.filter((event) => event.type === "permission.asked")).toMatchObject([
+        { turnID, request },
+      ]);
+      expect(test.events.filter((event) => event.type === "form.created")).toMatchObject([
+        { turnID, form },
+      ]);
+      expect(test.events.filter((event) => event.type === "permission.replied")).toEqual([]);
+      expect(test.events.filter((event) => event.type === "form.resolved")).toEqual([]);
+    } finally {
       await test.close();
     }
   });

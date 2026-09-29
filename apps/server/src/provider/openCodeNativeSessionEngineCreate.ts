@@ -505,6 +505,9 @@ export const openCodeNativeSessionEngineCreate = (input: {
     if (!session || !connected || disconnected || !lastTurnID)
       return fail("session.pending", "Native session is not ready for pending requests.");
     const id = session.id;
+    // A list response can predate live requests received while the HTTP calls are in flight.
+    const knownPermissions = new Map(permissions);
+    const knownForms = new Map(forms);
     try {
       const [pendingPermissions, pendingForms] = await Promise.all([
         requestWithDeadline(abort?.signal, (signal) =>
@@ -521,11 +524,13 @@ export const openCodeNativeSessionEngineCreate = (input: {
       if (closeMissing) {
         const permissionIDs = new Set(pendingPermissions.map((request) => request.id));
         const formIDs = new Set(pendingForms.map((form) => form.id));
-        for (const requestID of permissions.keys()) {
-          if (!permissionIDs.has(requestID)) requestSettle("permission", requestID, id);
+        for (const [requestID, pending] of knownPermissions) {
+          if (!permissionIDs.has(requestID) && permissions.get(requestID) === pending)
+            requestSettle("permission", requestID, id);
         }
-        for (const formID of forms.keys()) {
-          if (!formIDs.has(formID)) requestSettle("form", formID, id);
+        for (const [formID, pending] of knownForms) {
+          if (!formIDs.has(formID) && forms.get(formID) === pending)
+            requestSettle("form", formID, id);
         }
       }
       return { success: true, data: undefined };
@@ -1299,18 +1304,24 @@ export const openCodeNativeSessionEngineCreate = (input: {
       ),
     interrupt: async (): Promise<Result<boolean>> => {
       if (!session) return fail("session.interrupt", "Session has not started.");
+      const id = session.id;
       let response: { readonly interrupted: boolean };
       try {
-        response = await client.session.interrupt({ sessionID: session.id });
+        response = await requestWithDeadline(abort?.signal, (signal) =>
+          client.session.interrupt({ sessionID: id }, { signal }),
+        );
       } catch (cause) {
+        uncertain = true;
         return fail(
           "session.interrupt",
           cause instanceof Error ? cause.message : "Native interrupt request failed.",
         );
       }
       const interrupted = response.interrupted;
-      if (typeof interrupted !== "boolean")
+      if (typeof interrupted !== "boolean") {
+        uncertain = true;
         return fail("session.interrupt", "Invalid native interrupt response.");
+      }
       // Do not fabricate a turn terminal: the execution.interrupted event is authoritative.
       return { success: true, data: interrupted };
     },

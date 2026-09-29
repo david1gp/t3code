@@ -2419,7 +2419,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         });
       }),
     ).pipe(Effect.asVoid);
-    yield* Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll()).pipe(Effect.asVoid);
+    yield* Effect.forEach(currentAdapters, ([instanceId, adapter]) =>
+      adapter.stopAll().pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("failed to stop provider adapter", {
+            instanceId,
+            errorTag: causeErrorTag(cause),
+          }),
+        ),
+      ),
+    ).pipe(Effect.asVoid);
     yield* McpSessionRegistry.revokeAllActiveMcpCredentials();
     McpProviderSession.clearAllMcpProviderSessions();
     const bindings = yield* directory.listBindings().pipe(Effect.orElseSucceed(() => []));

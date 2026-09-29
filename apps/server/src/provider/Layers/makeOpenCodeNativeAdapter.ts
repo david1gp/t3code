@@ -18,6 +18,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
+import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 
 import { ServerConfig } from "../../config.ts";
@@ -885,7 +886,10 @@ export const makeOpenCodeNativeAdapter = (options: {
           const ctx = yield* requireSession(threadId);
           const inFlight = ctx.active ?? ctx.pending;
           if (!inFlight || (turnId && inFlight !== turnId)) return;
-          yield* result("session.interrupt", ctx.engine.interrupt());
+          const interrupted = yield* Effect.promise(() => ctx.engine.interrupt());
+          if (!interrupted.success)
+            markLost(ctx, "Native interrupt outcome is uncertain; do not retry in this session.");
+          yield* result("session.interrupt", Promise.resolve(interrupted));
         }),
       stopSession: (threadId) =>
         Effect.gen(function* () {
@@ -964,8 +968,21 @@ export const makeOpenCodeNativeAdapter = (options: {
       rollbackThread: () => unsupported("rollbackThread"),
       stopAll: () =>
         Effect.gen(function* () {
-          for (const ctx of sessions.values()) yield* result("session.stop", ctx.engine.stop());
+          let firstError: ProviderAdapterRequestError | undefined;
+          for (const ctx of sessions.values()) {
+            const stopped = yield* Effect.result(result("session.stop", ctx.engine.stop()));
+            if (Result.isFailure(stopped)) {
+              markLost(
+                ctx,
+                "Native session stopped locally; remote interrupt outcome is uncertain.",
+              );
+              firstError ??= stopped.failure;
+            } else if (!ctx.lost) {
+              emit({ type: "session.exited", ...base(ctx), payload: { exitKind: "graceful" } });
+            }
+          }
           sessions.clear();
+          if (firstError) return yield* firstError;
         }),
       streamEvents: Stream.fromQueue(bus),
     };

@@ -677,57 +677,72 @@ for (const [enabled, completed] of [
   );
 }
 
-it.effect("ProviderServiceLive catches stopAll failures during shutdown", () =>
-  Effect.gen(function* () {
-    const codex = makeFakeCodexAdapter();
-    codex.stopAll.mockImplementation(() =>
-      Effect.fail(
-        new ProviderAdapterRequestError({
-          provider: String(CODEX_DRIVER),
-          method: "stopAll",
-          detail: "simulated stopAll failure",
-        }),
-      ),
-    );
-    const registry = makeAdapterRegistryMock({
-      [CODEX_DRIVER]: codex.adapter,
-    });
-    const providerAdapterLayer = Layer.succeed(
-      ProviderAdapterRegistry.ProviderAdapterRegistry,
-      registry,
-    );
-    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
-      Layer.provide(SqlitePersistenceMemory),
-    );
-    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
-    const providerLayer = Layer.mergeAll(
-      makeProviderServiceLive().pipe(
+it.effect(
+  "ProviderServiceLive stops other adapters and clears bindings after a stopAll failure",
+  () =>
+    Effect.gen(function* () {
+      const codex = makeFakeCodexAdapter();
+      const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
+      codex.stopAll.mockImplementation(() =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: String(CODEX_DRIVER),
+            method: "stopAll",
+            detail: "simulated stopAll failure",
+          }),
+        ),
+      );
+      const registry = makeStaticInstanceRegistry([
+        [codexInstanceId, codex.adapter],
+        [claudeAgentInstanceId, claude.adapter],
+      ]);
+      const providerAdapterLayer = Layer.succeed(
+        ProviderAdapterRegistry.ProviderAdapterRegistry,
+        registry,
+      );
+      const persistence = yield* Layer.build(
+        ProviderSessionDirectoryLive.pipe(
+          Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+        ),
+      );
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory.pipe(
+        Effect.provide(persistence),
+      );
+      const providerLayer = makeProviderServiceLive().pipe(
         Layer.provide(NodeServices.layer),
         Layer.provide(providerAdapterLayer),
-        Layer.provide(directoryLayer),
+        Layer.provide(Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, directory)),
         Layer.provide(defaultServerSettingsLayer),
         Layer.provide(serverConfigTestLayer),
-        Layer.provideMerge(AnalyticsService.layerTest),
+        Layer.provide(AnalyticsService.layerTest),
         Layer.provide(
           Layer.succeed(
             ProviderEventLoggers.ProviderEventLoggers,
             ProviderEventLoggers.NoOpProviderEventLoggers,
           ),
         ),
-      ),
-      directoryLayer,
-      runtimeRepositoryLayer,
-      NodeServices.layer,
-    );
-    const scope = yield* Scope.make();
-    const runtimeServices = yield* Layer.build(providerLayer).pipe(Scope.provide(scope));
+      );
+      const scope = yield* Scope.make();
+      const runtimeServices = yield* Layer.build(providerLayer).pipe(Scope.provide(scope));
 
-    yield* ProviderService.ProviderService.pipe(Effect.provide(runtimeServices));
-    const closeExit = yield* Scope.close(scope, Exit.void).pipe(Effect.exit);
+      const provider = yield* ProviderService.ProviderService.pipe(Effect.provide(runtimeServices));
+      const threadId = asThreadId("shutdown-failed-adapter");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const closeExit = yield* Scope.close(scope, Exit.void).pipe(Effect.exit);
 
-    assert.equal(Exit.isSuccess(closeExit), true);
-    assert.equal(codex.stopAll.mock.calls.length, 1);
-  }),
+      assert.equal(Exit.isSuccess(closeExit), true);
+      assert.equal(codex.stopAll.mock.calls.length, 1);
+      assert.equal(claude.stopAll.mock.calls.length, 1);
+      const binding = yield* directory.getBinding(threadId);
+      assert(Option.isSome(binding));
+      assert.equal(binding.value.status, "stopped");
+      assert.propertyVal(binding.value.runtimePayload, "activeTurnId", null);
+    }),
 );
 
 it.effect("ProviderServiceLive flushes deferred completions during shutdown", () =>

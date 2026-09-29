@@ -27,6 +27,7 @@ const testLayer = ServerConfig.layerTest(process.cwd(), { prefix: "native-adapte
 function fakeEngine() {
   let receive!: Parameters<typeof openCodeNativeSessionEngineCreate>[0]["onEvent"];
   const calls: string[] = [];
+  const stoppedDirectories: string[] = [];
   const starts: Array<
     Parameters<ReturnType<typeof openCodeNativeSessionEngineCreate>["start"]>[0]
   > = [];
@@ -35,13 +36,17 @@ function fakeEngine() {
   let terminalBeforeReceipt = false;
   let rejectResume = false;
   let rejectStop = false;
+  let rejectInterrupt = false;
+  let rejectNextStopDirectory: string | undefined;
   let sends = 0;
   const create = ((input: Parameters<typeof openCodeNativeSessionEngineCreate>[0]) => {
     receive = input.onEvent;
+    let directory = "";
     return {
       start: async (
         options: Parameters<ReturnType<typeof openCodeNativeSessionEngineCreate>["start"]>[0],
       ) => {
+        directory = options.directory;
         starts.push(options);
         calls.push(`start:${options.directory}`);
         if (rejectResume && options.resumeSessionId)
@@ -70,11 +75,16 @@ function fakeEngine() {
       },
       interrupt: async () => {
         calls.push("interrupt");
-        return { success: true as const, data: true };
+        return rejectInterrupt
+          ? { success: false as const, error: { detail: "Interrupt outcome uncertain." } }
+          : { success: true as const, data: true };
       },
       stop: async () => {
         calls.push("stop");
-        return rejectStop
+        stoppedDirectories.push(directory);
+        const failThisStop = rejectStop || rejectNextStopDirectory === directory;
+        if (rejectNextStopDirectory === directory) rejectNextStopDirectory = undefined;
+        return failThisStop
           ? { success: false as const, error: { detail: "Interrupt outcome uncertain." } }
           : { success: true as const, data: undefined };
       },
@@ -93,6 +103,7 @@ function fakeEngine() {
   return {
     create,
     calls,
+    stoppedDirectories,
     starts,
     emit: (event: Parameters<typeof receive>[0]) => receive(event),
     completeBeforeReceipt: () => {
@@ -113,8 +124,115 @@ function fakeEngine() {
     failStop: () => {
       rejectStop = true;
     },
+    failInterrupt: () => {
+      rejectInterrupt = true;
+    },
+    failNextStopFor: (directory: string) => {
+      rejectNextStopDirectory = directory;
+    },
   };
 }
+
+it.effect("reports a failed native stop as lost while still stopping other sessions", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const events: ProviderRuntimeEvent[] = [];
+    const exited = yield* Deferred.make<void>();
+    let exitCount = 0;
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.gen(function* () {
+        events.push(event);
+        if (event.type === "session.exited" && ++exitCount === 2)
+          yield* Deferred.succeed(exited, undefined);
+      }),
+    ).pipe(Effect.forkChild);
+    const otherThread = ThreadId.make("native-v2-second-thread");
+    yield* adapter.startSession(start);
+    const turn = yield* adapter.sendTurn({ threadId, input: "in flight" });
+    fake.emit({ type: "turn.started", turnID: turn.turnId });
+    yield* adapter.startSession({ ...start, threadId: otherThread, cwd: "/tmp/native-v2-second" });
+    fake.failNextStopFor(start.cwd);
+    const error = yield* adapter.stopAll().pipe(Effect.flip);
+    yield* Deferred.await(exited);
+    assert.equal(error._tag, "ProviderAdapterRequestError");
+    if (error._tag === "ProviderAdapterRequestError")
+      assert.equal(error.detail, "Interrupt outcome uncertain.");
+    assert.deepStrictEqual(fake.stoppedDirectories, [start.cwd, "/tmp/native-v2-second"]);
+    assert.deepStrictEqual(yield* adapter.listSessions(), []);
+    yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
+    assert.deepStrictEqual(
+      events
+        .filter((event) => event.type === "session.exited")
+        .map((event) => ({
+          threadId: event.threadId,
+          payload: event.payload,
+        })),
+      [
+        {
+          threadId,
+          payload: {
+            reason: "Native session stopped locally; remote interrupt outcome is uncertain.",
+            recoverable: false,
+            exitKind: "error",
+          },
+        },
+        {
+          threadId: otherThread,
+          payload: { exitKind: "graceful" },
+        },
+      ],
+    );
+    assert.deepStrictEqual(
+      events.filter((event) => event.type === "turn.completed"),
+      [],
+    );
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("emits graceful exits for every successful stopAll session", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const events: ProviderRuntimeEvent[] = [];
+    const exited = yield* Deferred.make<void>();
+    let exitCount = 0;
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.gen(function* () {
+        events.push(event);
+        if (event.type === "session.exited" && ++exitCount === 2)
+          yield* Deferred.succeed(exited, undefined);
+      }),
+    ).pipe(Effect.forkChild);
+    const otherThread = ThreadId.make("native-v2-all-success-thread");
+    yield* adapter.startSession(start);
+    yield* adapter.startSession({
+      ...start,
+      threadId: otherThread,
+      cwd: "/tmp/native-v2-all-success",
+    });
+
+    yield* adapter.stopAll();
+    yield* Deferred.await(exited);
+    yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
+    assert.deepStrictEqual(
+      events
+        .filter((event) => event.type === "session.exited")
+        .map((event) => ({ threadId: event.threadId, payload: event.payload })),
+      [
+        { threadId, payload: { exitKind: "graceful" } },
+        { threadId: otherThread, payload: { exitKind: "graceful" } },
+      ],
+    );
+    assert.deepStrictEqual(yield* adapter.listSessions(), []);
+  }).pipe(Effect.provide(testLayer)),
+);
 
 it.effect("removes a stopped session locally and reports uncertain remote interruption", () =>
   Effect.gen(function* () {
@@ -476,6 +594,63 @@ it.effect(
       );
       yield* adapter.stopSession(threadId);
     }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("reports a failed interrupt as session loss without completing the turn", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const events: ProviderRuntimeEvent[] = [];
+    const exited = yield* Deferred.make<void>();
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.gen(function* () {
+        events.push(event);
+        if (event.type === "session.exited") yield* Deferred.succeed(exited, undefined);
+      }),
+    ).pipe(Effect.forkChild);
+    yield* adapter.startSession(start);
+    const turn = yield* adapter.sendTurn({ threadId, input: "in flight" });
+    fake.emit({ type: "turn.started", turnID: turn.turnId });
+    fake.failInterrupt();
+    const error = yield* adapter.interruptTurn(threadId, turn.turnId).pipe(Effect.flip);
+    assert.equal(error._tag, "ProviderAdapterRequestError");
+    if (error._tag === "ProviderAdapterRequestError")
+      assert.equal(error.detail, "Interrupt outcome uncertain.");
+    assert.equal(yield* adapter.hasSession(threadId), false);
+    yield* Deferred.await(exited);
+    fake.emit({ type: "turn.completed", turnID: turn.turnId });
+    yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
+    assert.deepStrictEqual(
+      events.filter((event) => event.type === "session.exited").map((event) => event.payload),
+      [
+        {
+          reason: "Native interrupt outcome is uncertain; do not retry in this session.",
+          recoverable: false,
+          exitKind: "error",
+        },
+      ],
+    );
+    assert.deepStrictEqual(
+      events.filter((event) => event.type === "turn.completed"),
+      [],
+    );
+    assert.equal((yield* adapter.listSessions())[0]?.status, "error");
+    assert.equal(
+      (yield* adapter.sendTurn({ threadId, input: "do not retry" }).pipe(Effect.flip))._tag,
+      "ProviderAdapterSessionNotFoundError",
+    );
+    yield* adapter.stopSession(threadId);
+    assert.deepStrictEqual(fake.calls, [
+      "start:/tmp/native-v2",
+      "send:in flight",
+      "interrupt",
+      "stop",
+    ]);
+    assert.equal(events.filter((event) => event.type === "session.exited").length, 1);
+  }).pipe(Effect.provide(testLayer)),
 );
 
 it.effect(
