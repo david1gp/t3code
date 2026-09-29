@@ -68,8 +68,41 @@ function piModelCapabilities(model: PiSdkModel) {
   });
 }
 
+export function piPresetNamesFromJson(value: unknown): ReadonlyArray<string> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
+  return Object.entries(value as Record<string, unknown>)
+    .filter(
+      ([name, preset]) =>
+        name !== "none" &&
+        /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) &&
+        typeof preset === "object" &&
+        preset !== null &&
+        !Array.isArray(preset),
+    )
+    .map(([name]) => name)
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function piCapabilities(model: PiSdkModel, presetNames: ReadonlyArray<string>) {
+  const capabilities = piModelCapabilities(model);
+  if (presetNames.length === 0) return capabilities;
+  const presetDescriptor = {
+    id: "preset",
+    label: "Preset",
+    type: "select" as const,
+    options: [
+      { id: "none", label: "Default" },
+      ...presetNames.map((name) => ({ id: name, label: name })),
+    ],
+  };
+  return createModelCapabilities({
+    optionDescriptors: [...(capabilities.optionDescriptors ?? []), presetDescriptor],
+  });
+}
+
 export function piModelsFromSdk(
   models: ReadonlyArray<PiSdkModel>,
+  presetNames: ReadonlyArray<string> = [],
 ): ReadonlyArray<ServerProviderModel> {
   const seen = new Set<string>();
   return models.flatMap((model): ServerProviderModel[] => {
@@ -77,7 +110,7 @@ export function piModelsFromSdk(
     if (seen.has(slug)) return [];
     seen.add(slug);
     const name = model.name.trim() || model.id;
-    return [{ slug, name, isCustom: false, capabilities: piModelCapabilities(model) }];
+    return [{ slug, name, isCustom: false, capabilities: piCapabilities(model, presetNames) }];
   });
 }
 

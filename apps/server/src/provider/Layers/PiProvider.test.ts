@@ -8,6 +8,7 @@ import {
   enrichPiSnapshot,
   piAuthFromSdk,
   piModelsFromSdk,
+  piPresetNamesFromJson,
 } from "./PiProvider.ts";
 
 const decodePiSettings = Schema.decodeSync(PiSettings);
@@ -59,6 +60,59 @@ describe("Pi provider catalog", () => {
       ],
     });
   });
+
+  it("discovers valid preset entries and exposes them alongside thinking choices", () => {
+    const presets = piPresetNamesFromJson({
+      delegate: { model: "a/model" },
+      build: { model: "b/model" },
+      none: { model: "reserved" },
+      "two words": { model: "invalid" },
+      "bad/name": { model: "invalid" },
+      invalid: null,
+    });
+    expect(presets).toEqual(["build", "delegate"]);
+    const [model] = piModelsFromSdk(
+      [{ provider: "openai", id: "gpt-5", name: "GPT-5", reasoning: true }],
+      presets,
+    );
+    expect(model?.capabilities?.optionDescriptors).toEqual([
+      {
+        id: "thinkingLevel",
+        label: "Reasoning",
+        type: "select",
+        options: [
+          { id: "off", label: "Off" },
+          { id: "minimal", label: "Minimal" },
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium", isDefault: true },
+          { id: "high", label: "High" },
+        ],
+        currentValue: "medium",
+      },
+      {
+        id: "preset",
+        label: "Preset",
+        type: "select",
+        options: [
+          { id: "none", label: "Default" },
+          { id: "build", label: "build" },
+          { id: "delegate", label: "delegate" },
+        ],
+      },
+    ]);
+  });
+
+  it.each([null, [], "bad", { invalid: null }])(
+    "safely omits preset choices for invalid or empty config %#",
+    (config) => {
+      expect(piPresetNamesFromJson(config)).toEqual([]);
+      const [model] = piModelsFromSdk(
+        [{ provider: "openai", id: "gpt-5", name: "GPT-5", reasoning: false }],
+        piPresetNamesFromJson(config),
+      );
+      expect(model?.capabilities).toEqual({ optionDescriptors: [] });
+    },
+  );
 
   it.each([
     {

@@ -356,6 +356,7 @@ function ThreadSettingsSessionProvider(
     () => new Set(),
   );
   const [pendingModel, setPendingModel] = useState<ModelOption | null>(null);
+  const selectedOptionSelections = props.selectedModel?.options;
 
   const isApplied = useCallback(
     (option: ModelOption) =>
@@ -406,7 +407,11 @@ function ThreadSettingsSessionProvider(
 
   const applyOptionChange = useCallback(
     (id: string, value: string | boolean) => {
-      const next = applyProviderOptionSelection(displayedDescriptors, { id, value });
+      const next = applyProviderOptionSelection(
+        displayedDescriptors,
+        { id, value },
+        pendingModel?.selection.options ?? selectedOptionSelections,
+      );
       if (!next) {
         return;
       }
@@ -419,7 +424,7 @@ function ThreadSettingsSessionProvider(
         props.onUpdateOptionSelections(next);
       }
     },
-    [displayedDescriptors, pendingModel, props.onUpdateOptionSelections],
+    [displayedDescriptors, pendingModel, props.onUpdateOptionSelections, selectedOptionSelections],
   );
 
   const toggleProvider = useCallback((providerKey: string) => {

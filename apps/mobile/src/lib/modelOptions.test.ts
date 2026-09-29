@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import { ProviderInstanceId, type ModelSelection, type ServerConfig } from "@t3tools/contracts";
+import { modelSelectionAfterExplicitModelChoice } from "@t3tools/shared/model";
+import { applyProviderOptionSelection, resolveProviderOptionDescriptors } from "./providerOptions";
 
 import {
   buildModelOptions,
@@ -184,6 +186,225 @@ describe("mobile model options", () => {
       options: [{ id: "serviceTier", value: "priority" }],
     });
     expect(explicitOption?.selection.options).toEqual([{ id: "serviceTier", value: "priority" }]);
+  });
+
+  it("keeps an explicit Pi model choice through catalog normalization and a preset edit", () => {
+    const config = {
+      providers: [
+        {
+          instanceId: "pi",
+          driver: "pi",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          models: [
+            {
+              slug: "test-model",
+              name: "Test Model",
+              isDefault: true,
+              capabilities: {
+                optionDescriptors: [
+                  {
+                    id: "preset",
+                    label: "Preset",
+                    type: "select",
+                    options: [
+                      { id: "none", label: "Default", isDefault: true },
+                      { id: "build", label: "Build" },
+                    ],
+                    currentValue: "none",
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    } as unknown as ServerConfig;
+    const [defaultOption] = buildModelOptions(config, null);
+    expect(defaultOption?.selection.options).toBeUndefined();
+    const presetOnly = {
+      ...defaultOption!.selection,
+      options: [{ id: "preset", value: "build" }],
+    };
+    expect(buildModelOptions(config, presetOnly)[0]?.selection.options).toEqual(presetOnly.options);
+
+    const picked = modelSelectionAfterExplicitModelChoice(presetOnly, "pi");
+    const [option] = buildModelOptions(config, picked);
+    const descriptors = resolveProviderOptionDescriptors({
+      capabilities: option?.capabilities,
+      selections: option?.selection.options,
+    });
+    const edited = applyProviderOptionSelection(
+      descriptors,
+      { id: "preset", value: "none" },
+      option?.selection.options,
+    );
+    expect(edited).toEqual([
+      { id: "preset", value: "none" },
+      { id: "modelOverride", value: true },
+    ]);
+    expect(
+      buildModelOptions(config, { ...picked, options: edited! })[0]?.selection.options,
+    ).toEqual(edited);
+    expect(
+      resolveNewTaskModelSelection({
+        draftSelection: { ...picked, options: edited! },
+        projectDefaultSelection: null,
+        stickySelection: null,
+        modelOptions: buildModelOptions(config, null),
+      })?.options,
+    ).toEqual(edited);
+  });
+
+  it("keeps a selected Pi preset on a new task when switching models", () => {
+    const preset = {
+      id: "preset",
+      label: "Preset",
+      type: "select",
+      options: [
+        { id: "none", label: "Default", isDefault: true },
+        { id: "build", label: "Build" },
+      ],
+      currentValue: "none",
+    } as const;
+    const config = {
+      providers: [
+        {
+          instanceId: "pi_work",
+          driver: "pi",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          models: [
+            { slug: "first", name: "First", capabilities: { optionDescriptors: [preset] } },
+            { slug: "second", name: "Second", capabilities: { optionDescriptors: [preset] } },
+          ],
+        },
+      ],
+    } as unknown as ServerConfig;
+    const previous: ModelSelection = {
+      instanceId: ProviderInstanceId.make("pi_work"),
+      model: "first",
+      options: [{ id: "preset", value: "build" }],
+    };
+    const target = buildModelOptions(config, previous).find(
+      (option) => option.selection.model === "second",
+    )!;
+    const changed = modelSelectionAfterExplicitModelChoice(
+      target.selection,
+      target.providerDriver,
+      previous,
+      target.capabilities,
+    );
+    expect(changed.options).toEqual([
+      { id: "preset", value: "build" },
+      { id: "modelOverride", value: true },
+    ]);
+    expect(
+      resolveNewTaskModelSelection({
+        draftSelection: changed,
+        projectDefaultSelection: null,
+        stickySelection: null,
+        modelOptions: buildModelOptions(config, changed),
+      })?.options,
+    ).toEqual(changed.options);
+    expect(
+      buildModelOptions(config, changed).find((option) => option.key === target.key)?.selection
+        .options,
+    ).toEqual(changed.options);
+  });
+
+  it("saves Build staged in settings when changing Pi models instead of restoring the applied preset", () => {
+    const preset = {
+      id: "preset",
+      label: "Preset",
+      type: "select",
+      options: [
+        { id: "none", label: "Default", isDefault: true },
+        { id: "build", label: "Build" },
+      ],
+      currentValue: "none",
+    } as const;
+    const config = {
+      providers: [
+        {
+          instanceId: "pi_work",
+          driver: "pi",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          models: [
+            { slug: "first", name: "First", capabilities: { optionDescriptors: [preset] } },
+            { slug: "second", name: "Second", capabilities: { optionDescriptors: [preset] } },
+          ],
+        },
+      ],
+    } as unknown as ServerConfig;
+    const applied: ModelSelection = {
+      instanceId: ProviderInstanceId.make("pi_work"),
+      model: "first",
+      options: [{ id: "preset", value: "none" }],
+    };
+    const target = buildModelOptions(config, applied).find(
+      (option) => option.selection.model === "second",
+    )!;
+    const descriptors = resolveProviderOptionDescriptors({
+      capabilities: target.capabilities,
+      selections: target.selection.options,
+    });
+    const staged = {
+      ...target,
+      selection: {
+        ...target.selection,
+        options:
+          applyProviderOptionSelection(
+            descriptors,
+            { id: "preset", value: "build" },
+            target.selection.options,
+          ) ?? undefined,
+      },
+    };
+
+    const saved = modelSelectionAfterExplicitModelChoice(
+      staged.selection,
+      staged.providerDriver,
+      applied,
+      staged.capabilities,
+    );
+    expect(saved).toEqual({
+      instanceId: "pi_work",
+      model: "second",
+      options: [
+        { id: "preset", value: "build" },
+        { id: "modelOverride", value: true },
+      ],
+    });
+    expect(
+      buildModelOptions(config, saved).find((option) => option.key === target.key)?.selection,
+    ).toEqual(saved);
+    expect(
+      resolveNewTaskModelSelection({
+        draftSelection: saved,
+        projectDefaultSelection: null,
+        stickySelection: null,
+        modelOptions: buildModelOptions(config, saved),
+      })?.options,
+    ).toEqual(saved.options);
+  });
+
+  it("keeps staged selections without adding Pi override for other providers", () => {
+    const applied: ModelSelection = {
+      instanceId: ProviderInstanceId.make("opencode"),
+      model: "first",
+      options: [{ id: "agent", value: "old" }],
+    };
+    const staged: ModelSelection = {
+      instanceId: applied.instanceId,
+      model: "second",
+      options: [{ id: "agent", value: "new" }],
+    };
+    expect(modelSelectionAfterExplicitModelChoice(staged, "opencode", applied)).toBe(staged);
   });
 
   it("rejects stored selections whose provider is not usable", () => {

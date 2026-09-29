@@ -8,12 +8,12 @@ import {
 } from "@t3tools/contracts";
 import {
   applyClaudePromptEffortPrefix,
-  buildProviderOptionSelectionsFromDescriptors,
   getProviderOptionCurrentLabel,
   getProviderOptionCurrentValue,
   getProviderOptionDescriptors,
   isClaudeUltrathinkPrompt,
   normalizeModelSlug,
+  providerOptionSelectionsAfterChange,
 } from "@t3tools/shared/model";
 import { memo, useCallback } from "react";
 import { BrainIcon, ZapIcon } from "lucide-react";
@@ -328,8 +328,13 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
     allowPromptInjectedEffort,
     planModeEnabled,
   });
-  const updateDescriptors = (nextDescriptors: ReadonlyArray<ProviderOptionDescriptor>) => {
-    updateModelOptions(buildProviderOptionSelectionsFromDescriptors(nextDescriptors));
+  const updateDescriptors = (
+    nextDescriptors: ReadonlyArray<ProviderOptionDescriptor>,
+    changedId: string,
+  ) => {
+    updateModelOptions(
+      providerOptionSelectionsAfterChange(nextDescriptors, modelOptions, changedId),
+    );
   };
 
   const handleSelectChange = (
@@ -350,7 +355,10 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
       const stripped = prompt.replace(/^Ultrathink:\s*/i, "");
       onPromptChange(stripped);
     }
-    updateDescriptors(replaceDescriptorCurrentValue(descriptors, descriptor.id, value));
+    updateDescriptors(
+      replaceDescriptorCurrentValue(descriptors, descriptor.id, value),
+      descriptor.id,
+    );
   };
 
   if (!hasAnyControls) {
@@ -454,6 +462,7 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
                 onValueChange={(value) => {
                   updateDescriptors(
                     replaceDescriptorCurrentValue(descriptors, descriptor.id, value === "on"),
+                    descriptor.id,
                   );
                 }}
               >

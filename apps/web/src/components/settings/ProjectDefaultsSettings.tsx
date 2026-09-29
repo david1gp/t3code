@@ -4,7 +4,10 @@ import {
   type ProviderInstanceId,
   type WorktreeSubmodules,
 } from "@t3tools/contracts";
-import { createModelSelection } from "@t3tools/shared/model";
+import {
+  createModelSelection,
+  modelSelectionAfterExplicitModelChoice,
+} from "@t3tools/shared/model";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { useNavigate } from "@tanstack/react-router";
 
@@ -174,7 +177,22 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
                   });
               }}
               onInstanceModelChange={(instanceId, model) =>
-                setModel(createModelSelection(instanceId, model))
+                setModel(
+                  modelSelectionAfterExplicitModelChoice(
+                    createModelSelection(
+                      instanceId,
+                      model,
+                      selection.instanceId === instanceId && selection.model === model
+                        ? selection.options
+                        : undefined,
+                    ),
+                    entries.find((entry) => entry.instanceId === instanceId)?.driverKind,
+                    selection,
+                    entries
+                      .find((entry) => entry.instanceId === instanceId)
+                      ?.models.find((candidate) => candidate.slug === model)?.capabilities,
+                  ),
+                )
               }
             />
             {!mixedModel ? (

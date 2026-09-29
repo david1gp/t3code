@@ -1,5 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Pi SDK runtime resolves its standard credential directory.
-import { ModelRuntime, VERSION } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, ModelRuntime, VERSION } from "@earendil-works/pi-coding-agent";
+import * as NodeFSP from "node:fs/promises";
+import * as NodePath from "node:path";
 import { PiSettings, ProviderDriverKind } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -15,6 +17,7 @@ import {
   buildPiProviderSnapshot,
   piAuthFromSdk,
   piModelsFromSdk,
+  piPresetNamesFromJson,
 } from "../Layers/PiProvider.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
@@ -36,6 +39,16 @@ const maintenance = makeManualOnlyProviderMaintenanceCapabilities({
   provider: DRIVER,
   packageName: null,
 });
+
+async function readPiPresetNames(): Promise<ReadonlyArray<string>> {
+  try {
+    const source = await NodeFSP.readFile(NodePath.join(getAgentDir(), "presets.json"), "utf8");
+    return piPresetNamesFromJson(JSON.parse(source));
+  } catch {
+    // A missing or malformed optional preset file must not block Pi discovery.
+    return [];
+  }
+}
 
 export type PiDriverEnv =
   | BackgroundPolicy.BackgroundPolicy
@@ -79,8 +92,9 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
               allowModelNetwork: false,
             });
             const sdkModels = runtime.getModels();
+            const presetNames = await readPiPresetNames();
             return {
-              models: piModelsFromSdk(sdkModels),
+              models: piModelsFromSdk(sdkModels, presetNames),
               auth: piAuthFromSdk(runtime, sdkModels),
             };
           },

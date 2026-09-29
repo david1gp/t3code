@@ -68,6 +68,7 @@ import {
 import {
   applyClaudePromptEffortPrefix,
   createModelSelection,
+  modelSelectionAfterExplicitModelChoice,
   resolvePromptInjectedEffort,
 } from "@t3tools/shared/model";
 import {
@@ -9400,10 +9401,25 @@ export default function ChatView(props: ChatViewProps) {
         if (options?.focusComposer !== false) scheduleComposerFocus();
         return;
       }
-      const nextModelSelection: ModelSelection = {
-        instanceId,
-        model: resolvedModel,
-      };
+      const currentDraftSelection = useComposerDraftStore
+        .getState()
+        .getComposerDraft(scopeThreadRef(activeThread.environmentId, activeThread.id))
+        ?.modelSelectionByProvider[instanceId];
+      const priorSelection =
+        (currentDraftSelection?.instanceId === instanceId ? currentDraftSelection : null) ??
+        (activeThread.modelSelection.instanceId === instanceId
+          ? activeThread.modelSelection
+          : null);
+      const nextModelSelection = modelSelectionAfterExplicitModelChoice(
+        createModelSelection(
+          instanceId,
+          resolvedModel,
+          priorSelection?.model === resolvedModel ? priorSelection.options : undefined,
+        ),
+        resolvedDriverKind,
+        priorSelection,
+        entry?.models.find((candidate) => candidate.slug === resolvedModel)?.capabilities,
+      );
       const modelChangeBlockReason = getStartedThreadModelChangeBlockReason({
         providers: providerStatuses,
         hasStartedSession: activeThread.session !== null,

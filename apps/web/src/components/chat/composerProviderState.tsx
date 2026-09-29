@@ -11,6 +11,8 @@ import {
   getProviderOptionCurrentValue,
   getProviderOptionDescriptors,
   isClaudeUltrathinkPrompt,
+  createModelSelection,
+  modelSelectionAfterExplicitModelChoice,
   normalizeModelSlug,
 } from "@t3tools/shared/model";
 import type { ReactNode } from "react";
@@ -39,6 +41,15 @@ export type ComposerProviderState = {
   composerSurfaceClassName?: string;
   modelPickerIconClassName?: string;
 };
+
+export function createMultiModelPickerSelection(
+  instanceId: ProviderInstanceId,
+  model: string,
+  provider: ProviderDriverKind | undefined,
+) {
+  const selection = createModelSelection(instanceId, model);
+  return modelSelectionAfterExplicitModelChoice(selection, provider);
+}
 
 type TraitsRenderInput = {
   provider: ProviderDriverKind;

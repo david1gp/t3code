@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import { ProviderDriverKind, type ProviderOptionDescriptor } from "@t3tools/contracts";
+import { providerOptionSelectionsAfterChange } from "@t3tools/shared/model";
 import { buildTraitsTriggerDisplay, buildUnavailableModelOptionDescriptors } from "./TraitsPicker";
 
 function selectDescriptor(
@@ -185,6 +186,53 @@ describe("buildUnavailableModelOptionDescriptors", () => {
         type: "boolean",
         currentValue: true,
       },
+    ]);
+  });
+});
+
+describe("provider option changes", () => {
+  const piDescriptors: ReadonlyArray<Extract<ProviderOptionDescriptor, { type: "select" }>> = [
+    {
+      id: "preset",
+      label: "Preset",
+      type: "select",
+      options: [
+        { id: "build", label: "Build" },
+        { id: "delegate", label: "Delegate" },
+      ],
+    },
+    {
+      id: "thinkingLevel",
+      label: "Thinking",
+      type: "select",
+      options: [
+        { id: "medium", label: "Medium", isDefault: true },
+        { id: "high", label: "High" },
+      ],
+    },
+  ];
+
+  it("selects a Pi preset without serializing the unset thinking default", () => {
+    const changed = piDescriptors.map((descriptor) =>
+      descriptor.id === "preset" ? { ...descriptor, currentValue: "build" } : descriptor,
+    );
+    expect(providerOptionSelectionsAfterChange(changed, undefined, "preset")).toEqual([
+      { id: "preset", value: "build" },
+    ]);
+  });
+
+  it("preserves an explicitly selected Pi thinking level when selecting a preset", () => {
+    const selections = [{ id: "thinkingLevel", value: "high" }];
+    const changed = piDescriptors.map((descriptor) =>
+      descriptor.id === "preset"
+        ? { ...descriptor, currentValue: "delegate" }
+        : descriptor.id === "thinkingLevel"
+          ? { ...descriptor, currentValue: "high" }
+          : descriptor,
+    );
+    expect(providerOptionSelectionsAfterChange(changed, selections, "preset")).toEqual([
+      { id: "preset", value: "delegate" },
+      { id: "thinkingLevel", value: "high" },
     ]);
   });
 });

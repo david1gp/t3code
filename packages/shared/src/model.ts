@@ -215,10 +215,39 @@ export function buildExplicitProviderOptionSelectionsFromDescriptors(
     return undefined;
   }
   const explicitIds = new Set(selections.map((selection) => selection.id));
-  const normalized = buildProviderOptionSelectionsFromDescriptors(descriptors)?.filter(
-    (selection) => explicitIds.has(selection.id),
-  );
-  return normalized && normalized.length > 0 ? normalized : undefined;
+  const normalized =
+    buildProviderOptionSelectionsFromDescriptors(descriptors)?.filter((selection) =>
+      explicitIds.has(selection.id),
+    ) ?? [];
+  // This is a dispatch-only Pi flag, not a user-facing trait descriptor.
+  if (
+    selections.some((selection) => selection.id === "modelOverride" && selection.value === true)
+  ) {
+    normalized.push({ id: "modelOverride", value: true });
+  }
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+/**
+ * Serialize an option change without turning descriptor defaults into explicit
+ * selections. Keep prior explicit values and always include the changed option.
+ */
+export function providerOptionSelectionsAfterChange(
+  descriptors: ReadonlyArray<ProviderOptionDescriptor> | null | undefined,
+  selections: ReadonlyArray<ProviderOptionSelection> | null | undefined,
+  changedId: string,
+): Array<ProviderOptionSelection> | undefined {
+  const changedIds = new Set([...(selections ?? []).map(({ id }) => id), changedId]);
+  const nextSelections =
+    buildProviderOptionSelectionsFromDescriptors(descriptors)?.filter(({ id }) =>
+      changedIds.has(id),
+    ) ?? [];
+  if (
+    selections?.some((selection) => selection.id === "modelOverride" && selection.value === true)
+  ) {
+    nextSelections.push({ id: "modelOverride", value: true });
+  }
+  return nextSelections.length > 0 ? nextSelections : undefined;
 }
 
 export function isClaudeUltrathinkPrompt(text: string | null | undefined): boolean {
@@ -384,6 +413,35 @@ export function createModelSelection(
     model,
   };
   return selections.length > 0 ? { ...base, options: selections } : base;
+}
+
+/** Mark a Pi model picker choice, keeping staged options ahead of applied options. */
+export function modelSelectionAfterExplicitModelChoice(
+  selection: ModelSelection,
+  provider: string | null | undefined,
+  previousSelection?: ModelSelection | null,
+  capabilities?: ModelCapabilities | null,
+): ModelSelection {
+  if (provider !== "pi") return selection;
+  const changingModel =
+    previousSelection?.instanceId === selection.instanceId &&
+    previousSelection.model !== selection.model;
+  const options = changingModel
+    ? (selection.options ?? previousSelection.options)?.filter((option) =>
+        capabilities?.optionDescriptors?.some(
+          (descriptor) =>
+            descriptor.id === option.id &&
+            (descriptor.type === "boolean"
+              ? typeof option.value === "boolean"
+              : typeof option.value === "string" &&
+                descriptor.options.some((choice) => choice.id === option.value)),
+        ),
+      )
+    : selection.options;
+  return createModelSelection(selection.instanceId, selection.model, [
+    ...(options ?? []).filter((option) => option.id !== "modelOverride"),
+    { id: "modelOverride", value: true },
+  ]);
 }
 
 /**

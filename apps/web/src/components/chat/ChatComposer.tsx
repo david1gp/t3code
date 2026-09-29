@@ -271,6 +271,7 @@ import {
   slashCommandItemsForPromptPosition,
 } from "./composerSlashCommandSearch";
 import {
+  createMultiModelPickerSelection,
   getComposerPromptInjectionState,
   getComposerProviderState,
   renderProviderTraitsMenuContent,
@@ -5028,7 +5029,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 const exists = current.some(matchesModel);
                 const next = exists
                   ? current.filter((selection) => !matchesModel(selection))
-                  : [...current, createModelSelection(instanceId, model)];
+                  : [
+                      ...current,
+                      createMultiModelPickerSelection(
+                        instanceId,
+                        model,
+                        providerInstanceEntries.find((entry) => entry.instanceId === instanceId)
+                          ?.driverKind,
+                      ),
+                    ];
                 if (next.length > 1) {
                   setMultipleModelSelections(next);
                 } else {

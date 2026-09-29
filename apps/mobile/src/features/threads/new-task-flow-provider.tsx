@@ -19,6 +19,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import { modelSelectionAfterExplicitModelChoice } from "@t3tools/shared/model";
 import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import * as Arr from "effect/Array";
 import { pipe } from "effect/Function";
@@ -542,7 +543,12 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       if (!option) {
         return;
       }
-      const selection = options ? { ...option.selection, options } : option.selection;
+      const selection = modelSelectionAfterExplicitModelChoice(
+        options ? { ...option.selection, options } : option.selection,
+        option.providerDriver,
+        selectedModel,
+        option.capabilities,
+      );
       const provider = selectedEnvironmentServerConfig?.providers.find(
         (candidate) => candidate.instanceId === selection.instanceId,
       );
@@ -554,7 +560,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       });
       setStickyComposerModelSelection(selection);
     },
-    [modelOptions, selectedEnvironmentServerConfig, selectedProjectDraftKey],
+    [modelOptions, selectedEnvironmentServerConfig, selectedProjectDraftKey, selectedModel],
   );
   const setSelectedModelOptions = useCallback(
     (options: ReadonlyArray<ProviderOptionSelection> | undefined) => {

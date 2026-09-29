@@ -44,7 +44,10 @@ import {
   type QuitConfirmationMode,
 } from "@t3tools/contracts/settings";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
-import { createModelSelection } from "@t3tools/shared/model";
+import {
+  createModelSelection,
+  modelSelectionAfterExplicitModelChoice,
+} from "@t3tools/shared/model";
 import * as Duration from "effect/Duration";
 import * as Equal from "effect/Equal";
 import * as Schema from "effect/Schema";
@@ -3521,7 +3524,23 @@ export function GeneralSettingsPanel() {
                       textGenerationModelSelection: resolveAppModelSelectionState(
                         {
                           ...settings,
-                          textGenerationModelSelection: createModelSelection(instanceId, model),
+                          textGenerationModelSelection: modelSelectionAfterExplicitModelChoice(
+                            createModelSelection(
+                              instanceId,
+                              model,
+                              settings.textGenerationModelSelection?.instanceId === instanceId &&
+                                settings.textGenerationModelSelection.model === model
+                                ? settings.textGenerationModelSelection.options
+                                : undefined,
+                            ),
+                            textGenerationModelInstanceEntries.find(
+                              (entry) => entry.instanceId === instanceId,
+                            )?.driverKind,
+                            textGenerationModelSelection,
+                            textGenerationModelInstanceEntries
+                              .find((entry) => entry.instanceId === instanceId)
+                              ?.models.find((candidate) => candidate.slug === model)?.capabilities,
+                          ),
                         },
                         textGenerationProviders,
                       ),

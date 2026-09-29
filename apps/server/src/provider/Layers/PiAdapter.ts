@@ -4,6 +4,7 @@ import * as NodeCrypto from "node:crypto";
 import {
   createAgentSession,
   createEventBus,
+  CONFIG_DIR_NAME,
   DefaultResourceLoader,
   getAgentDir,
   ModelRuntime,
@@ -36,6 +37,7 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
+import { piPresetNamesFromJson } from "./PiProvider.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
@@ -91,7 +93,6 @@ function defaultThinkingLevel(
 ): (typeof thinkingLevels)[number] | null {
   if (!model) return null;
   if (!model.reasoning) return "off";
-  // Match the advertised default: start at medium, clamp upward, then downward.
   const supported = thinkingLevels.filter((level) => modelSupportsThinkingLevel(model, level));
   return (
     supported.find((level) => thinkingLevels.indexOf(level) >= thinkingLevels.indexOf("medium")) ??
@@ -100,32 +101,122 @@ function defaultThinkingLevel(
   );
 }
 
-function selectedThinkingLevel(
+function selectedOptions(
   selection: ProviderSessionStartInput["modelSelection"],
   instanceId: ProviderInstanceId,
   operation: "startSession" | "sendTurn",
+  fs: FileSystem.FileSystem,
+  cwd: string,
 ) {
   if (selection?.instanceId !== instanceId || !selection.options?.length)
-    return Effect.succeed(null);
-  const options = selection.options;
-  if (options.length !== 1 || options[0]?.id !== "thinkingLevel")
+    return Effect.succeed({ preset: undefined, thinkingLevel: null, modelOverride: false });
+  const values = new Map<string, unknown>();
+  for (const option of selection.options) {
+    if (
+      (option.id !== "preset" && option.id !== "thinkingLevel" && option.id !== "modelOverride") ||
+      values.has(option.id)
+    )
+      return Effect.fail(
+        new ProviderAdapterValidationError({
+          provider,
+          operation,
+          issue: "Pi supports one preset, one thinkingLevel, and one modelOverride model option.",
+        }),
+      );
+    values.set(option.id, option.value);
+  }
+  const presetValue = values.get("preset");
+  if (values.has("preset") && (typeof presetValue !== "string" || !presetValue.trim()))
     return Effect.fail(
       new ProviderAdapterValidationError({
         provider,
         operation,
-        issue: "Pi only supports the thinkingLevel model option.",
+        issue: "Invalid Pi preset name.",
       }),
     );
-  const level = thinkingLevels.find((value) => value === options[0]?.value);
-  if (!level)
+  const thinkingValue = values.get("thinkingLevel");
+  const modelOverride = values.get("modelOverride");
+  if (values.has("modelOverride") && typeof modelOverride !== "boolean")
     return Effect.fail(
       new ProviderAdapterValidationError({
         provider,
         operation,
-        issue: `Invalid Pi thinking level: ${options[0]?.value}.`,
+        issue: "Pi modelOverride must be a boolean.",
       }),
     );
-  return Effect.succeed(level);
+  const thinkingLevel = values.has("thinkingLevel")
+    ? (thinkingLevels.find((value) => value === thinkingValue) ?? null)
+    : null;
+  if (values.has("thinkingLevel") && !thinkingLevel)
+    return Effect.fail(
+      new ProviderAdapterValidationError({
+        provider,
+        operation,
+        issue: `Invalid Pi thinking level: ${String(thinkingValue)}.`,
+      }),
+    );
+  if (!values.has("preset"))
+    return Effect.succeed({
+      preset: undefined,
+      thinkingLevel,
+      modelOverride: modelOverride === true,
+    });
+  const preset = presetValue as string;
+  if (preset === "none")
+    return Effect.succeed({ preset, thinkingLevel, modelOverride: modelOverride === true });
+  // Pi dispatches slash commands by their first whitespace-delimited argument.
+  // Keep the name a single safe token, then require it to exist in the effective config.
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(preset))
+    return Effect.fail(
+      new ProviderAdapterValidationError({
+        provider,
+        operation,
+        issue: "Invalid Pi preset name.",
+      }),
+    );
+  const readPresets = (path: string) =>
+    fs.readFile(path).pipe(
+      Effect.map((source) => {
+        let config: unknown;
+        try {
+          config = JSON.parse(new TextDecoder().decode(source));
+        } catch {
+          config = undefined;
+        }
+        return config;
+      }),
+      Effect.orElseSucceed(() => ({})),
+    );
+  return Effect.all([
+    readPresets(NodePath.join(getAgentDir(), "presets.json")),
+    readPresets(NodePath.join(cwd, CONFIG_DIR_NAME, "presets.json")),
+  ]).pipe(
+    Effect.map(([globalConfig, projectConfig]) =>
+      piPresetNamesFromJson({
+        ...(typeof globalConfig === "object" &&
+        globalConfig !== null &&
+        !Array.isArray(globalConfig)
+          ? globalConfig
+          : {}),
+        ...(typeof projectConfig === "object" &&
+        projectConfig !== null &&
+        !Array.isArray(projectConfig)
+          ? projectConfig
+          : {}),
+      }),
+    ),
+    Effect.flatMap((names) =>
+      names.includes(preset)
+        ? Effect.succeed({ preset, thinkingLevel, modelOverride: modelOverride === true })
+        : Effect.fail(
+            new ProviderAdapterValidationError({
+              provider,
+              operation,
+              issue: `Pi preset '${preset}' is unavailable in the effective presets.json.`,
+            }),
+          ),
+    ),
+  );
 }
 
 function snapshotFromMessages(
@@ -214,13 +305,19 @@ function subagentUsage(event: SubagentEvent) {
 type Session = {
   session: ProviderSession;
   readonly sessionId: string;
+  readonly cwd: string;
   readonly sdk: AgentSession;
   unsubscribe: () => void;
   readonly scope: Scope.Closeable;
   active: Turn | undefined;
+  /** Covers preflight and the SDK's asynchronous agent_settled dispatch. */
+  pendingPrompt: boolean;
   /** Background subagents settle after their spawning turn. */
   lastTurnId: TurnId | undefined;
-  readonly subagents: Set<string>;
+  appliedPreset: string | undefined;
+  appliedPresetModelOverride: boolean;
+  /** A child keeps its originating turn even if a later turn becomes active. */
+  readonly subagents: Map<string, TurnId | undefined>;
   stopped: boolean;
 };
 
@@ -281,6 +378,42 @@ export const makePiAdapter = (
           });
         yield* request("set_model", () => ctx.sdk.setModel(selected));
         ctx.session = { ...ctx.session, model };
+      });
+    const applyPreset = (ctx: Session, name: string | undefined, modelOverride: boolean) =>
+      Effect.gen(function* () {
+        // The selection was checked against the effective config; without the extension
+        // command it cannot be applied, so reject rather than proceed with stale state.
+        if (
+          name === undefined ||
+          (ctx.appliedPreset === name &&
+            (name === "none" || ctx.appliedPresetModelOverride === modelOverride))
+        )
+          return;
+        const command = ctx.sdk.extensionRunner.getCommand("preset");
+        if (!command)
+          return yield* new ProviderAdapterRequestError({
+            provider,
+            method: "preset",
+            detail: "The Pi preset command is unavailable in this session.",
+          });
+        yield* request("preset", async () => {
+          // The SDK catches extension command handler rejections and resolves prompt().
+          // Listen only for this command during its dispatch, not unrelated extension errors.
+          let commandError: string | undefined;
+          const off = ctx.sdk.extensionRunner.onError((error) => {
+            if (error.event === "command" && error.extensionPath === "command:preset")
+              commandError = error.error;
+          });
+          try {
+            await ctx.sdk.prompt(`/preset ${name}`);
+          } finally {
+            off();
+          }
+          if (commandError !== undefined)
+            throw new Error(`Pi preset command failed: ${commandError}`);
+        });
+        ctx.appliedPreset = name;
+        ctx.appliedPresetModelOverride = modelOverride;
       });
     const requireSession = (threadId: ThreadId) => {
       const ctx = sessions.get(threadId);
@@ -401,7 +534,10 @@ export const makePiAdapter = (
       Effect.gen(function* () {
         const id = text(data.id);
         if (!id || ctx.stopped) return;
-        const turnId = ctx.active?.id ?? ctx.lastTurnId;
+        const turnId =
+          kind === "started" || !ctx.subagents.has(id)
+            ? (ctx.active?.id ?? ctx.lastTurnId)
+            : ctx.subagents.get(id);
         const role = text(data.type);
         const description = text(data.description) ?? role ?? "Pi subagent";
         const linkage = {
@@ -413,7 +549,7 @@ export const makePiAdapter = (
         const taskId = RuntimeTaskId.make(`pi:${id}`);
         if (kind === "started") {
           if (ctx.subagents.has(id)) return;
-          ctx.subagents.add(id);
+          ctx.subagents.set(id, turnId);
           yield* emit({
             type: "task.started",
             ...base(ctx, turnId),
@@ -662,10 +798,12 @@ export const makePiAdapter = (
             issue: "Invalid Pi resume cursor.",
           });
         }
-        const thinkingLevel = yield* selectedThinkingLevel(
+        const { preset, thinkingLevel, modelOverride } = yield* selectedOptions(
           input.modelSelection,
           instanceId,
           "startSession",
+          fs,
+          NodePath.resolve(input.cwd.trim()),
         );
         const resumedId = sessionIdFromCursor(input.resumeCursor);
         const sessionId = resumedId ?? NodeCrypto.randomUUID();
@@ -688,8 +826,10 @@ export const makePiAdapter = (
         const { modelRuntime, model } = yield* Effect.tryPromise({
           try: async () => {
             const modelRuntime = await ModelRuntime.create();
+            // A model can be a client-supplied default, not a deliberate choice.
+            // Let session_start own the SDK model unless T3 explicitly overrides it.
             const selection =
-              input.modelSelection?.instanceId === instanceId
+              input.modelSelection?.instanceId === instanceId && modelOverride
                 ? input.modelSelection.model
                 : undefined;
             const parts = selection ? modelParts(selection) : undefined;
@@ -778,20 +918,22 @@ export const makePiAdapter = (
         });
         const previous = sessions.get(input.threadId);
         if (previous) yield* stop(previous);
-        const initialThinkingLevel = thinkingLevel ?? defaultThinkingLevel(opened.model);
-        if (initialThinkingLevel) opened.setThinkingLevel(initialThinkingLevel);
         const scope = yield* Scope.make("sequential");
         const cursor = { schemaVersion: resumeVersion, sessionId };
         const now = nowIso();
         const ctx: Session = {
           sessionId,
+          cwd,
           sdk: opened,
           unsubscribe: () => {},
           scope,
           stopped: false,
           active: undefined,
+          pendingPrompt: false,
           lastTurnId: undefined,
-          subagents: new Set(),
+          appliedPreset: undefined,
+          appliedPresetModelOverride: false,
+          subagents: new Map(),
           session: {
             provider,
             providerInstanceId: instanceId,
@@ -808,6 +950,39 @@ export const makePiAdapter = (
           ...ctx.session,
           model: opened.model ? `${opened.model.provider}/${opened.model.id}` : undefined,
         };
+        // Extension command dispatch is an SDK preflight, not a T3 turn. Apply it only
+        // after extension binding and before exposing the session to real prompts.
+        const presetResult = yield* applyPreset(ctx, preset, modelOverride).pipe(Effect.exit);
+        if (Exit.isFailure(presetResult)) {
+          opened.dispose();
+          return yield* Effect.failCause(presetResult.cause);
+        }
+        ctx.session = {
+          ...ctx.session,
+          model: opened.model ? `${opened.model.provider}/${opened.model.id}` : undefined,
+        };
+        if (model) {
+          const current = opened.model;
+          if (current?.provider !== model.provider || current.id !== model.id)
+            yield* request("set_model", () => opened.setModel(model));
+          ctx.session = { ...ctx.session, model: `${model.provider}/${model.id}` };
+        }
+        if (
+          thinkingLevel &&
+          opened.model &&
+          !modelSupportsThinkingLevel(opened.model, thinkingLevel)
+        ) {
+          opened.dispose();
+          return yield* new ProviderAdapterValidationError({
+            provider,
+            operation: "startSession",
+            issue: `Pi thinking level ${thinkingLevel} is not supported by this model.`,
+          });
+        }
+        const initialThinkingLevel =
+          thinkingLevel ??
+          (preset === "none" || model !== undefined ? defaultThinkingLevel(opened.model) : null);
+        if (initialThinkingLevel) opened.setThinkingLevel(initialThinkingLevel);
         type Queued =
           | { readonly source: "sdk"; readonly event: AgentSessionEvent }
           | {
@@ -878,26 +1053,17 @@ export const makePiAdapter = (
             issue: `Pi does not support '${unsupportedAttachment.type}' attachments.`,
           });
         }
-        const selection =
-          input.modelSelection?.instanceId === instanceId ? input.modelSelection.model : undefined;
-        const thinkingLevel = yield* selectedThinkingLevel(
+        const { preset, thinkingLevel, modelOverride } = yield* selectedOptions(
           input.modelSelection,
           instanceId,
           "sendTurn",
+          fs,
+          ctx.cwd,
         );
-        if (
-          thinkingLevel &&
-          (!selection || selection === ctx.session.model) &&
-          !ctx.sdk.getAvailableThinkingLevels().includes(thinkingLevel)
-        )
-          return yield* new ProviderAdapterValidationError({
-            provider,
-            operation: "sendTurn",
-            issue: `Pi thinking level ${thinkingLevel} is not supported by this model.`,
-          });
-        if (selection && selection !== ctx.session.model) {
-          yield* setModel(ctx, selection, thinkingLevel);
-        }
+        const selection =
+          input.modelSelection?.instanceId === instanceId && modelOverride
+            ? input.modelSelection.model
+            : undefined;
         const images: Array<{ type: "image"; data: string; mimeType: string }> = [];
         for (const attachment of input.attachments ?? []) {
           const path = resolveAttachmentPath({ attachmentsDir: config.attachmentsDir, attachment });
@@ -934,74 +1100,112 @@ export const makePiAdapter = (
             detail: "Pi is still preparing the active turn; send again once it starts.",
           });
         // An extension-triggered run whose agent_start has not been consumed yet.
-        if (!steering && ctx.sdk.isStreaming)
+        if (!steering && (ctx.pendingPrompt || ctx.sdk.isStreaming))
           return yield* new ProviderAdapterRequestError({
             provider,
             method: "prompt",
             detail:
-              "Pi is starting a follow-up run (e.g. a subagent result); send again once it starts.",
+              "Pi is finishing a prompt or starting a follow-up run; send again once it settles.",
           });
-        const promptThinkingLevel = thinkingLevel ?? defaultThinkingLevel(ctx.sdk.model);
-        if (promptThinkingLevel) ctx.sdk.setThinkingLevel(promptThinkingLevel);
-        const count = ctx.sdk.sessionManager
-          .getEntries()
-          .filter((entry) => entry.type === "message" && entry.message.role === "user").length;
-        const turn =
-          steering ?? (yield* turnBegin(ctx, TurnId.make(`pi:${ctx.sessionId}:${count}`)));
-        let accepted = false;
-        const prompt = steering
-          ? ctx.sdk.steer(message, images.length ? images : undefined)
-          : ctx.sdk.prompt(message, {
-              ...(images.length ? { images } : {}),
-              preflightResult: (success) => {
-                accepted = success;
-              },
+        // agent_settled clears active before Pi finishes emitting the event. prompt()
+        // would otherwise defer both /preset and the next user prompt, reporting success
+        // before either has run. Reserve the SDK prompt slot across all async preflight.
+        if (!steering) ctx.pendingPrompt = true;
+        return yield* Effect.gen(function* () {
+          // Do not mutate Pi's active preset/model until all send preflight and turn-eligibility
+          // checks pass. In particular, rejected attachments or a busy turn must be side-effect free.
+          yield* applyPreset(ctx, preset, modelOverride);
+          ctx.session = {
+            ...ctx.session,
+            model: ctx.sdk.model ? `${ctx.sdk.model.provider}/${ctx.sdk.model.id}` : undefined,
+          };
+          // Presets can change the SDK model/thinking level. An explicit T3 choice always wins.
+          if (selection && selection !== ctx.session.model)
+            yield* setModel(ctx, selection, thinkingLevel);
+          else if (selection) {
+            const current = ctx.sdk.model;
+            const parts = modelParts(selection);
+            if (parts && (current?.provider !== parts.provider || current.id !== parts.modelId))
+              yield* setModel(ctx, selection, thinkingLevel);
+          }
+          if (thinkingLevel && !ctx.sdk.getAvailableThinkingLevels().includes(thinkingLevel))
+            return yield* new ProviderAdapterValidationError({
+              provider,
+              operation: "sendTurn",
+              issue: `Pi thinking level ${thinkingLevel} is not supported by this model.`,
             });
-        const response = yield* Effect.tryPromise({
-          try: () => prompt,
-          catch: (cause) =>
-            new ProviderAdapterRequestError({
+          const promptThinkingLevel =
+            thinkingLevel ??
+            (preset === "none" || selection !== undefined
+              ? defaultThinkingLevel(ctx.sdk.model)
+              : null);
+          if (promptThinkingLevel) ctx.sdk.setThinkingLevel(promptThinkingLevel);
+          const count = ctx.sdk.sessionManager
+            .getEntries()
+            .filter((entry) => entry.type === "message" && entry.message.role === "user").length;
+          const turn =
+            steering ?? (yield* turnBegin(ctx, TurnId.make(`pi:${ctx.sessionId}:${count}`)));
+          let accepted = false;
+          const prompt = steering
+            ? ctx.sdk.steer(message, images.length ? images : undefined)
+            : ctx.sdk.prompt(message, {
+                ...(images.length ? { images } : {}),
+                preflightResult: (success) => {
+                  accepted = success;
+                },
+              });
+          const response = yield* Effect.tryPromise({
+            try: () => prompt,
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider,
+                method: "prompt",
+                detail: String(cause),
+                cause,
+              }),
+          }).pipe(Effect.exit);
+          if (Exit.isFailure(response)) {
+            if (!steering) yield* failPrompt(ctx, turn, String(response.cause));
+            if (!steering && turn.interrupted) {
+              return {
+                threadId: input.threadId,
+                turnId: turn.id,
+                resumeCursor: ctx.session.resumeCursor,
+              };
+            }
+            return yield* Effect.failCause(response.cause);
+          }
+          if (!steering && !accepted) {
+            yield* failPrompt(ctx, turn, "Pi did not accept the prompt.");
+            return yield* new ProviderAdapterRequestError({
               provider,
               method: "prompt",
-              detail: String(cause),
-              cause,
-            }),
-        }).pipe(Effect.exit);
-        if (Exit.isFailure(response)) {
-          if (!steering) yield* failPrompt(ctx, turn, String(response.cause));
-          if (!steering && turn.interrupted) {
+              detail: "Pi did not accept the prompt.",
+            });
+          }
+          if (steering)
             return {
               threadId: input.threadId,
               turnId: turn.id,
               resumeCursor: ctx.session.resumeCursor,
             };
+          if (turn.interrupted && !ctx.stopped && ctx.active === turn) {
+            ctx.sdk.clearQueue();
+            yield* request("abort", () => ctx.sdk.abort());
           }
-          return yield* Effect.failCause(response.cause);
-        }
-        if (!steering && !accepted) {
-          yield* failPrompt(ctx, turn, "Pi did not accept the prompt.");
-          return yield* new ProviderAdapterRequestError({
-            provider,
-            method: "prompt",
-            detail: "Pi did not accept the prompt.",
-          });
-        }
-        if (steering)
+          yield* Deferred.await(turn.settled);
           return {
             threadId: input.threadId,
             turnId: turn.id,
             resumeCursor: ctx.session.resumeCursor,
           };
-        if (turn.interrupted && !ctx.stopped && ctx.active === turn) {
-          ctx.sdk.clearQueue();
-          yield* request("abort", () => ctx.sdk.abort());
-        }
-        yield* Deferred.await(turn.settled);
-        return {
-          threadId: input.threadId,
-          turnId: turn.id,
-          resumeCursor: ctx.session.resumeCursor,
-        };
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (!steering) ctx.pendingPrompt = false;
+            }),
+          ),
+        );
       });
 
     const interruptTurn: ProviderAdapterShape<

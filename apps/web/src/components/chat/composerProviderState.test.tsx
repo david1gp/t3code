@@ -5,9 +5,16 @@ import {
   type ProviderOptionSelection,
   type ServerProviderModel,
 } from "@t3tools/contracts";
-import { getProviderOptionDescriptors } from "@t3tools/shared/model";
+import {
+  createModelSelection,
+  getProviderOptionDescriptors,
+  modelSelectionAfterExplicitModelChoice,
+  providerOptionSelectionsAfterChange,
+} from "@t3tools/shared/model";
+import { ProviderInstanceId } from "@t3tools/contracts";
 import { getProviderModelCapabilities } from "../../providerModels";
 import {
+  createMultiModelPickerSelection,
   getComposerPromptInjectionState,
   getComposerProviderState,
   renderProviderTraitsMenuContent,
@@ -73,6 +80,129 @@ const ULTRATHINK_FRAME_CLASSES = {
 } as const;
 
 describe("getComposerProviderState", () => {
+  it("marks explicit Pi models selected in the multi-model picker as overrides only for Pi", () => {
+    const instanceId = ProviderInstanceId.make("pi_work");
+    expect(
+      createMultiModelPickerSelection(instanceId, "pi-model", ProviderDriverKind.make("pi")),
+    ).toEqual(createModelSelection(instanceId, "pi-model", selections(["modelOverride", true])));
+    expect(
+      createMultiModelPickerSelection(instanceId, "codex-model", ProviderDriverKind.make("codex")),
+    ).toEqual(createModelSelection(instanceId, "codex-model"));
+    expect(createMultiModelPickerSelection(instanceId, "default-model", undefined)).toEqual(
+      createModelSelection(instanceId, "default-model"),
+    );
+  });
+
+  it("keeps an advertised Pi preset across models while marking the explicit model override", () => {
+    const preset = selectDescriptor("preset", [
+      { id: "none", label: "Default", isDefault: true },
+      { id: "build", label: "Build" },
+    ]);
+    const thinking = selectDescriptor("thinkingLevel", [
+      { id: "low", label: "Low", isDefault: true },
+      { id: "high", label: "High" },
+    ]);
+    const models: ReadonlyArray<ServerProviderModel> = [
+      {
+        slug: "first",
+        name: "First",
+        isCustom: false,
+        capabilities: { optionDescriptors: [preset, thinking] },
+      },
+      {
+        slug: "second",
+        name: "Second",
+        isCustom: false,
+        capabilities: {
+          optionDescriptors: [preset, thinking],
+        },
+      },
+    ];
+    const previous = createModelSelection(
+      ProviderInstanceId.make("pi_work"),
+      "first",
+      selections(["preset", "build"], ["thinkingLevel", "high"], ["removed", "invalid"]),
+    );
+    const next = modelSelectionAfterExplicitModelChoice(
+      createModelSelection(previous.instanceId, "second"),
+      "pi",
+      previous,
+      models[1]!.capabilities,
+    );
+    expect(next.options).toEqual(
+      selections(["preset", "build"], ["thinkingLevel", "high"], ["modelOverride", true]),
+    );
+    expect(
+      getComposerProviderState({
+        provider: ProviderDriverKind.make("pi"),
+        model: "second",
+        models,
+        modelOptions: next.options,
+        planModeEnabled: false,
+      }).modelOptionsForDispatch,
+    ).toEqual(next.options);
+    expect(
+      modelSelectionAfterExplicitModelChoice(
+        createModelSelection(ProviderInstanceId.make("pi_other"), "second"),
+        "pi",
+        previous,
+        models[1]!.capabilities,
+      ).options,
+    ).toEqual(selections(["modelOverride", true]));
+    expect(
+      modelSelectionAfterExplicitModelChoice(
+        createModelSelection(previous.instanceId, "second"),
+        "codex",
+        previous,
+        models[1]!.capabilities,
+      ).options,
+    ).toBeUndefined();
+  });
+
+  it("dispatches Pi preset-only choices without a model marker, but retains a picker choice through thinking edits", () => {
+    const models = modelWith([
+      selectDescriptor("preset", [
+        { id: "none", label: "Default", isDefault: true },
+        { id: "build", label: "Build" },
+      ]),
+      selectDescriptor("thinkingLevel", [
+        { id: "low", label: "Low", isDefault: true },
+        { id: "high", label: "High" },
+      ]),
+    ]);
+    const base = createModelSelection(
+      ProviderInstanceId.make("pi"),
+      MODEL,
+      selections(["preset", "build"]),
+    );
+    const state = (options: ReadonlyArray<ProviderOptionSelection> | undefined) =>
+      getComposerProviderState({
+        provider: ProviderDriverKind.make("pi"),
+        model: MODEL,
+        models,
+        modelOptions: options,
+        planModeEnabled: false,
+      }).modelOptionsForDispatch;
+    expect(state(base.options)).toEqual(selections(["preset", "build"]));
+
+    const picked = modelSelectionAfterExplicitModelChoice(base, "pi");
+    const descriptors = getProviderOptionDescriptors({
+      caps: models[0]!.capabilities!,
+      selections: picked.options,
+    });
+    const edited = providerOptionSelectionsAfterChange(
+      descriptors.map((descriptor) =>
+        descriptor.id === "thinkingLevel" && descriptor.type === "select"
+          ? { ...descriptor, currentValue: "high" }
+          : descriptor,
+      ),
+      picked.options,
+      "thinkingLevel",
+    );
+    expect(state(edited)).toEqual(
+      selections(["preset", "build"], ["thinkingLevel", "high"], ["modelOverride", true]),
+    );
+  });
   it("derives a stable prompt injection state for ordinary prompt edits", () => {
     expect(getComposerPromptInjectionState("Investigate this failure")).toBe("none");
     expect(getComposerPromptInjectionState("Ultrathink:\nInvestigate this failure")).toBe(

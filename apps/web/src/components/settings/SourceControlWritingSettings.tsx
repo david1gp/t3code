@@ -6,7 +6,10 @@ import type {
   SourceControlWritingStyleMode,
 } from "@t3tools/contracts";
 import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
-import { createModelSelection } from "@t3tools/shared/model";
+import {
+  createModelSelection,
+  modelSelectionAfterExplicitModelChoice,
+} from "@t3tools/shared/model";
 import { resolveSourceControlWriterModelSelection } from "@t3tools/shared/serverSettings";
 
 import {
@@ -329,7 +332,22 @@ export function SourceControlWritingSettingsSection() {
                       return;
                     }
                     updateSettings({
-                      sourceControlWriterModelSelection: createModelSelection(instanceId, model),
+                      sourceControlWriterModelSelection: modelSelectionAfterExplicitModelChoice(
+                        createModelSelection(
+                          instanceId,
+                          model,
+                          activeSelection.instanceId === instanceId &&
+                            activeSelection.model === model
+                            ? activeSelection.options
+                            : undefined,
+                        ),
+                        instanceEntries.find((entry) => entry.instanceId === instanceId)
+                          ?.driverKind,
+                        activeSelection,
+                        instanceEntries
+                          .find((entry) => entry.instanceId === instanceId)
+                          ?.models.find((candidate) => candidate.slug === model)?.capabilities,
+                      ),
                     });
                   }}
                 />

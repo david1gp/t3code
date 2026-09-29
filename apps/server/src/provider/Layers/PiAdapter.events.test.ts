@@ -1,8 +1,12 @@
 // @effect-diagnostics nodeBuiltinImport:off - SDK sessions persist in isolated test state.
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   createAgentSession,
   createEventBus,
+  CONFIG_DIR_NAME,
   ModelRuntime,
   type AgentSession,
   type AgentSessionEvent,
@@ -20,6 +24,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { ServerConfig } from "../../config.ts";
 import { makePiAdapter } from "./PiAdapter.ts";
@@ -36,6 +41,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
 const testLayer = ServerConfig.layerTest(process.cwd(), { prefix: "pi-sdk-events-test-" }).pipe(
   Layer.provideMerge(NodeServices.layer),
 );
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const threadId = ThreadId.make("pi-sdk-events");
 const start = {
   threadId,
@@ -68,6 +74,8 @@ function sdkSession(
     readonly restoredModel?: AgentSession["model"];
     readonly listen?: (emit: (event: AgentSessionEvent) => void) => void;
     readonly contextUsage?: () => ReturnType<AgentSession["getContextUsage"]>;
+    readonly presetCommand?: boolean;
+    readonly onPrompt?: (text: string) => void;
   } = {},
 ) {
   vi.mocked(createAgentSession).mockImplementation(async (sessionOptions) => {
@@ -106,9 +114,17 @@ function sdkSession(
           return () => {};
         },
         bindExtensions: async () => {},
-        extensionRunner: { hasHandlers: () => false, emit: async () => undefined },
-        prompt: (_text: string, config: { preflightResult: (success: boolean) => void }) =>
-          prompt(listener, config.preflightResult),
+        extensionRunner: {
+          hasHandlers: () => false,
+          emit: async () => undefined,
+          getCommand: () => (sdkOptions.presetCommand ? {} : undefined),
+          onError: () => () => {},
+        },
+        prompt: (text: string, config: { preflightResult: (success: boolean) => void }) => {
+          sdkOptions.onPrompt?.(text);
+          if (text.startsWith("/preset ")) return Promise.resolve();
+          return prompt(listener, config.preflightResult);
+        },
         get isStreaming() {
           return sdkOptions.isStreaming?.() ?? false;
         },
@@ -142,63 +158,145 @@ it.effect("applies a selected thinking level to the new Pi session without chang
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );
 
-it.effect("uses the advertised medium default instead of SDK high when no level is sent", () =>
+it.effect(
+  "uses model defaults for explicit model selections but preserves SDK thinking otherwise",
+  () =>
+    Effect.gen(function* () {
+      const model = (yield* Effect.promise(() => ModelRuntime.create()))
+        .getModels()
+        .find(
+          (candidate) =>
+            candidate.reasoning &&
+            candidate.thinkingLevelMap?.medium !== null &&
+            candidate.thinkingLevelMap?.high !== null,
+        )!;
+      let currentLevel = "high"; // The SDK restored/configured level.
+      const applied: string[] = [];
+      const prompts: string[] = [];
+      sdkSession(
+        async (emit, preflight) => {
+          prompts.push(currentLevel);
+          preflight(true);
+          emit({ type: "agent_settled" });
+        },
+        {
+          availableLevels: () => ["off", "minimal", "low", "medium", "high"],
+          setThinkingLevel: (level) => {
+            currentLevel = level;
+            applied.push(level);
+          },
+        },
+      );
+      const adapter = yield* makePiAdapter();
+      const events: ProviderRuntimeEvent[] = [];
+      yield* adapter.streamEvents.pipe(
+        Stream.runForEach((event) =>
+          Effect.sync(() => {
+            events.push(event);
+          }),
+        ),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      const modelSelection = {
+        instanceId: ProviderInstanceId.make("pi"),
+        model: `${model.provider}/${model.id}`,
+        options: [{ id: "modelOverride", value: true }],
+      };
+      yield* adapter.startSession({ ...start, modelSelection });
+      assert.deepEqual(applied, ["medium"]);
+      assert.isUndefined(vi.mocked(createAgentSession).mock.lastCall?.[0]?.thinkingLevel);
+      yield* adapter.sendTurn({ threadId, input: "first", modelSelection });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "explicit high",
+        modelSelection: {
+          ...modelSelection,
+          options: [...modelSelection.options, { id: "thinkingLevel", value: "high" }],
+        },
+      });
+      yield* adapter.sendTurn({ threadId, input: "default again" });
+      assert.deepEqual(prompts, ["medium", "high", "high"]);
+      assert.deepEqual(applied, ["medium", "medium", "high"]);
+      assert.deepEqual(
+        events
+          .filter((event) => event.type === "turn.started")
+          .map((event) => event.payload.effort),
+        ["medium", "high", "high"],
+      );
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect(
+  "does not override the extension's thinking default on a fresh no-selection session",
+  () =>
+    Effect.gen(function* () {
+      const applied: string[] = [];
+      sdkSession(async () => {}, { setThinkingLevel: (level) => applied.push(level) });
+      const adapter = yield* makePiAdapter();
+      yield* adapter.startSession(start);
+      assert.deepEqual(applied, []);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("explicit model override with none restores the model-derived thinking default", () =>
   Effect.gen(function* () {
-    const model = (yield* Effect.promise(() => ModelRuntime.create()))
-      .getModels()
-      .find(
-        (candidate) =>
-          candidate.reasoning &&
-          candidate.thinkingLevelMap?.medium !== null &&
-          candidate.thinkingLevelMap?.high !== null,
-      )!;
-    let currentLevel = "high"; // The SDK restored/configured level.
+    const model = (yield* Effect.promise(() => ModelRuntime.create())).getAvailableSnapshot()[0]!;
     const applied: string[] = [];
     const prompts: string[] = [];
-    sdkSession(
-      async (emit, preflight) => {
-        prompts.push(currentLevel);
-        preflight(true);
-        emit({ type: "agent_settled" });
-      },
-      {
-        availableLevels: () => ["off", "minimal", "low", "medium", "high"],
-        setThinkingLevel: (level) => {
-          currentLevel = level;
-          applied.push(level);
-        },
-      },
-    );
-    const adapter = yield* makePiAdapter();
-    const events: ProviderRuntimeEvent[] = [];
-    yield* adapter.streamEvents.pipe(
-      Stream.runForEach((event) =>
-        Effect.sync(() => {
-          events.push(event);
-        }),
-      ),
-      Effect.forkScoped({ startImmediately: true }),
-    );
-    const modelSelection = {
-      instanceId: ProviderInstanceId.make("pi"),
-      model: `${model.provider}/${model.id}`,
-    };
-    yield* adapter.startSession({ ...start, modelSelection });
-    assert.deepEqual(applied, ["medium"]);
-    assert.isUndefined(vi.mocked(createAgentSession).mock.lastCall?.[0]?.thinkingLevel);
-    yield* adapter.sendTurn({ threadId, input: "first", modelSelection });
-    yield* adapter.sendTurn({
-      threadId,
-      input: "explicit high",
-      modelSelection: { ...modelSelection, options: [{ id: "thinkingLevel", value: "high" }] },
+    sdkSession(async () => {}, {
+      presetCommand: true,
+      onPrompt: (text) => prompts.push(text),
+      setThinkingLevel: (level) => applied.push(level),
     });
-    yield* adapter.sendTurn({ threadId, input: "default again" });
-    assert.deepEqual(prompts, ["medium", "high", "medium"]);
-    assert.deepEqual(applied, ["medium", "medium", "high", "medium"]);
-    assert.deepEqual(
-      events.filter((event) => event.type === "turn.started").map((event) => event.payload.effort),
-      ["medium", "high", "medium"],
+    const adapter = yield* makePiAdapter();
+    yield* adapter.startSession({
+      ...start,
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("pi"),
+        model: `${model.provider}/${model.id}`,
+        options: [
+          { id: "preset", value: "none" },
+          { id: "modelOverride", value: true },
+        ],
+      },
+    });
+    assert.deepEqual(prompts, ["/preset none"]);
+    assert.deepEqual(applied, ["medium"]);
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("validates project presets from the effective extension config", () =>
+  Effect.gen(function* () {
+    const model = (yield* Effect.promise(() => ModelRuntime.create())).getAvailableSnapshot()[0]!;
+    const projectDir = yield* Effect.acquireRelease(
+      Effect.promise(() => NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "pi-project-presets-"))),
+      (path) => Effect.promise(() => NodeFSP.rm(path, { recursive: true, force: true })),
     );
+    yield* Effect.promise(() =>
+      NodeFSP.mkdir(NodePath.join(projectDir, CONFIG_DIR_NAME), { recursive: true }),
+    );
+    yield* Effect.promise(() =>
+      NodeFSP.writeFile(
+        NodePath.join(projectDir, CONFIG_DIR_NAME, "presets.json"),
+        encodeJson({ projectpreset: { thinkingLevel: "high" } }),
+      ),
+    );
+    const prompts: string[] = [];
+    sdkSession(async () => {}, { presetCommand: true, onPrompt: (text) => prompts.push(text) });
+    const adapter = yield* makePiAdapter();
+    yield* adapter.startSession({
+      ...start,
+      cwd: projectDir,
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("pi"),
+        model: `${model.provider}/${model.id}`,
+        options: [{ id: "preset", value: "projectpreset" }],
+      },
+    });
+    assert.deepEqual(prompts, ["/preset projectpreset"]);
     yield* adapter.stopSession(threadId);
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );
@@ -241,8 +339,8 @@ it.effect("keeps restored off-only models off with no thinking option", () =>
       const adapter = yield* makePiAdapter();
       yield* adapter.startSession(start);
       yield* adapter.sendTurn({ threadId, input: "off-only" });
-      assert.deepEqual(applied, ["off", "off"]);
-      assert.deepEqual(prompts, ["off"]);
+      assert.deepEqual(applied, []);
+      assert.deepEqual(prompts, ["high"]);
       yield* adapter.stopSession(threadId);
     }
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
@@ -264,7 +362,10 @@ it.effect("rejects an unsupported explicit start level before opening or stoppin
         modelSelection: {
           instanceId: ProviderInstanceId.make("pi"),
           model: `${model.provider}/${model.id}`,
-          options: [{ id: "thinkingLevel", value: "high" }],
+          options: [
+            { id: "modelOverride", value: true },
+            { id: "thinkingLevel", value: "high" },
+          ],
         },
       })
       .pipe(Effect.flip);
@@ -300,11 +401,14 @@ it.effect(
         modelSelection: {
           instanceId: ProviderInstanceId.make("pi"),
           model: "test/reasoning",
-          options: [{ id: "thinkingLevel", value: "off" }],
+          options: [
+            { id: "modelOverride", value: true },
+            { id: "thinkingLevel", value: "off" },
+          ],
         },
       });
       yield* adapter.sendTurn({ threadId, input: "second" });
-      assert.deepEqual(calls, ["model", "thinking:off", "prompt", "thinking:medium", "prompt"]);
+      assert.deepEqual(calls, ["model", "thinking:off", "prompt", "prompt"]);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );
 
@@ -349,7 +453,11 @@ it.effect("clamps absent thinking levels using the selected model's SDK mapping"
       yield* adapter.sendTurn({
         threadId,
         input: model,
-        modelSelection: { instanceId: ProviderInstanceId.make("pi"), model: `test/${model}` },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("pi"),
+          model: `test/${model}`,
+          options: [{ id: "modelOverride", value: true }],
+        },
       });
       assert.deepEqual(calls, ["model", `thinking:${expected}`, `prompt:${expected}`]);
     }
@@ -391,7 +499,10 @@ it.effect(
           modelSelection: {
             instanceId: ProviderInstanceId.make("pi"),
             model: "test/plain",
-            options: [{ id: "thinkingLevel", value: "high" }],
+            options: [
+              { id: "modelOverride", value: true },
+              { id: "thinkingLevel", value: "high" },
+            ],
           },
         })
         .pipe(Effect.flip);
@@ -575,6 +686,55 @@ it.effect("rejects a concurrent send during Pi preflight without starting a seco
       ["completed"],
     );
     assert.equal(events.filter((event) => event.type === "turn.started").length, 1);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("does not defer a preset or user prompt behind an unsettled SDK prompt", () =>
+  Effect.gen(function* () {
+    let releasePrompt!: () => void;
+    const promptFinished = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+    const calls: string[] = [];
+    sdkSession(
+      async (emit, preflight) => {
+        preflight(true);
+        emit({ type: "agent_settled" });
+        // Pi emits agent_settled before prompt() has finished its async dispatch.
+        await promptFinished;
+      },
+      { presetCommand: true, onPrompt: (text) => calls.push(text) },
+    );
+    const adapter = yield* makePiAdapter();
+    const settled = yield* Deferred.make<void>();
+    yield* adapter.streamEvents.pipe(
+      Stream.runForEach((event) =>
+        event.type === "turn.completed" ? Deferred.succeed(settled, undefined) : Effect.void,
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    yield* adapter.startSession(start);
+    const first = yield* Effect.forkChild(adapter.sendTurn({ threadId, input: "first" }), {
+      startImmediately: true,
+    });
+    yield* Deferred.await(settled);
+    assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+    const secondInput = {
+      threadId,
+      input: "second",
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("pi"),
+        model: "test/model",
+        options: [{ id: "preset", value: "none" }],
+      },
+    };
+    const rejected = yield* adapter.sendTurn(secondInput).pipe(Effect.flip);
+    assert.equal(rejected._tag, "ProviderAdapterRequestError");
+    assert.deepEqual(calls, ["first"]);
+    releasePrompt();
+    yield* Fiber.join(first);
+    yield* adapter.sendTurn(secondInput);
+    assert.deepEqual(calls, ["first", "/preset none", "second"]);
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );
 
@@ -883,6 +1043,115 @@ it.effect("maps the Pi Agent tool to a subagent tool call", () =>
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );
 
+it.effect("keeps background subagent tasks on their originating turn across later turns", () =>
+  Effect.gen(function* () {
+    let prompts = 0;
+    let releaseSecond!: () => void;
+    const secondFinished = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    let secondEntered!: () => void;
+    const secondStarted = new Promise<void>((resolve) => {
+      secondEntered = resolve;
+    });
+    const agentBus = () =>
+      vi.mocked(createEventBus).mock.results.at(-1)?.value as ReturnType<typeof createEventBus>;
+    sdkSession(async (emit, preflight) => {
+      preflight(true);
+      if (prompts++ === 0) {
+        agentBus().emit("subagents:started", { id: "late-success", description: "Scan" });
+        agentBus().emit("subagents:started", { id: "late-failure", description: "Review" });
+        emit({ type: "agent_settled" });
+        return;
+      }
+      secondEntered();
+      await secondFinished;
+      emit({ type: "agent_settled" });
+    });
+    const adapter = yield* makePiAdapter();
+    const events: ProviderRuntimeEvent[] = [];
+    const preactiveStarted = yield* Deferred.make<void>();
+    const tasksSettled = yield* Deferred.make<void>();
+    const restartedSettled = yield* Deferred.make<void>();
+    yield* adapter.streamEvents.pipe(
+      Stream.runForEach((event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "task.started" && event.payload.taskId === "pi:before-turn")
+            yield* Deferred.succeed(preactiveStarted, undefined);
+          if (events.filter((entry) => entry.type === "task.completed").length === 3)
+            yield* Deferred.succeed(tasksSettled, undefined);
+          if (events.filter((entry) => entry.type === "task.completed").length === 4)
+            yield* Deferred.succeed(restartedSettled, undefined);
+        }),
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    yield* adapter.startSession(start);
+    agentBus().emit("subagents:started", { id: "before-turn", description: "Early" });
+    yield* Deferred.await(preactiveStarted);
+    const first = yield* adapter.sendTurn({ threadId, input: "spawn two children" });
+    // The test SDK does not persist prompts; advance its message count for a distinct parent ID.
+    const sessionManager = vi.mocked(createAgentSession).mock.lastCall?.[0]?.sessionManager;
+    assert.isDefined(sessionManager);
+    sessionManager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "spawn two children" }],
+      timestamp: 1,
+    });
+    const second = yield* Effect.forkChild(adapter.sendTurn({ threadId, input: "next turn" }), {
+      startImmediately: true,
+    });
+    yield* Effect.promise(() => secondStarted);
+    const secondTurnId = (yield* adapter.listSessions())[0]?.activeTurnId;
+    assert.isDefined(secondTurnId);
+    assert.notEqual(secondTurnId, first.turnId);
+    agentBus().emit("subagents:completed", { id: "late-success", result: "found it" });
+    agentBus().emit("subagents:failed", { id: "late-failure", error: "review failed" });
+    agentBus().emit("subagents:completed", { id: "before-turn", result: "early result" });
+    yield* Deferred.await(tasksSettled);
+    assert.deepEqual(
+      events
+        .filter((event) => event.type === "task.started" || event.type === "task.completed")
+        .map((event) => [
+          event.type,
+          event.payload.taskId,
+          event.turnId,
+          ...(event.type === "task.completed" ? [event.payload.status] : []),
+        ]),
+      [
+        ["task.started", RuntimeTaskId.make("pi:before-turn"), undefined],
+        ["task.started", RuntimeTaskId.make("pi:late-success"), first.turnId],
+        ["task.started", RuntimeTaskId.make("pi:late-failure"), first.turnId],
+        ["task.completed", RuntimeTaskId.make("pi:late-success"), first.turnId, "completed"],
+        ["task.completed", RuntimeTaskId.make("pi:late-failure"), first.turnId, "failed"],
+        ["task.completed", RuntimeTaskId.make("pi:before-turn"), undefined, "completed"],
+      ],
+    );
+    // A terminal event releases the ID, so a later lifecycle can bind to this turn.
+    agentBus().emit("subagents:started", { id: "late-failure", description: "Retry" });
+    agentBus().emit("subagents:completed", { id: "late-failure", result: "retried" });
+    yield* Deferred.await(restartedSettled);
+    assert.deepEqual(
+      events
+        .filter(
+          (event) =>
+            (event.type === "task.started" || event.type === "task.completed") &&
+            event.payload.taskId === RuntimeTaskId.make("pi:late-failure"),
+        )
+        .slice(-2)
+        .map((event) => [event.type, event.turnId]),
+      [
+        ["task.started", secondTurnId],
+        ["task.completed", secondTurnId],
+      ],
+    );
+    releaseSecond();
+    assert.equal((yield* Fiber.join(second)).turnId, secondTurnId);
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
 it.effect(
   "reports Pi context size, API-equivalent turn cost and pi-subagents lifecycle as tasks",
   () =>
@@ -896,6 +1165,11 @@ it.effect(
           >;
           // A pi-subagents Agent tool call launches a child during the turn.
           bus.emit("subagents:started", { id: "agent-1", type: "explore", description: "Scan" });
+          bus.emit("subagents:started", {
+            id: "agent-2",
+            type: "review",
+            description: "Review changes",
+          });
           emit({
             type: "message_end",
             message: {
@@ -926,6 +1200,27 @@ it.effect(
               cacheWrite: 0,
               totalTokens: 100,
               cost: { total: 0.002 },
+            },
+          });
+          // pi-subagents buildEventData() includes both result and error,
+          // plus lifecycle metadata even when a child fails.
+          bus.emit("subagents:failed", {
+            id: "agent-2",
+            type: "review",
+            description: "Review changes",
+            result: "",
+            error: "Review agent exited with code 1",
+            status: "error",
+            toolUses: 1,
+            durationMs: 450,
+            tokens: { input: 20, output: 4, total: 24 },
+            usage: {
+              input: 20,
+              output: 4,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 24,
+              cost: { total: 0.0005 },
             },
           });
           emit({ type: "agent_settled" });
@@ -982,6 +1277,18 @@ it.effect(
             },
           },
           {
+            type: "task.started",
+            turnId: turn.turnId,
+            payload: {
+              taskId: RuntimeTaskId.make("pi:agent-2"),
+              description: "Review changes",
+              taskType: "subagent",
+              agentKind: "agent",
+              title: "Review changes",
+              role: "review",
+            },
+          },
+          {
             type: "task.completed",
             turnId: turn.turnId,
             payload: {
@@ -1002,6 +1309,28 @@ it.effect(
               agentKind: "agent",
               title: "Scan",
               role: "explore",
+            },
+          },
+          {
+            type: "task.completed",
+            turnId: turn.turnId,
+            payload: {
+              taskId: RuntimeTaskId.make("pi:agent-2"),
+              status: "failed",
+              summary: "Review agent exited with code 1",
+              typedUsage: {
+                totalTokens: 24,
+                inputTokens: 20,
+                cachedInputTokens: 0,
+                outputTokens: 4,
+                toolUses: 1,
+                durationMs: 450,
+                costUsd: 0.0005,
+              },
+              taskType: "subagent",
+              agentKind: "agent",
+              title: "Review changes",
+              role: "review",
             },
           },
         ],

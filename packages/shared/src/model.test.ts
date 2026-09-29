@@ -7,6 +7,7 @@ import {
   buildProviderOptionSelectionsFromDescriptors,
   createModelCapabilities,
   createModelSelection,
+  modelSelectionAfterExplicitModelChoice,
   getModelSelectionBooleanOptionValue,
   getModelSelectionStringOptionValue,
   getProviderOptionDescriptors,
@@ -144,6 +145,35 @@ describe("descriptor helpers", () => {
         { id: "fastMode", value: true },
       ],
     });
+  });
+
+  it("prioritizes a staged Pi preset when the model changes", () => {
+    const previous = createModelSelection(ProviderInstanceId.make("pi"), "first", [
+      { id: "preset", value: "none" },
+    ]);
+    const staged = createModelSelection(previous.instanceId, "second", [
+      { id: "preset", value: "build" },
+    ]);
+    const capabilities = createModelCapabilities({
+      optionDescriptors: [
+        {
+          id: "preset",
+          label: "Preset",
+          type: "select",
+          options: [
+            { id: "none", label: "Default" },
+            { id: "build", label: "Build" },
+          ],
+        },
+      ],
+    });
+
+    expect(modelSelectionAfterExplicitModelChoice(staged, "pi", previous, capabilities)).toEqual(
+      createModelSelection(previous.instanceId, "second", [
+        { id: "preset", value: "build" },
+        { id: "modelOverride", value: true },
+      ]),
+    );
   });
 
   it("reads typed option selection values", () => {
