@@ -1,11 +1,17 @@
 // @effect-diagnostics nodeBuiltinImport:off - Pi SDK runtime resolves its standard credential directory.
-import { getAgentDir, ModelRuntime, VERSION } from "@earendil-works/pi-coding-agent";
+import {
+  DefaultResourceLoader,
+  getAgentDir,
+  ModelRuntime,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import { PiSettings, ProviderDriverKind } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
+import serverPackage from "../../../package.json" with { type: "json" };
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import type { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -18,6 +24,7 @@ import {
   piAuthFromSdk,
   piModelsFromSdk,
   piPresetNamesFromJson,
+  piPromptTemplatesToSlashCommands,
 } from "../Layers/PiProvider.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
@@ -32,8 +39,13 @@ import {
   type ProviderSnapshotSettings,
 } from "../providerUpdateSettings.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
+import { piSkillsToServerProviderSkills } from "../piSkillsToServerProviderSkills.ts";
+import { piExtensionCommandsForResources } from "../piExtensionCommandsForResources.ts";
 
 const DRIVER = ProviderDriverKind.make("pi");
+// SDK VERSION resolves package.json relative to import.meta.url, which becomes T3's
+// package directory in the server bundle. The exact dependency pin identifies the embedded SDK.
+const SDK_VERSION = serverPackage.dependencies["@earendil-works/pi-coding-agent"];
 const decodeSettings = Schema.decodeSync(PiSettings);
 const maintenance = makeManualOnlyProviderMaintenanceCapabilities({
   provider: DRIVER,
@@ -48,6 +60,26 @@ async function readPiPresetNames(): Promise<ReadonlyArray<string>> {
     // A missing or malformed optional preset file must not block Pi discovery.
     return [];
   }
+}
+
+/** Discover the same cwd-aware global/project resources used by Pi sessions. */
+export async function piResourcesForCwd(cwd: string) {
+  const agentDir = getAgentDir();
+  const settingsManager = SettingsManager.create(cwd, agentDir);
+  const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+  await loader.reload();
+  const extensionCommands = await piExtensionCommandsForResources(cwd, loader.getExtensions());
+  const extensionNames = new Set(extensionCommands.map((command) => command.name));
+  return {
+    // Pi resolves registered extension commands before expanding prompt templates.
+    slashCommands: [
+      ...extensionCommands,
+      ...piPromptTemplatesToSlashCommands(loader.getPrompts().prompts).filter(
+        (command) => !extensionNames.has(command.name),
+      ),
+    ],
+    skills: piSkillsToServerProviderSkills(loader.getSkills().skills),
+  };
 }
 
 export type PiDriverEnv =
@@ -111,7 +143,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
             settings,
             models: [],
             installed: true,
-            version: VERSION,
+            version: SDK_VERSION,
             message: "The embedded Pi SDK model catalog could not be read.",
           });
         }
@@ -119,7 +151,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
           settings,
           models: result.success.value.models,
           installed: true,
-          version: VERSION,
+          version: SDK_VERSION,
           auth: result.success.value.auth,
         });
       }).pipe(Effect.map(stampIdentity));
@@ -146,6 +178,19 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
             }),
         ),
       );
+      const snapshotForCwd: NonNullable<ProviderInstance["snapshotForCwd"]> = (cwd) =>
+        Effect.all([snapshot.getSnapshot, Effect.tryPromise(() => piResourcesForCwd(cwd))]).pipe(
+          Effect.map(([current, resources]) => ({ ...current, ...resources })),
+          Effect.mapError(
+            (cause) =>
+              new ProviderDriverError({
+                driver: DRIVER,
+                instanceId,
+                detail: `Failed to discover Pi resources for '${cwd}'.`,
+                cause,
+              }),
+          ),
+        );
       return {
         instanceId,
         driverKind: DRIVER,
@@ -154,6 +199,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
         accentColor,
         enabled,
         snapshot,
+        snapshotForCwd,
         adapter,
         textGeneration,
       } satisfies ProviderInstance;

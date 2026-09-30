@@ -33,6 +33,8 @@ const start = {
 // The real SDK loads and binds this extension, but ordinary prompts are intercepted
 // before the provider can be called. Nothing here reads or writes the user's Pi home.
 const agentDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pi-preset-test-"));
+const reviewCwd = NodePath.join(agentDir, "review-workspace");
+const reviewPrompts: string[] = [];
 const emptyAgentDir = NodePath.join(agentDir, "without-command");
 const noPresetAgentDir = NodePath.join(agentDir, "without-presets-or-extension");
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -46,8 +48,20 @@ let presetModel: string;
 
 beforeAll(async () => {
   NodeFS.mkdirSync(NodePath.join(agentDir, "extensions"));
+  NodeFS.mkdirSync(NodePath.join(agentDir, "prompts"));
+  const skillDirectory = NodePath.join(agentDir, "skills", "fixture-skill");
+  NodeFS.mkdirSync(skillDirectory, { recursive: true });
+  NodeFS.writeFileSync(
+    NodePath.join(skillDirectory, "SKILL.md"),
+    "---\nname: fixture-skill\ndescription: Harmless invocation fixture\n---\nNative skill instruction.",
+  );
+  NodeFS.mkdirSync(reviewCwd);
   NodeFS.mkdirSync(emptyAgentDir);
   NodeFS.mkdirSync(noPresetAgentDir);
+  NodeFS.writeFileSync(
+    NodePath.join(agentDir, "prompts", "review.md"),
+    "---\ndescription: Review fixture\n---\nReview $1 against $2",
+  );
   NodeFS.writeFileSync(
     NodePath.join(agentDir, "presets.json"),
     '{"build":{"model":"test/build"},"delegate":{"model":"test/delegate"},"broken":{},"noisy":{}}',
@@ -72,6 +86,12 @@ beforeAll(async () => {
         if (!model) throw new Error("Delegate fixture model unavailable");
         await pi.setModel(model);
         pi.setThinkingLevel("low");
+      });
+      pi.registerCommand("fixture-command", {
+        handler: async (args) => pi.appendEntry("test-command", { args }),
+      });
+      pi.registerCommand("fixture-fail", {
+        handler: async () => { throw new Error("Fixture command failed"); },
       });
        pi.registerCommand("preset", {
          handler: async (name) => {
@@ -123,6 +143,48 @@ beforeAll(async () => {
       );
       return;
     }
+    if (text.startsWith("/fixture-")) {
+      await originalPrompt.call(this, text, options);
+      commandEntries.push(
+        ...this.sessionManager
+          .getEntries()
+          .flatMap((entry) =>
+            entry.type === "custom" && entry.customType === "test-command" ? [entry.data] : [],
+          ),
+      );
+      return;
+    }
+    if (text.startsWith("/review ") || text.startsWith("/skill:")) {
+      const agentPrompt = vi
+        .spyOn(this.agent, "prompt")
+        .mockImplementation(
+          async (messages: string | AgentSession["agent"]["state"]["messages"]) => {
+            const userMessage =
+              typeof messages === "string"
+                ? undefined
+                : messages.find((message) => message.role === "user");
+            if (userMessage?.role === "user") {
+              const content = userMessage.content;
+              reviewPrompts.push(
+                typeof content === "string"
+                  ? content
+                  : content
+                      .filter((block) => block.type === "text")
+                      .map((block) => (block.type === "text" ? block.text : ""))
+                      .join("\n"),
+              );
+            }
+            // Stop at the model boundary after recording the SDK-expanded user message.
+            throw new Error("Review fixture stopped before provider call");
+          },
+        );
+      try {
+        await originalPrompt.call(this, text, options);
+      } finally {
+        agentPrompt.mockRestore();
+      }
+      return;
+    }
     if (text.startsWith("/")) throw new Error(`Unexpected SDK command: ${text}`);
     promptModels.push(this.model ? `${this.model.provider}/${this.model.id}` : undefined);
     promptThinkingLevels.push(this.thinkingLevel);
@@ -138,6 +200,7 @@ beforeEach(() => {
   promptModels.length = 0;
   promptThinkingLevels.length = 0;
   commandEntries.length = 0;
+  reviewPrompts.length = 0;
   process.env.PI_CODING_AGENT_DIR = agentDir;
 });
 
@@ -667,7 +730,7 @@ it.effect("sends one ordinary user turn with no preset config or extension", () 
     yield* adapter.streamEvents.pipe(
       Stream.runForEach((event) =>
         Effect.sync(() => {
-          if (event.type === "turn.completed") completed.push(event.turnId);
+          if (event.type === "turn.completed" && event.turnId) completed.push(event.turnId);
         }),
       ),
       Effect.forkScoped({ startImmediately: true }),
@@ -680,6 +743,92 @@ it.effect("sends one ordinary user turn with no preset config or extension", () 
     assert.deepEqual(prompts, ["ordinary user message"]);
     assert.deepEqual(commandEntries, []);
     assert.equal(completed.length, 1);
+    assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("expands a Pi prompt template with slash-command arguments through the SDK", () =>
+  Effect.gen(function* () {
+    const adapter = yield* makePiAdapter();
+    yield* adapter.startSession({ ...start, cwd: reviewCwd });
+
+    const error = yield* adapter.sendTurn({ threadId, input: "/review one two" }).pipe(Effect.flip);
+
+    assert.equal(error._tag, "ProviderAdapterRequestError");
+    assert.deepEqual(prompts, ["/review one two"]);
+    assert.deepEqual(reviewPrompts, ["Review one against two"]);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect(
+  "settles a native Pi extension command that changes state without starting a model run",
+  () =>
+    Effect.gen(function* () {
+      const adapter = yield* makePiAdapter();
+      const completed: unknown[] = [];
+      yield* adapter.streamEvents.pipe(
+        Stream.runForEach((event) =>
+          Effect.sync(() => {
+            if (event.type === "turn.completed") completed.push(event.payload.state);
+          }),
+        ),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* adapter.startSession(start);
+      yield* adapter.sendTurn({ threadId, input: "/fixture-command one two" });
+      assert.deepEqual(commandEntries, [{ args: "one two" }]);
+      assert.deepEqual(completed, ["completed"]);
+      assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+      assert.deepEqual(promptModels, []);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("reports swallowed native Pi extension command errors and clears the active turn", () =>
+  Effect.gen(function* () {
+    const adapter = yield* makePiAdapter();
+    const completed: unknown[] = [];
+    yield* adapter.streamEvents.pipe(
+      Stream.runForEach((event) =>
+        Effect.sync(() => {
+          if (event.type === "turn.completed") completed.push(event.payload.state);
+        }),
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    yield* adapter.startSession(start);
+    const error = yield* adapter.sendTurn({ threadId, input: "/fixture-fail" }).pipe(Effect.flip);
+    assert.equal(error._tag, "ProviderAdapterRequestError");
+    assert.include(error.message, "Fixture command failed");
+    assert.deepEqual(completed, ["failed"]);
+    assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+    yield* adapter.sendTurn({ threadId, input: "after the failed command" });
+    assert.deepEqual(promptModels, [presetModel]);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+for (const input of ["$fixture-skill one two", "/skill:fixture-skill one two"]) {
+  it.effect(`expands the native Pi skill body and location for ${input}`, () =>
+    Effect.gen(function* () {
+      const adapter = yield* makePiAdapter();
+      yield* adapter.startSession({ ...start, cwd: reviewCwd });
+      const error = yield* adapter.sendTurn({ threadId, input }).pipe(Effect.flip);
+      assert.equal(error._tag, "ProviderAdapterRequestError");
+      const directory = NodePath.join(agentDir, "skills", "fixture-skill");
+      assert.deepEqual(reviewPrompts, [
+        `<skill name="fixture-skill" location="${NodePath.join(directory, "SKILL.md")}">\nReferences are relative to ${directory}.\n\nNative skill instruction.\n</skill>\n\none two`,
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+}
+
+it.effect("leaves unknown, quoted, and nonleading Pi skill-like tokens as ordinary text", () =>
+  Effect.gen(function* () {
+    const adapter = yield* makePiAdapter();
+    yield* adapter.startSession({ ...start, cwd: reviewCwd });
+    const inputs = ["$unknown one", '"$fixture-skill" one', "Explain $fixture-skill"];
+    for (const input of inputs) yield* adapter.sendTurn({ threadId, input });
+    assert.deepEqual(prompts, inputs);
+    assert.deepEqual(reviewPrompts, []);
     assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );

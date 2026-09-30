@@ -1,5 +1,10 @@
-import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { type PiSettings, type ServerProvider, type ServerProviderModel } from "@t3tools/contracts";
+import type { ModelRuntime, PromptTemplate } from "@earendil-works/pi-coding-agent";
+import {
+  type PiSettings,
+  type ServerProvider,
+  type ServerProviderModel,
+  type ServerProviderSlashCommand,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import { createModelCapabilities } from "@t3tools/shared/model";
@@ -111,6 +116,29 @@ export function piModelsFromSdk(
     seen.add(slug);
     const name = model.name.trim() || model.id;
     return [{ slug, name, isCustom: false, capabilities: piCapabilities(model, presetNames) }];
+  });
+}
+
+/** Map Pi prompt templates to the slash menu in SDK expansion order. */
+export function piPromptTemplatesToSlashCommands(
+  templates: ReadonlyArray<Pick<PromptTemplate, "name" | "description" | "argumentHint">>,
+): ReadonlyArray<ServerProviderSlashCommand> {
+  const seen = new Set<string>();
+  return templates.flatMap((template) => {
+    const name = template.name.trim();
+    // Pi's template expander requires the whole first token to match exactly;
+    // malformed names and duplicates later in discovery order are not invokable.
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || seen.has(name)) return [];
+    seen.add(name);
+    const description = template.description.trim();
+    const hint = template.argumentHint?.trim();
+    return [
+      {
+        name,
+        ...(description ? { description } : {}),
+        ...(hint ? { input: { hint } } : {}),
+      },
+    ];
   });
 }
 

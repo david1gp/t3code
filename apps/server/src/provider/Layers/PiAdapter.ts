@@ -308,6 +308,7 @@ type Session = {
   readonly cwd: string;
   readonly sdk: AgentSession;
   unsubscribe: () => void;
+  readonly completeCommand: (turn: Turn) => Effect.Effect<void>;
   readonly scope: Scope.Closeable;
   active: Turn | undefined;
   /** Covers preflight and the SDK's asynchronous agent_settled dispatch. */
@@ -921,11 +922,22 @@ export const makePiAdapter = (
         const scope = yield* Scope.make("sequential");
         const cursor = { schemaVersion: resumeVersion, sessionId };
         const now = nowIso();
+        type Queued =
+          | { readonly source: "sdk"; readonly event: AgentSessionEvent }
+          | { readonly source: "command"; readonly turn: Turn }
+          | {
+              readonly source: "subagent";
+              readonly kind: "started" | "completed" | "failed";
+              readonly data: SubagentEvent;
+            };
+        const events = yield* Queue.unbounded<Queued>();
         const ctx: Session = {
           sessionId,
           cwd,
           sdk: opened,
           unsubscribe: () => {},
+          completeCommand: (turn) =>
+            Queue.offer(events, { source: "command", turn }).pipe(Effect.asVoid),
           scope,
           stopped: false,
           active: undefined,
@@ -983,14 +995,6 @@ export const makePiAdapter = (
           thinkingLevel ??
           (preset === "none" || model !== undefined ? defaultThinkingLevel(opened.model) : null);
         if (initialThinkingLevel) opened.setThinkingLevel(initialThinkingLevel);
-        type Queued =
-          | { readonly source: "sdk"; readonly event: AgentSessionEvent }
-          | {
-              readonly source: "subagent";
-              readonly kind: "started" | "completed" | "failed";
-              readonly data: SubagentEvent;
-            };
-        const events = yield* Queue.unbounded<Queued>();
         const unsubscribeSdk = opened.subscribe((event) => {
           Effect.runSync(Queue.offer(events, { source: "sdk", event }));
         });
@@ -1013,7 +1017,11 @@ export const makePiAdapter = (
               ? Effect.void
               : item.source === "sdk"
                 ? consume(ctx, item.event)
-                : subagentEvent(ctx, item.kind, item.data),
+                : item.source === "command"
+                  ? ctx.active === item.turn && ctx.sdk.isIdle && ctx.sdk.pendingMessageCount === 0
+                    ? consume(ctx, { type: "agent_settled" })
+                    : Effect.void
+                  : subagentEvent(ctx, item.kind, item.data),
           ),
           Effect.forkIn(scope),
         );
@@ -1145,17 +1153,42 @@ export const makePiAdapter = (
             .filter((entry) => entry.type === "message" && entry.message.role === "user").length;
           const turn =
             steering ?? (yield* turnBegin(ctx, TurnId.make(`pi:${ctx.sessionId}:${count}`)));
+          // T3 skill chips use $name; Pi owns body/base-directory expansion for both paths.
+          // Native Pi expands only one leading skill command, not additional chips in args.
+          const skillName = /^\$([^\s]+)/.exec(message)?.[1];
+          const promptMessage =
+            skillName &&
+            ctx.sdk.resourceLoader.getSkills().skills.some((skill) => skill.name === skillName)
+              ? `/skill:${skillName}${message.slice(skillName.length + 1)}`
+              : message;
+          const commandName = !steering ? /^\/([^\s]+)/.exec(promptMessage)?.[1] : undefined;
+          const nativeCommand = commandName
+            ? ctx.sdk.extensionRunner.getCommand(commandName)
+            : undefined;
+          let commandError: string | undefined;
+          const offCommandError = nativeCommand
+            ? ctx.sdk.extensionRunner.onError((error) => {
+                if (error.event === "command" && error.extensionPath === `command:${commandName}`)
+                  commandError = error.error;
+              })
+            : () => {};
           let accepted = false;
           const prompt = steering
-            ? ctx.sdk.steer(message, images.length ? images : undefined)
-            : ctx.sdk.prompt(message, {
+            ? ctx.sdk.steer(promptMessage, images.length ? images : undefined)
+            : ctx.sdk.prompt(promptMessage, {
                 ...(images.length ? { images } : {}),
                 preflightResult: (success) => {
                   accepted = success;
                 },
               });
           const response = yield* Effect.tryPromise({
-            try: () => prompt,
+            try: async () => {
+              try {
+                await prompt;
+              } finally {
+                offCommandError();
+              }
+            },
             catch: (cause) =>
               new ProviderAdapterRequestError({
                 provider,
@@ -1175,6 +1208,11 @@ export const makePiAdapter = (
             }
             return yield* Effect.failCause(response.cause);
           }
+          if (commandError !== undefined) {
+            const detail = `Pi /${commandName} failed: ${commandError}`;
+            yield* failPrompt(ctx, turn, detail);
+            return yield* new ProviderAdapterRequestError({ provider, method: "prompt", detail });
+          }
           if (!steering && !accepted) {
             yield* failPrompt(ctx, turn, "Pi did not accept the prompt.");
             return yield* new ProviderAdapterRequestError({
@@ -1193,6 +1231,10 @@ export const makePiAdapter = (
             ctx.sdk.clearQueue();
             yield* request("abort", () => ctx.sdk.abort());
           }
+          // Commands that only change extension state have no agent_settled event.
+          // Queue completion behind their SDK events; model-triggering commands keep
+          // the normal native settlement path instead of being completed early.
+          if (nativeCommand) yield* ctx.completeCommand(turn);
           yield* Deferred.await(turn.settled);
           return {
             threadId: input.threadId,

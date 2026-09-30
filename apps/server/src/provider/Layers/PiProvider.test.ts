@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { PiSettings, ProviderDriverKind, ProviderInstanceId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { piSkillsToServerProviderSkills } from "../piSkillsToServerProviderSkills.ts";
 import {
   buildInitialPiProviderSnapshot,
   buildPiProviderSnapshot,
@@ -9,6 +10,7 @@ import {
   piAuthFromSdk,
   piModelsFromSdk,
   piPresetNamesFromJson,
+  piPromptTemplatesToSlashCommands,
 } from "./PiProvider.ts";
 
 const decodePiSettings = Schema.decodeSync(PiSettings);
@@ -25,6 +27,62 @@ const customCapabilities = {
 } as const;
 
 describe("Pi provider catalog", () => {
+  it("maps loaded skill metadata without normalizing paths or filtering native names", () => {
+    const sourceInfo = {
+      path: "/shared/real/SKILL.md",
+      source: "auto",
+      scope: "project" as const,
+      origin: "top-level" as const,
+    };
+    expect(
+      piSkillsToServerProviderSkills([
+        {
+          name: "assets",
+          description: " Asset instructions ",
+          filePath: "/project/.pi/skills/assets-link/SKILL.md",
+          sourceInfo,
+        },
+        {
+          name: "Legacy_Name",
+          description: "  ",
+          filePath: "/home/agent/skills/legacy/SKILL.md",
+          sourceInfo: { ...sourceInfo, scope: "user" },
+        },
+      ]),
+    ).toEqual([
+      {
+        name: "assets",
+        description: "Asset instructions",
+        path: "/project/.pi/skills/assets-link/SKILL.md",
+        scope: "project",
+        enabled: true,
+      },
+      {
+        name: "Legacy_Name",
+        path: "/home/agent/skills/legacy/SKILL.md",
+        scope: "user",
+        enabled: true,
+      },
+    ]);
+  });
+
+  it("maps invokable prompt metadata and keeps Pi's first-name-wins collision behavior", () => {
+    expect(
+      piPromptTemplatesToSlashCommands([
+        { name: "global", description: " Global description ", argumentHint: " <topic> " },
+        { name: "shared", description: "Global version", argumentHint: " [args] " },
+        { name: "shared", description: "Project version", argumentHint: "ignored" },
+        { name: "", description: "invalid" },
+        { name: "not invokable/name", description: "invalid" },
+        { name: "plain", description: "  ", argumentHint: " " },
+      ]),
+    ).toEqual([
+      { name: "global", description: "Global description", input: { hint: "<topic>" } },
+      { name: "shared", description: "Global version", input: { hint: "[args]" } },
+      { name: "plain" },
+    ]);
+  });
+
   it("deduplicates provider/model records without changing their slugs or names", () => {
     expect(
       piModelsFromSdk([
