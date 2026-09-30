@@ -13,6 +13,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -820,6 +821,80 @@ for (const input of ["$fixture-skill one two", "/skill:fixture-skill one two"]) 
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 }
+
+it.effect(
+  "steers a leading T3 skill chip through native Pi expansion without replacing the active turn",
+  () =>
+    Effect.gen(function* () {
+      const adapter = yield* makePiAdapter();
+      const streaming = Promise.withResolvers<AgentSession>();
+      const started: string[] = [];
+      const completed: string[] = [];
+      yield* adapter.streamEvents.pipe(
+        Stream.runForEach((event) =>
+          Effect.sync(() => {
+            if (event.type === "turn.started" && event.turnId) started.push(event.turnId);
+            if (event.type === "turn.completed" && event.turnId) completed.push(event.turnId);
+          }),
+        ),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* adapter.startSession({ ...start, cwd: reviewCwd });
+      vi.mocked(AgentSession.prototype.prompt).mockImplementationOnce(async function (
+        this: AgentSession,
+        text,
+        options,
+      ) {
+        prompts.push(text);
+        options?.preflightResult?.(true);
+        // Hold native settlement until after steering, without starting a model run.
+        streaming.resolve(this);
+      });
+      const originalTurn = yield* adapter
+        .sendTurn({ threadId, input: "active native turn" })
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      const sdk = yield* Effect.promise(() => streaming.promise);
+      const isStreaming = vi.spyOn(sdk, "isStreaming", "get").mockReturnValue(true);
+      const steer = vi.spyOn(sdk, "steer");
+      const agentSteer = vi.spyOn(sdk.agent, "steer");
+      try {
+        const active = (yield* adapter.listSessions())[0]!;
+        assert.isDefined(active.activeTurnId);
+        assert.equal(active.status, "running");
+        const accepted = yield* adapter.sendTurn({ threadId, input: "$fixture-skill one two" });
+        assert.deepEqual(steer.mock.calls, [["/skill:fixture-skill one two", undefined]]);
+        const directory = NodePath.join(agentDir, "skills", "fixture-skill");
+        assert.equal(agentSteer.mock.calls.length, 1);
+        assert.deepInclude(agentSteer.mock.calls[0]![0], {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `<skill name="fixture-skill" location="${NodePath.join(directory, "SKILL.md")}">\nReferences are relative to ${directory}.\n\nNative skill instruction.\n</skill>\n\none two`,
+            },
+          ],
+        });
+        assert.equal(accepted.turnId, active.activeTurnId);
+        assert.equal((yield* adapter.listSessions())[0]?.activeTurnId, active.activeTurnId);
+        assert.equal((yield* adapter.listSessions())[0]?.status, "running");
+        assert.deepEqual(prompts, ["active native turn"]);
+        assert.deepEqual(started, [active.activeTurnId]);
+        assert.deepEqual(completed, []);
+
+        isStreaming.mockRestore();
+        const emit = Reflect.get(sdk, "_emit") as (event: { type: "agent_settled" }) => void;
+        emit.call(sdk, { type: "agent_settled" });
+        assert.equal((yield* Fiber.join(originalTurn)).turnId, active.activeTurnId);
+        assert.deepEqual(started, [active.activeTurnId]);
+        assert.deepEqual(completed, [active.activeTurnId]);
+        assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+      } finally {
+        isStreaming.mockRestore();
+        steer.mockRestore();
+        agentSteer.mockRestore();
+      }
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
 
 it.effect("leaves unknown, quoted, and nonleading Pi skill-like tokens as ordinary text", () =>
   Effect.gen(function* () {

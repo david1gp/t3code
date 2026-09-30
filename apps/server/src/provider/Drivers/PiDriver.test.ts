@@ -1,10 +1,11 @@
 // @effect-diagnostics nodeBuiltinImport:off - SDK resource-loader fixture uses temporary Node paths.
-import { afterEach, beforeEach, describe, expect, it, vi } from "@effect/vitest";
+import { afterEach, beforeEach, describe, expect, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import { CONFIG_DIR_NAME, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, ModelRuntime, VERSION } from "@earendil-works/pi-coding-agent";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -14,6 +15,13 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { BUILT_IN_DRIVERS } from "../builtInDrivers.ts";
 import { PiDriver, piResourcesForCwd } from "./PiDriver.ts";
+
+vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@earendil-works/pi-coding-agent")>();
+  // Bundling relocates Pi's package-relative VERSION lookup to the server package.
+  // Keep native SDK discovery and resource loading; only simulate that version mismatch.
+  return { ...actual, VERSION: "0.0.42" };
+});
 
 const decodePiSettings = Schema.decodeSync(PiSettings);
 const decodeLegacyPiSettings = Schema.decodeUnknownSync(PiSettings);
@@ -264,8 +272,9 @@ describe("Pi built-in driver", () => {
     });
   });
 
-  it.effect("reports the embedded SDK version even when model discovery fails", () =>
+  it.effect("uses the embedded SDK pin, not relocated VERSION, when discovery fails", () =>
     Effect.gen(function* () {
+      expect(VERSION).toBe("0.0.42");
       vi.spyOn(ModelRuntime, "create").mockRejectedValue(new Error("Model catalog unavailable"));
       const instance = yield* PiDriver.create({
         instanceId: ProviderInstanceId.make("pi-version-test"),
@@ -301,10 +310,24 @@ describe("Pi built-in driver", () => {
     "publishes loaded skills and prompt commands together in the cwd provider snapshot",
     () =>
       Effect.gen(function* () {
-        const path = skillWrite(NodePath.join(agentDir, "skills"), "assets", "Assets skill");
+        skillWrite(NodePath.join(agentDir, "skills"), "assets", "Global assets skill");
+        const path = skillWrite(
+          NodePath.join(cwd, CONFIG_DIR_NAME, "skills"),
+          "assets",
+          "Project assets skill",
+        );
         const prompts = NodePath.join(agentDir, "prompts");
+        const projectPrompts = NodePath.join(cwd, CONFIG_DIR_NAME, "prompts");
         NodeFS.mkdirSync(prompts, { recursive: true });
-        NodeFS.writeFileSync(NodePath.join(prompts, "assets.md"), "Assets prompt");
+        NodeFS.mkdirSync(projectPrompts, { recursive: true });
+        NodeFS.writeFileSync(
+          NodePath.join(prompts, "assets.md"),
+          "---\ndescription: Global assets prompt\n---\nGlobal assets body",
+        );
+        NodeFS.writeFileSync(
+          NodePath.join(projectPrompts, "assets.md"),
+          "---\ndescription: Project assets prompt\n---\nProject assets body",
+        );
         // A disabled provider skips model/auth discovery, keeping this a resource-only test.
         const instance = yield* PiDriver.create({
           instanceId: ProviderInstanceId.make("pi-resource-test"),
@@ -317,15 +340,22 @@ describe("Pi built-in driver", () => {
         expect(snapshot).toMatchObject({
           instanceId: "pi-resource-test",
           enabled: false,
-          slashCommands: [{ name: "assets", description: "Assets prompt" }],
+          slashCommands: [{ name: "assets", description: "Project assets prompt" }],
           skills: [
-            { name: "assets", path, description: "Assets skill", enabled: true, scope: "user" },
+            {
+              name: "assets",
+              path,
+              description: "Project assets skill",
+              enabled: true,
+              scope: "project",
+            },
           ],
         });
       }).pipe(
         Effect.scoped,
         Effect.provide(
-          ServerConfig.layerTest(cwd, { prefix: "t3-pi-resource-snapshot-" }).pipe(
+          // The requested workspace differs from the server cwd.
+          ServerConfig.layerTest(root, { prefix: "t3-pi-resource-snapshot-" }).pipe(
             Layer.provideMerge(NodeServices.layer),
             Layer.provideMerge(ServerSettingsService.layerTest()),
             Layer.provideMerge(
