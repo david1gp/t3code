@@ -477,6 +477,31 @@ export function runtimeEventToActivities(
       : {};
   })();
   switch (event.type) {
+    case "turn.cost.updated": {
+      if (event.provider !== "opencode" && event.provider !== "pi") return [];
+      const { totalCostUsd } = event.payload;
+      if (!Number.isFinite(totalCostUsd) || totalCostUsd < 0) return [];
+      return [
+        {
+          id: EventId.make(`usage-cost:${event.threadId}:${event.turnId}`),
+          createdAt: event.createdAt,
+          tone: "info",
+          kind: "usage.cost",
+          summary: "Provider reported turn cost",
+          payload: {
+            totalCostUsd,
+            status: event.payload.status === "final" ? "final" : "provisional",
+            ...(event.payload.costModel ? { model: event.payload.costModel } : {}),
+            ...(event.payload.costSessionId
+              ? { providerSessionId: event.payload.costSessionId }
+              : {}),
+          },
+          turnId: event.turnId,
+          ...maybeSequence,
+        },
+      ];
+    }
+
     case "turn.completed": {
       // API-priced providers only; subscription harnesses report their own totals.
       if (event.provider !== "opencode" && event.provider !== "pi") return [];
@@ -486,13 +511,14 @@ export function runtimeEventToActivities(
       }
       return [
         {
-          id: event.eventId,
+          id: EventId.make(`usage-cost:${event.threadId}:${event.turnId}`),
           createdAt: event.createdAt,
           tone: "info",
           kind: "usage.cost",
           summary: "Provider reported turn cost",
           payload: {
             totalCostUsd,
+            status: "final",
             ...(event.payload.costModel ? { model: event.payload.costModel } : {}),
             ...(event.payload.costSessionId
               ? { providerSessionId: event.payload.costSessionId }

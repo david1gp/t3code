@@ -372,6 +372,40 @@ describe("thread pagination state", () => {
     }),
   );
 
+  it.effect("keeps newer per-turn costs when merging an older page", () =>
+    Effect.gen(function* () {
+      const newerCosts = [
+        { turnId: TurnId.make("turn-2"), totalCostUsd: 0.4, status: "final" as const },
+      ];
+      const olderCosts = [
+        { turnId: TurnId.make("turn-1"), totalCostUsd: 0.1, status: "final" as const },
+        { turnId: TurnId.make("turn-2"), totalCostUsd: 0.2, status: "provisional" as const },
+      ];
+      const initialResponse = Option.some({
+        ...WINDOWED_SNAPSHOT,
+        thread: { ...BASE_THREAD, reportedCosts: newerCosts },
+      });
+      const harness = yield* makeHarness({ initialResponse });
+      yield* harness.awaitState((value) => Option.isSome(value.page));
+      requestOlderThreadTurns(TARGET.environmentId, THREAD_ID);
+      yield* harness.awaitState((value) =>
+        Option.match(value.page, { onNone: () => false, onSome: (page) => page.loadingOlder }),
+      );
+      yield* harness.resolveNextPage(
+        Option.some({
+          ...OLDER_PAGE,
+          thread: { ...OLDER_PAGE.thread, reportedCosts: olderCosts },
+        }),
+      );
+      const state = yield* harness.awaitState((value) =>
+        Option.exists(value.data, (thread) =>
+          thread.messages.some((row) => row.id === "message-old"),
+        ),
+      );
+      expect(Option.getOrThrow(state.data).reportedCosts).toEqual([olderCosts[0], newerCosts[0]]);
+    }),
+  );
+
   it.effect("discards an in-flight older page when a revert rewrites history", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ initialResponse: Option.some(WINDOWED_SNAPSHOT) });

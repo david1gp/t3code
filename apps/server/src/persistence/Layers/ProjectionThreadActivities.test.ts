@@ -13,6 +13,35 @@ const layer = it.layer(
 );
 
 layer("ProjectionThreadActivityRepository", (it) => {
+  it.effect("keeps a final usage cost when late provisional observations repeat", () =>
+    Effect.gen(function* () {
+      const repository = yield* ProjectionThreadActivityRepository;
+      const threadId = ThreadId.make("thread-final-cost-wins");
+      const finalActivity = {
+        activityId: EventId.make("usage-cost:thread-final-cost-wins:turn-1"),
+        threadId,
+        turnId: TurnId.make("turn-1"),
+        tone: "info" as const,
+        kind: "usage.cost" as const,
+        summary: "Provider reported turn cost",
+        payload: { totalCostUsd: 0.3, status: "final" },
+        createdAt: "2026-03-01T00:00:02.000Z",
+      };
+      const provisionalActivity = {
+        ...finalActivity,
+        payload: { totalCostUsd: 0.12, status: "provisional" },
+        createdAt: "2026-03-01T00:00:01.000Z",
+      };
+
+      yield* repository.upsert(finalActivity);
+      yield* repository.upsert(provisionalActivity);
+      yield* repository.upsert(provisionalActivity);
+
+      const activities = yield* repository.listByThreadId({ threadId });
+      assert.deepEqual(activities, [finalActivity]);
+    }),
+  );
+
   it.effect("reads only the latest matching task activity", () =>
     Effect.gen(function* () {
       const repository = yield* ProjectionThreadActivityRepository;

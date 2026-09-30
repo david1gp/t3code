@@ -11,7 +11,7 @@ import {
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
-import type { OrchestrationThread } from "@t3tools/contracts";
+import type { OrchestrationEvent, OrchestrationThread } from "@t3tools/contracts";
 
 import { applyThreadDetailEvent } from "./threadReducer.ts";
 
@@ -46,6 +46,30 @@ const baseThread: OrchestrationThread = {
   checkpoints: [],
   session: null,
 };
+
+function costEvent(totalCostUsd: number, status: "provisional" | "final", sequence: number) {
+  return {
+    ...baseEventFields,
+    sequence,
+    occurredAt: `2026-04-01T11:${String(sequence).padStart(2, "0")}:00.000Z`,
+    aggregateKind: "thread",
+    aggregateId: ThreadId.make("thread-1"),
+    type: "thread.activity-appended",
+    payload: {
+      threadId: ThreadId.make("thread-1"),
+      activity: {
+        id: EventId.make("usage-cost:thread-1:turn-1"),
+        tone: "info",
+        kind: "usage.cost",
+        summary: "Provider reported turn cost",
+        payload: { totalCostUsd, status },
+        turnId: TurnId.make("turn-1"),
+        sequence,
+        createdAt: `2026-04-01T11:${String(sequence).padStart(2, "0")}:00.000Z`,
+      },
+    },
+  } as OrchestrationEvent;
+}
 
 describe("applyThreadDetailEvent", () => {
   describe("project events", () => {
@@ -1087,6 +1111,52 @@ describe("applyThreadDetailEvent", () => {
   });
 
   describe("thread.activity-appended", () => {
+    it("tracks costs beyond the activity window and gives final reports precedence", () => {
+      const oldTurnCost = {
+        turnId: TurnId.make("turn-old"),
+        totalCostUsd: 0.2,
+        status: "final" as const,
+      };
+      let thread: OrchestrationThread = {
+        ...baseThread,
+        activities: Array.from({ length: 129 }, (_, index) => ({
+          id: EventId.make(`activity-${index}`),
+          tone: "tool" as const,
+          kind: "command",
+          summary: `Command ${index}`,
+          payload: {},
+          turnId: TurnId.make("turn-new"),
+          sequence: index,
+          createdAt: "2026-04-01T10:00:00.000Z",
+        })),
+        reportedCosts: [oldTurnCost],
+      };
+      const provisional = applyThreadDetailEvent(thread, costEvent(0.3, "provisional", 130));
+      expect(provisional.kind).toBe("updated");
+      if (provisional.kind !== "updated") return;
+      thread = provisional.thread;
+      expect(thread.activities).toHaveLength(130);
+      expect(thread.reportedCosts).toEqual([
+        oldTurnCost,
+        { turnId: TurnId.make("turn-1"), totalCostUsd: 0.3, status: "provisional" },
+      ]);
+
+      const final = applyThreadDetailEvent(thread, costEvent(0.45, "final", 131));
+      expect(final.kind).toBe("updated");
+      if (final.kind !== "updated") return;
+      const lateProvisional = applyThreadDetailEvent(
+        final.thread,
+        costEvent(0.1, "provisional", 132),
+      );
+      expect(lateProvisional.kind).toBe("updated");
+      if (lateProvisional.kind === "updated") {
+        expect(lateProvisional.thread.reportedCosts).toEqual([
+          oldTurnCost,
+          { turnId: TurnId.make("turn-1"), totalCostUsd: 0.45, status: "final" },
+        ]);
+      }
+    });
+
     it("adds an activity", () => {
       const result = applyThreadDetailEvent(baseThread, {
         ...baseEventFields,
@@ -1622,6 +1692,10 @@ describe("applyThreadDetailEvent", () => {
             completedAt: "2026-04-01T03:00:00.000Z",
           },
         ],
+        reportedCosts: [
+          { turnId: TurnId.make("turn-1"), totalCostUsd: 0.1, status: "final" },
+          { turnId: TurnId.make("turn-2"), totalCostUsd: 0.2, status: "final" },
+        ],
       };
 
       const result = applyThreadDetailEvent(threadWithData, {
@@ -1645,6 +1719,9 @@ describe("applyThreadDetailEvent", () => {
         // msg-3 (turn-2) is filtered, msg-1 (no turn) and msg-2 (turn-1) remain
         expect(result.thread.messages).toHaveLength(2);
         expect(result.thread.latestTurn?.turnId).toBe("turn-1");
+        expect(result.thread.reportedCosts).toEqual([
+          { turnId: TurnId.make("turn-1"), totalCostUsd: 0.1, status: "final" },
+        ]);
       }
     });
   });

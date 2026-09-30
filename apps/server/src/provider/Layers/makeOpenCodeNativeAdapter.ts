@@ -148,40 +148,37 @@ const formQuestion = (field: NativeField, title: string) => ({
   multiSelect: field.type === "multiselect",
 });
 type ChildEvent = Extract<NativeEvent, { type: "child.attached" | "child.updated" }>;
+type StepAccounting = {
+  readonly cost: number;
+  readonly tokens?: Extract<NativeEvent, { type: "step.completed" }>["step"]["tokens"];
+  readonly completed: boolean;
+};
 type Child = {
   readonly turnId: TurnId;
   readonly parentId: string;
   parentToolKey: string | undefined;
   info: ChildEvent["info"];
   status: "running" | "completed" | "failed" | "stopped";
-  readonly steps: Map<
-    string,
-    {
-      input: number;
-      output: number;
-      reasoning: number;
-      cache: { read: number; write: number };
-      cost: number;
-    }
-  >;
+  readonly steps: Map<string, StepAccounting>;
+  readonly unresolvedSteps: Set<string>;
   readonly tools: Set<string>;
 };
+type CostAccounting = {
+  readonly usage: Context["usage"];
+  readonly unresolvedSteps: Set<string>;
+  lastCostUsd: number | undefined;
+};
+type SettledCostAccounting = CostAccounting & { readonly model: string | undefined };
 type Context = {
   session: ProviderSession;
   readonly engine: Engine;
   readonly sessionId: string;
   modelSelection: ProviderSessionStartInput["modelSelection"];
   readonly fragments: Map<string, string>;
-  readonly usage: Map<
-    string,
-    {
-      input: number;
-      output: number;
-      reasoning: number;
-      cache: { read: number; write: number };
-      cost: number;
-    }
-  >;
+  readonly usage: Map<string, StepAccounting>;
+  readonly unresolvedSteps: Set<string>;
+  lastCostUsd: number | undefined;
+  readonly settledCosts: Map<TurnId, SettledCostAccounting>;
   readonly children: Map<string, Child>;
   /** undefined = not looked up yet, null = server reported no limit. */
   contextLimit: number | null | undefined;
@@ -307,10 +304,11 @@ export const makeOpenCodeNativeAdapter = (options: {
       );
     const tokenUsage = (ctx: Context): TurnTokenUsage | undefined => {
       if (!ctx.usage.size) return undefined;
-      const totals = [...ctx.usage.values()];
+      const totals = [...ctx.usage.values()].flatMap((step) => (step.tokens ? [step.tokens] : []));
+      if (!totals.length) return undefined;
       return {
         usageScope: "main_agent",
-        usageStatus: "complete",
+        usageStatus: totals.length === ctx.usage.size ? "complete" : "partial",
         hasSubagents: [...ctx.children.values()].some((child) => child.turnId === ctx.active),
         inputTokens: totals.reduce(
           (n, step) => n + step.input + step.cache.read + step.cache.write,
@@ -321,6 +319,98 @@ export const makeOpenCodeNativeAdapter = (options: {
         cacheCreationTokens: totals.reduce((n, step) => n + step.cache.write, 0),
         reasoningTokens: totals.reduce((n, step) => n + step.reasoning, 0),
       };
+    };
+    const failedStepRecord = (
+      steps: Map<string, StepAccounting>,
+      unresolved: Set<string>,
+      step: Extract<NativeEvent, { type: "step.failed" }>["step"],
+    ) => {
+      const id = step.assistantMessageID;
+      if (steps.get(id)?.completed) return;
+      if (step.cost === undefined || !Number.isFinite(step.cost) || step.cost < 0) {
+        steps.delete(id);
+        unresolved.add(id);
+        return;
+      }
+      unresolved.delete(id);
+      steps.set(id, {
+        cost: step.cost,
+        ...(step.tokens ? { tokens: step.tokens } : {}),
+        completed: false,
+      });
+    };
+    const turnCost = (
+      ctx: Context,
+      turnId: TurnId,
+      complete: boolean,
+      accounting: CostAccounting,
+    ) => {
+      const children = [...ctx.children.values()].filter((child) => child.turnId === turnId);
+      if (
+        complete &&
+        (accounting.unresolvedSteps.size > 0 ||
+          children.some(
+            (child) =>
+              child.status === "running" || child.unresolvedSteps.size > 0 || !child.steps.size,
+          ))
+      )
+        return undefined;
+      let total = 0;
+      let hasPricedStep = false;
+      for (const steps of [accounting.usage, ...children.map((child) => child.steps)]) {
+        for (const step of steps.values()) {
+          if (!Number.isFinite(step.cost) || step.cost < 0) {
+            if (complete) return undefined;
+            continue;
+          }
+          hasPricedStep = true;
+          total += step.cost;
+        }
+      }
+      // Child-only turns are priced from their child steps; never infer a zero without a priced step.
+      return hasPricedStep && Number.isFinite(total) ? total : undefined;
+    };
+    const turnCostEmit = (ctx: Context, turnId: TurnId) => {
+      const accounting = ctx.active === turnId ? ctx : ctx.settledCosts.get(turnId);
+      if (!accounting) return;
+      const cost = turnCost(ctx, turnId, false, accounting);
+      if (cost === undefined || cost === accounting.lastCostUsd) return;
+      accounting.lastCostUsd = cost;
+      const model = ctx.active === turnId ? ctx.session.model : ctx.settledCosts.get(turnId)?.model;
+      emit({
+        type: "turn.cost.updated",
+        ...base(ctx, turnId),
+        turnId,
+        payload: {
+          totalCostUsd: cost,
+          costSessionId: ctx.sessionId,
+          ...(model ? { costModel: model } : {}),
+        },
+      });
+    };
+    const settledCostFinish = (ctx: Context, turnId: TurnId) => {
+      const accounting = ctx.settledCosts.get(turnId);
+      if (
+        !accounting ||
+        [...ctx.children.values()].some(
+          (child) => child.turnId === turnId && child.status === "running",
+        )
+      )
+        return;
+      const cost = turnCost(ctx, turnId, true, accounting);
+      ctx.settledCosts.delete(turnId);
+      if (cost === undefined) return;
+      emit({
+        type: "turn.cost.updated",
+        ...base(ctx, turnId),
+        turnId,
+        payload: {
+          totalCostUsd: cost,
+          status: "final",
+          costSessionId: ctx.sessionId,
+          ...(accounting.model ? { costModel: accounting.model } : {}),
+        },
+      });
     };
     const childLinkage = (ctx: Context, id: string, child: Child) => {
       const url = new URL(options.url);
@@ -343,17 +433,18 @@ export const makeOpenCodeNativeAdapter = (options: {
     const childUsage = (child: Child) => {
       if (!child.steps.size && !child.tools.size) return undefined;
       const steps = [...child.steps.values()];
-      const inputTokens = steps.reduce(
+      const reported = steps.flatMap((step) => (step.tokens ? [step.tokens] : []));
+      const inputTokens = reported.reduce(
         (n, step) => n + step.input + step.cache.read + step.cache.write,
         0,
       );
-      const outputTokens = steps.reduce((n, step) => n + step.output + step.reasoning, 0);
+      const outputTokens = reported.reduce((n, step) => n + step.output + step.reasoning, 0);
       return {
         totalTokens: inputTokens + outputTokens,
         inputTokens,
-        cachedInputTokens: steps.reduce((n, step) => n + step.cache.read, 0),
+        cachedInputTokens: reported.reduce((n, step) => n + step.cache.read, 0),
         outputTokens,
-        reasoningOutputTokens: steps.reduce((n, step) => n + step.reasoning, 0),
+        reasoningOutputTokens: reported.reduce((n, step) => n + step.reasoning, 0),
         toolUses: child.tools.size,
         costUsd: steps.reduce((n, step) => n + step.cost, 0),
       };
@@ -551,6 +642,7 @@ export const makeOpenCodeNativeAdapter = (options: {
             info,
             status: "running",
             steps: new Map(),
+            unresolvedSteps: new Set(),
             tools: new Set(),
           };
           if (childEvent.turnID !== next.turnId) return;
@@ -613,16 +705,28 @@ export const makeOpenCodeNativeAdapter = (options: {
             ...childLinkage(ctx, childEvent.sessionID, child),
           },
         });
+        settledCostFinish(ctx, child.turnId);
         return;
       }
       if ("sessionID" in event && "turnID" in event && event.sessionID !== ctx.sessionId) {
         const child = ctx.children.get(event.sessionID);
         if (!child || child.status !== "running" || event.turnID !== child.turnId) return;
-        if (event.type === "step.completed") {
+        if (event.type === "step.started" || event.type === "step.streamed") {
+          if (!child.steps.has(event.step.assistantMessageID))
+            child.unresolvedSteps.add(event.step.assistantMessageID);
+          return;
+        }
+        if (event.type === "step.failed") {
+          failedStepRecord(child.steps, child.unresolvedSteps, event.step);
+          turnCostEmit(ctx, child.turnId);
+        } else if (event.type === "step.completed") {
+          child.unresolvedSteps.delete(event.step.assistantMessageID);
           child.steps.set(event.step.assistantMessageID, {
-            ...event.step.tokens,
+            tokens: event.step.tokens,
             cost: event.step.cost,
+            completed: true,
           });
+          turnCostEmit(ctx, child.turnId);
         } else if (event.type === "tool.called") {
           child.tools.add(event.key);
         } else return;
@@ -645,6 +749,9 @@ export const makeOpenCodeNativeAdapter = (options: {
       const turnId = ctx.active;
       if (event.type === "turn.started") {
         const id = TurnId.make(event.turnID);
+        ctx.usage.clear();
+        ctx.unresolvedSteps.clear();
+        ctx.lastCostUsd = undefined;
         ctx.pending = undefined;
         ctx.active = id;
         ctx.session = { ...ctx.session, status: "running", activeTurnId: id, updatedAt: now() };
@@ -657,9 +764,22 @@ export const makeOpenCodeNativeAdapter = (options: {
         ctx.lastSettled = id;
         ctx.pending = undefined;
         const usage = tokenUsage(ctx);
-        const cost = [...ctx.usage.values()].reduce((n, step) => n + step.cost, 0);
+        const cost = turnCost(ctx, id, true, ctx);
+        if (
+          cost === undefined &&
+          [...ctx.children.values()].some(
+            (child) => child.turnId === id && child.status === "running",
+          )
+        )
+          ctx.settledCosts.set(id, {
+            usage: new Map(ctx.usage),
+            unresolvedSteps: new Set(ctx.unresolvedSteps),
+            lastCostUsd: ctx.lastCostUsd,
+            model: ctx.session.model,
+          });
         ctx.active = undefined;
         ctx.usage.clear();
+        ctx.unresolvedSteps.clear();
         ctx.fragments.clear();
         ctx.session = {
           ...ctx.session,
@@ -674,8 +794,13 @@ export const makeOpenCodeNativeAdapter = (options: {
             event.type === "turn.completed"
               ? {
                   state: "completed",
-                  ...(usage
-                    ? { tokenUsage: usage, totalCostUsd: cost, costSessionId: ctx.sessionId }
+                  ...(usage ? { tokenUsage: usage } : {}),
+                  ...(cost !== undefined
+                    ? {
+                        totalCostUsd: cost,
+                        costSessionId: ctx.sessionId,
+                        ...(ctx.session.model ? { costModel: ctx.session.model } : {}),
+                      }
                     : {}),
                 }
               : {
@@ -684,19 +809,44 @@ export const makeOpenCodeNativeAdapter = (options: {
                     event.reason === "failed"
                       ? event.error.message
                       : `Execution interrupted: ${event.interruptionReason}.`,
-                  ...(usage
-                    ? { tokenUsage: usage, totalCostUsd: cost, costSessionId: ctx.sessionId }
+                  ...(usage ? { tokenUsage: usage } : {}),
+                  ...(cost !== undefined
+                    ? {
+                        totalCostUsd: cost,
+                        costSessionId: ctx.sessionId,
+                        ...(ctx.session.model ? { costModel: ctx.session.model } : {}),
+                      }
                     : {}),
                 },
         });
         return;
       }
+      if (event.type === "step.started" || event.type === "step.streamed") {
+        if (
+          turnId &&
+          event.turnID === turnId &&
+          event.sessionID === ctx.sessionId &&
+          !ctx.usage.has(event.step.assistantMessageID)
+        )
+          ctx.unresolvedSteps.add(event.step.assistantMessageID);
+        return;
+      }
+      if (event.type === "step.failed") {
+        if (turnId && event.turnID === turnId && event.sessionID === ctx.sessionId) {
+          failedStepRecord(ctx.usage, ctx.unresolvedSteps, event.step);
+          turnCostEmit(ctx, turnId);
+        }
+        return;
+      }
       if (event.type === "step.completed") {
-        if (turnId && event.sessionID === ctx.sessionId) {
+        if (turnId && event.turnID === turnId && event.sessionID === ctx.sessionId) {
+          ctx.unresolvedSteps.delete(event.step.assistantMessageID);
           ctx.usage.set(event.step.assistantMessageID, {
-            ...event.step.tokens,
+            tokens: event.step.tokens,
             cost: event.step.cost,
+            completed: true,
           });
+          turnCostEmit(ctx, turnId);
           contextUsageEmit(ctx, turnId, event.step.tokens);
         }
         return;
@@ -880,6 +1030,9 @@ export const makeOpenCodeNativeAdapter = (options: {
             modelSelection: selection,
             fragments: new Map(),
             usage: new Map(),
+            unresolvedSteps: new Set(),
+            lastCostUsd: undefined,
+            settledCosts: new Map(),
             children: new Map(),
             contextLimit: undefined,
             permissions: new Map(),

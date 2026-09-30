@@ -85,6 +85,20 @@ describe("runtimeEventToActivities task progress", () => {
 });
 
 describe("runtimeEventToActivities reported turn cost", () => {
+  const provisional = (totalCostUsd: number, eventId: string) =>
+    ({
+      ...base,
+      provider: ProviderDriverKind.make("opencode"),
+      type: "turn.cost.updated",
+      eventId: EventId.make(eventId),
+      turnId: TurnId.make("turn-1"),
+      payload: {
+        totalCostUsd,
+        costModel: "provider/model-at-turn",
+        costSessionId: "session-at-turn",
+      },
+    }) satisfies ProviderRuntimeEvent;
+
   const completed = (totalCostUsd?: number) =>
     ({
       ...base,
@@ -100,26 +114,76 @@ describe("runtimeEventToActivities reported turn cost", () => {
       },
     }) satisfies ProviderRuntimeEvent;
 
-  it("persists a reported zero as a turn activity and omits a missing amount", () => {
+  it("leaves a provisional cost untouched when completion reports no amount", () => {
     const zeroCost = runtimeEventToActivities(completed(0));
     const missingCost = runtimeEventToActivities(completed());
+    const priorProvisional = runtimeEventToActivities(provisional(0.12, "evt-cost-prior"))[0];
 
     expect(zeroCost).toHaveLength(1);
     expect(zeroCost[0]).toMatchObject({
       kind: "usage.cost",
+      id: "usage-cost:thread-1:turn-1",
       turnId: "turn-1",
       payload: {
         totalCostUsd: 0,
+        status: "final",
         model: "provider/model-at-turn",
         providerSessionId: "session-at-turn",
       },
     });
     expect(missingCost).toEqual([]);
+    expect(priorProvisional).toMatchObject({
+      id: "usage-cost:thread-1:turn-1",
+      payload: { totalCostUsd: 0.12, status: "provisional" },
+    });
   });
 
   it("does not persist invalid reported amounts", () => {
     expect(runtimeEventToActivities(completed(-1))).toEqual([]);
     expect(runtimeEventToActivities(completed(Number.NaN))).toEqual([]);
+    expect(runtimeEventToActivities(completed(Number.POSITIVE_INFINITY))).toEqual([]);
+    expect(runtimeEventToActivities(provisional(-1, "evt-cost-invalid"))).toEqual([]);
+    expect(runtimeEventToActivities(provisional(Number.NaN, "evt-cost-nan"))).toEqual([]);
+  });
+
+  it("replaces repeated provisional updates with the final turn cost activity", () => {
+    const observation = provisional(0.12, "evt-cost-first");
+    const first = runtimeEventToActivities(observation)[0];
+    const duplicate = runtimeEventToActivities(observation)[0];
+    const repeated = runtimeEventToActivities(provisional(0.24, "evt-cost-repeated"))[0];
+    const final = runtimeEventToActivities(completed(0.3))[0];
+
+    expect(first).toMatchObject({
+      id: "usage-cost:thread-1:turn-1",
+      kind: "usage.cost",
+      payload: { totalCostUsd: 0.12, status: "provisional" },
+    });
+    expect(duplicate).toEqual(first);
+    expect(repeated?.id).toBe(first?.id);
+    expect(repeated?.payload).toMatchObject({ totalCostUsd: 0.24, status: "provisional" });
+    expect(final?.id).toBe(first?.id);
+    expect(final?.payload).toMatchObject({ totalCostUsd: 0.3, status: "final" });
+  });
+
+  it("maps a valid late final snapshot to the same identity and rejects invalid final amounts", () => {
+    const initial = runtimeEventToActivities(provisional(0.12, "evt-cost-initial"))[0];
+    const late = runtimeEventToActivities({
+      ...provisional(0.3, "evt-cost-late"),
+      payload: { ...provisional(0.3, "evt-cost-late").payload, status: "final" },
+    })[0];
+    expect(late?.id).toBe(initial?.id);
+    expect(late?.payload).toMatchObject({
+      totalCostUsd: 0.3,
+      status: "final",
+      model: "provider/model-at-turn",
+      providerSessionId: "session-at-turn",
+    });
+    expect(
+      runtimeEventToActivities({
+        ...provisional(Number.NaN, "evt-invalid-final"),
+        payload: { totalCostUsd: Number.NaN, status: "final" },
+      }),
+    ).toEqual([]);
   });
 
   it("does not create an OpenCode usage activity for another provider's completion", () => {

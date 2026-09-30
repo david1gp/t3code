@@ -463,6 +463,7 @@ interface OpenCodeSessionContext {
   readonly childOriginTurnIdBySessionId: Map<string, TurnId | undefined>;
   readonly childUsageByMessageId: Map<string, Map<string, ThreadTokenUsageSnapshot>>;
   readonly childCostByPartId: Map<string, Map<string, number | undefined>>;
+  readonly turnCostsById: Map<TurnId, OpenCodeTurnCostState>;
   readonly childToolCallIds: Map<string, Set<string>>;
   readonly resolvedRequestIds: Set<string>;
   readonly autoRepliedRequestIds: Set<string>;
@@ -527,7 +528,7 @@ type OpenCodeChildSessionInfo = {
 
 interface OpenCodeTurnTokenUsageAccumulator {
   readonly partIds: Set<string>;
-  readonly costPartIds: Set<string>;
+  readonly costByPartId: Map<string, number | undefined>;
   costIncomplete: boolean;
   readonly promptMessageIds: Set<string>;
   readonly assistantOwnershipByMessageId: Map<string, "owned" | "other" | "unknown">;
@@ -543,10 +544,19 @@ interface OpenCodeTurnTokenUsageAccumulator {
   hasSubagents: boolean;
 }
 
+interface OpenCodeTurnCostState {
+  readonly usage: OpenCodeTurnTokenUsageAccumulator;
+  readonly model: string | undefined;
+  readonly deletedChildCostsBySessionId: Map<string, Map<string, number | undefined>>;
+  completed: boolean;
+  lastCostUsd: number | undefined;
+  lastStatus: "provisional" | "final" | undefined;
+}
+
 function makeOpenCodeTurnTokenUsageAccumulator(): OpenCodeTurnTokenUsageAccumulator {
   return {
     partIds: new Set(),
-    costPartIds: new Set(),
+    costByPartId: new Map(),
     costIncomplete: false,
     promptMessageIds: new Set(),
     assistantOwnershipByMessageId: new Map(),
@@ -579,18 +589,17 @@ function accumulateOpenCodeStepCost(
   accumulator: OpenCodeTurnTokenUsageAccumulator,
   part: OpenCodeStepUsage,
 ): void {
-  if (accumulator.costPartIds.has(part.id)) return;
-  if (!Number.isFinite(part.cost) || part.cost < 0) {
-    accumulator.costIncomplete = true;
-    return;
-  }
-  const nextCost = (accumulator.totalCostUsd ?? 0) + part.cost;
-  if (!Number.isFinite(nextCost)) {
-    accumulator.costIncomplete = true;
-    return;
-  }
-  accumulator.costPartIds.add(part.id);
-  accumulator.totalCostUsd = nextCost;
+  const cost = Number.isFinite(part.cost) && part.cost >= 0 ? part.cost : undefined;
+  accumulator.costByPartId.set(part.id, cost);
+  accumulator.costIncomplete = [...accumulator.costByPartId.values()].some(
+    (value) => value === undefined,
+  );
+  const totalCostUsd = [...accumulator.costByPartId.values()].reduce(
+    (total, value) => total + (value ?? 0),
+    0,
+  );
+  accumulator.totalCostUsd = Number.isFinite(totalCostUsd) ? totalCostUsd : undefined;
+  if (!Number.isFinite(totalCostUsd)) accumulator.costIncomplete = true;
 }
 
 function takeOpenCodeTurnCostUsd(context: OpenCodeSessionContext): number | undefined {
@@ -603,9 +612,6 @@ function takeOpenCodeTurnCostUsd(context: OpenCodeSessionContext): number | unde
     usage.unresolvedStepsByMessageId.size > 0
       ? undefined
       : usage.totalCostUsd;
-  usage.totalCostUsd = undefined;
-  usage.costIncomplete = false;
-  usage.costPartIds.clear();
   return totalCostUsd;
 }
 
@@ -1328,6 +1334,81 @@ export function makeOpenCodeAdapter(
 
     const emit = (event: ProviderRuntimeEvent) =>
       Queue.offer(runtimeEvents, event).pipe(Effect.asVoid);
+    const emitTurnCost = Effect.fn("emitTurnCost")(function* (
+      context: OpenCodeSessionContext,
+      turnId: TurnId,
+    ) {
+      const state = context.turnCostsById.get(turnId);
+      if (!state) return;
+      const hasPendingChildren = [...context.pendingChildTaskEvents.values()].some((events) =>
+        events.some((pending) => pending.turnId === turnId),
+      );
+      const children = [...context.childOriginTurnIdBySessionId]
+        .filter(([, origin]) => origin === turnId)
+        .map(([sessionId]) => ({
+          status: context.childTaskStatusById.get(sessionId),
+          costs: context.childCostByPartId.get(sessionId),
+        }));
+      // An idle child can still publish another step-finish (or edit a part).
+      // Keep its completed turn's cost state while the child is associated with
+      // it, so those updates correct the same turn even after the parent settles.
+      const hasAssociatedChildren = children.length > 0;
+      for (const [sessionId, costs] of state.deletedChildCostsBySessionId) {
+        if (context.childOriginTurnIdBySessionId.get(sessionId) !== turnId) {
+          children.push({ status: "idle", costs });
+        }
+      }
+      let total = state.usage.totalCostUsd ?? 0;
+      let reported = state.usage.totalCostUsd !== undefined;
+      let childCostsComplete = children.length > 0 || !state.usage.hasSubagents;
+      for (const child of children) {
+        if (!child.costs?.size) childCostsComplete = false;
+        for (const cost of child.costs?.values() ?? []) {
+          if (cost === undefined) {
+            childCostsComplete = false;
+            continue;
+          }
+          reported = true;
+          total += cost;
+        }
+      }
+      const childrenSettled =
+        (children.length > 0 || !state.usage.hasSubagents) &&
+        children.every(
+          (child) =>
+            child.status === "completed" || child.status === "failed" || child.status === "idle",
+        );
+      if (!reported || !Number.isFinite(total)) {
+        if (state.completed && childrenSettled && !hasPendingChildren && !hasAssociatedChildren)
+          context.turnCostsById.delete(turnId);
+        return;
+      }
+      const final =
+        state.completed &&
+        state.usage.complete &&
+        !state.usage.costIncomplete &&
+        state.usage.unresolvedStepsByMessageId.size === 0 &&
+        childCostsComplete &&
+        childrenSettled &&
+        !hasPendingChildren;
+      const status = final ? "final" : "provisional";
+      if (state.lastCostUsd === total && state.lastStatus === status) return;
+      state.lastCostUsd = total;
+      state.lastStatus = status;
+      yield* emit({
+        ...(yield* buildEventBase({ threadId: context.session.threadId, turnId })),
+        turnId,
+        type: "turn.cost.updated",
+        payload: {
+          totalCostUsd: total,
+          ...(final ? { status: "final" as const } : {}),
+          ...(state.model ? { costModel: state.model } : {}),
+          costSessionId: context.openCodeSessionId,
+        },
+      });
+      if (state.completed && childrenSettled && !hasPendingChildren && !hasAssociatedChildren)
+        context.turnCostsById.delete(turnId);
+    });
     // Synchronous publish for callers that must not yield between a state
     // check and the enqueue, e.g. reopening an approval only if its terminal
     // event has not landed yet.
@@ -1383,6 +1464,8 @@ export function makeOpenCodeAdapter(
         context.pendingIdleReconciliation = undefined;
       }
       const totalCostUsd = takeOpenCodeTurnCostUsd(context);
+      const costState = context.turnCostsById.get(turnId);
+      if (costState) costState.completed = true;
       const tokenUsage = takeOpenCodeTurnTokenUsage(context, true);
       context.activeTurnId = undefined;
       context.activeAgent = undefined;
@@ -1423,6 +1506,7 @@ export function makeOpenCodeAdapter(
             : {}),
         },
       });
+      yield* emitTurnCost(context, turnId);
     });
 
     const scheduleIdleReconciliation = Effect.fn("scheduleIdleReconciliation")(function* (
@@ -1559,6 +1643,9 @@ export function makeOpenCodeAdapter(
         return;
       }
       const totalCostUsd = takeOpenCodeTurnCostUsd(context);
+      const costState = context.turnCostsById.get(promptAdmission.turnId);
+      if (costState) costState.completed = true;
+      yield* emitTurnCost(context, promptAdmission.turnId);
       const tokenUsage = takeOpenCodeTurnTokenUsage(context, false);
       context.promptAdmission = undefined;
       context.activeTurnId = undefined;
@@ -1792,6 +1879,7 @@ export function makeOpenCodeAdapter(
       };
       if (context.activeTurnId === turnId) {
         takeOpenCodeTurnCostUsd(context);
+        context.turnCostsById.delete(turnId);
         tokenUsage = takeOpenCodeTurnTokenUsage(context, false);
         context.activeTurnId = undefined;
         context.activeAgent = undefined;
@@ -1937,7 +2025,12 @@ export function makeOpenCodeAdapter(
     const addRelatedOpenCodeSession = (context: OpenCodeSessionContext, sessionId: string) => {
       context.relatedSessionIds.add(sessionId);
       if (context.activeTurnId && context.turnTokenUsage) {
-        context.turnTokenUsage.hasSubagents = true;
+        if (
+          !context.childOriginTurnIdBySessionId.has(sessionId) ||
+          context.childOriginTurnIdBySessionId.get(sessionId) === context.activeTurnId
+        ) {
+          context.turnTokenUsage.hasSubagents = true;
+        }
       }
     };
 
@@ -2483,7 +2576,7 @@ export function makeOpenCodeAdapter(
       context.childTaskStatusById.set(sessionId, "running");
       const originTurnId = context.childOriginTurnIdBySessionId.get(sessionId);
       if (context.activeTurnId && context.turnTokenUsage) {
-        context.turnTokenUsage.hasSubagents = true;
+        if (originTurnId === context.activeTurnId) context.turnTokenUsage.hasSubagents = true;
       }
       if (currentStatus === undefined) {
         yield* emit({
@@ -2551,7 +2644,18 @@ export function makeOpenCodeAdapter(
       const taskId = RuntimeTaskId.make(sessionId);
       const raw = event;
       if (event.type === "session.deleted") {
-        if (context.childTaskStatusById.get(sessionId) === "running") {
+        const originTurnId = context.childOriginTurnIdBySessionId.get(sessionId);
+        const wasRunning = context.childTaskStatusById.get(sessionId) === "running";
+        context.childTaskStatusById.set(sessionId, "idle");
+        if (originTurnId) {
+          const state = context.turnCostsById.get(originTurnId);
+          if (state) {
+            const costs = context.childCostByPartId.get(sessionId);
+            // Session deletion clears live child state, but not costs already observed for this turn.
+            if (costs) state.deletedChildCostsBySessionId.set(sessionId, new Map(costs));
+          }
+        }
+        if (wasRunning) {
           yield* emit({
             ...(yield* buildEventBase({
               threadId: context.session.threadId,
@@ -2570,6 +2674,7 @@ export function makeOpenCodeAdapter(
         context.childUsageByMessageId.delete(sessionId);
         context.childCostByPartId.delete(sessionId);
         context.childToolCallIds.delete(sessionId);
+        if (originTurnId) yield* emitTurnCost(context, originTurnId);
         return;
       }
       if (event.type === "session.updated" || event.type === "session.created") {
@@ -2588,10 +2693,39 @@ export function makeOpenCodeAdapter(
             ? parentOriginTurnId
             : arrivalTurnId;
         context.childOriginTurnIdBySessionId.set(sessionId, originTurnId);
+      } else if (context.childOriginTurnIdBySessionId.get(sessionId) === undefined) {
+        const parentId = context.childParentBySessionId.get(sessionId);
+        const parentOrigin =
+          parentId === context.openCodeSessionId
+            ? arrivalTurnId
+            : parentId
+              ? context.childOriginTurnIdBySessionId.get(parentId)
+              : undefined;
+        if (parentOrigin) context.childOriginTurnIdBySessionId.set(sessionId, parentOrigin);
       }
       const explicitRestart =
         event.type === "session.status" &&
         (event.properties.status.type === "busy" || event.properties.status.type === "retry");
+      const previousOrigin = context.childOriginTurnIdBySessionId.get(sessionId);
+      if (
+        explicitRestart &&
+        previousTaskStatus !== "running" &&
+        arrivalTurnId &&
+        previousOrigin !== arrivalTurnId
+      ) {
+        if (previousOrigin) {
+          const previousCost = context.turnCostsById.get(previousOrigin);
+          const costs = context.childCostByPartId.get(sessionId);
+          if (previousCost && costs) {
+            previousCost.deletedChildCostsBySessionId.set(sessionId, new Map(costs));
+          }
+        }
+        context.childOriginTurnIdBySessionId.set(sessionId, arrivalTurnId);
+        context.childUsageByMessageId.delete(sessionId);
+        context.childCostByPartId.delete(sessionId);
+        context.childToolCallIds.delete(sessionId);
+        if (previousOrigin) yield* emitTurnCost(context, previousOrigin);
+      }
       if (previousTaskStatus === undefined || explicitRestart) {
         yield* emitChildTaskStarted(context, sessionId, raw);
       }
@@ -2633,6 +2767,8 @@ export function makeOpenCodeAdapter(
               ...childTaskLinkage(context, sessionId),
             },
           });
+          const origin = context.childOriginTurnIdBySessionId.get(sessionId);
+          if (origin) yield* emitTurnCost(context, origin);
         }
         return;
       }
@@ -2642,6 +2778,8 @@ export function makeOpenCodeAdapter(
         const status = context.childTaskStatusById.get(sessionId);
         if (status === "failed" || status === "completed") return;
         context.childTaskStatusById.set(sessionId, "failed");
+        const origin = context.childOriginTurnIdBySessionId.get(sessionId);
+        if (origin) yield* emitTurnCost(context, origin);
         const typedUsage = openCodeChildTypedUsage(
           context.childUsageByMessageId.get(sessionId) ?? new Map(),
           context.childToolCallIds.get(sessionId)?.size ?? 0,
@@ -2672,6 +2810,8 @@ export function makeOpenCodeAdapter(
           if (status === "failed" || status === "completed") return;
           const detail = sessionErrorMessage(messageError);
           context.childTaskStatusById.set(sessionId, "failed");
+          const origin = context.childOriginTurnIdBySessionId.get(sessionId);
+          if (origin) yield* emitTurnCost(context, origin);
           const typedUsage = openCodeChildTypedUsage(
             context.childUsageByMessageId.get(sessionId) ?? new Map(),
             context.childToolCallIds.get(sessionId)?.size ?? 0,
@@ -2726,7 +2866,6 @@ export function makeOpenCodeAdapter(
         return;
       }
       if (event.type === "message.part.updated" && event.properties.part.type === "step-finish") {
-        if (context.childTaskStatusById.get(sessionId) === "completed") return;
         const part = event.properties.part;
         const cost = part.cost;
         const costs = context.childCostByPartId.get(sessionId) ?? new Map();
@@ -2735,11 +2874,12 @@ export function makeOpenCodeAdapter(
           typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : undefined,
         );
         context.childCostByPartId.set(sessionId, costs);
+        const origin = context.childOriginTurnIdBySessionId.get(sessionId);
+        if (origin) yield* emitTurnCost(context, origin);
         const typedUsage = openCodeChildTypedUsage(
           context.childUsageByMessageId.get(sessionId) ?? new Map(),
           context.childToolCallIds.get(sessionId)?.size ?? 0,
           costs,
-          context.childTaskStatusById.get(sessionId) === "completed",
         );
         if (typedUsage) {
           yield* emit({
@@ -2814,12 +2954,14 @@ export function makeOpenCodeAdapter(
     ) {
       const events = context.pendingChildTaskEvents.get(sessionId);
       if (!events || context.childTaskEventFlushes.has(sessionId)) return;
+      const pendingTurnIds = new Set<TurnId>();
       context.childTaskEventFlushes.add(sessionId);
       yield* Effect.gen(function* () {
         while (events.length > 0) {
           const pending = events.shift();
           if (!pending) continue;
           const { event, turnId } = pending;
+          if (turnId) pendingTurnIds.add(turnId);
           yield* writeNativeEventBestEffort(context.session.threadId, {
             observedAt: yield* nowIso,
             event: {
@@ -2835,6 +2977,7 @@ export function makeOpenCodeAdapter(
           yield* handleChildSessionEvent(context, event, sessionId, turnId);
         }
         context.pendingChildTaskEvents.delete(sessionId);
+        for (const turnId of pendingTurnIds) yield* emitTurnCost(context, turnId);
       }).pipe(Effect.ensuring(Effect.sync(() => context.childTaskEventFlushes.delete(sessionId))));
     });
 
@@ -2887,6 +3030,9 @@ export function makeOpenCodeAdapter(
           if (oldestId !== undefined) {
             const discarded = context.pendingChildTaskEvents.get(oldestId);
             context.pendingChildTaskEvents.delete(oldestId);
+            for (const turnId of new Set(discarded?.map(({ turnId }) => turnId))) {
+              if (turnId) yield* emitTurnCost(context, turnId);
+            }
             markUnrelatedChildSession(context, oldestId);
             const retry = context.childTaskRelationRetries.get(oldestId);
             if (retry) {
@@ -2980,6 +3126,9 @@ export function makeOpenCodeAdapter(
           if (ancestryLookups >= 5) {
             const discarded = context.pendingChildTaskEvents.get(sessionId);
             context.pendingChildTaskEvents.delete(sessionId);
+            for (const turnId of new Set(discarded?.map(({ turnId }) => turnId))) {
+              if (turnId) yield* emitTurnCost(context, turnId);
+            }
             markUnrelatedChildSession(context, sessionId);
             if (
               lastRelation === undefined &&
@@ -3329,6 +3478,7 @@ export function makeOpenCodeAdapter(
                     accumulateOpenCodeStepUsage(usage, step);
                     accumulateOpenCodeStepCost(usage, step);
                   }
+                  if (turnId) yield* emitTurnCost(context, turnId);
                 }
                 usage.unresolvedStepsByMessageId.delete(event.properties.info.id);
               }
@@ -3407,6 +3557,7 @@ export function makeOpenCodeAdapter(
             if (ownership === "owned") {
               accumulateOpenCodeStepUsage(usage, part);
               accumulateOpenCodeStepCost(usage, part);
+              yield* emitTurnCost(context, turnId);
             } else if (
               ownership === "unknown" ||
               (ownership === undefined &&
@@ -3624,6 +3775,11 @@ export function makeOpenCodeAdapter(
             terminalCancellation.acknowledged = true;
           }
           const totalCostUsd = activeTurnId ? takeOpenCodeTurnCostUsd(context) : undefined;
+          if (activeTurnId) {
+            const costState = context.turnCostsById.get(activeTurnId);
+            if (costState) costState.completed = true;
+            yield* emitTurnCost(context, activeTurnId);
+          }
           const tokenUsage = activeTurnId ? takeOpenCodeTurnTokenUsage(context, false) : undefined;
           context.activeTurnId = undefined;
           context.activeAgent = undefined;
@@ -3977,6 +4133,7 @@ export function makeOpenCodeAdapter(
           childOriginTurnIdBySessionId: new Map(),
           childUsageByMessageId: new Map(),
           childCostByPartId: new Map(),
+          turnCostsById: new Map(),
           childToolCallIds: new Map(),
           resolvedRequestIds: new Set(),
           autoRepliedRequestIds: new Set(),
@@ -4178,6 +4335,14 @@ export function makeOpenCodeAdapter(
           context.activeTurnId = turnId;
           if (steeringTurnId === undefined) {
             context.turnTokenUsage = makeOpenCodeTurnTokenUsageAccumulator();
+            context.turnCostsById.set(turnId, {
+              usage: context.turnTokenUsage,
+              model: modelSelection?.model ?? context.session.model,
+              deletedChildCostsBySessionId: new Map(),
+              completed: false,
+              lastCostUsd: undefined,
+              lastStatus: undefined,
+            });
           }
           context.turnTokenUsage?.promptMessageIds.add(messageId);
           context.activeAgent = agent ?? (input.interactionMode === "plan" ? "plan" : undefined);
@@ -4349,6 +4514,7 @@ export function makeOpenCodeAdapter(
                         return;
                       }
                       takeOpenCodeTurnCostUsd(context);
+                      context.turnCostsById.delete(turnId);
                       const tokenUsage = takeOpenCodeTurnTokenUsage(context, false);
                       context.promptAdmission = undefined;
                       context.activeTurnId = undefined;
@@ -4398,6 +4564,7 @@ export function makeOpenCodeAdapter(
                       return;
                     }
                     takeOpenCodeTurnCostUsd(context);
+                    context.turnCostsById.delete(turnId);
                     const tokenUsage = takeOpenCodeTurnTokenUsage(context, false);
                     context.promptAdmission = undefined;
                     context.activeTurnId = undefined;
@@ -4979,6 +5146,7 @@ export function makeOpenCodeAdapter(
           context.childOriginTurnIdBySessionId.clear();
           context.childUsageByMessageId.clear();
           context.childCostByPartId.clear();
+          context.turnCostsById.clear();
           context.childToolCallIds.clear();
           context.messageRoleById.clear();
           context.textPartsByMessageId.clear();

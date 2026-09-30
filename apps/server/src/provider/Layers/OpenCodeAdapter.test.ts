@@ -4211,6 +4211,759 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       }),
   );
 
+  it.effect("uses the latest deduplicated parent step cost when the turn completes", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-final-corrected-parent-step-cost");
+      const root = "http://127.0.0.1:9999/session";
+      const busy = promiseWithResolvers<unknown>();
+      const slots = Array.from({ length: 5 }, () => promiseWithResolvers<unknown>());
+      runtimeMock.state.subscribedEvents = [busy.promise, ...slots.map((slot) => slot.promise)];
+      const observedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil(
+          (event) => event.type === "turn.cost.updated" && event.payload.status === "final",
+        ),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const sending = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Work",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "opencode/kimi-k3",
+          ),
+        })
+        .pipe(Effect.forkChild);
+      busy.resolve({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "busy" } },
+      });
+      const turn = yield* Fiber.join(sending);
+      const promptId = (runtimeMock.state.promptCalls[0] as { messageID: string }).messageID;
+      const step = (cost: number) => ({
+        type: "message.part.updated",
+        properties: {
+          sessionID: root,
+          part: {
+            id: "correctable-final-step",
+            sessionID: root,
+            messageID: "correctable-final-message",
+            type: "step-finish",
+            reason: "stop",
+            cost,
+            tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+          },
+        },
+      });
+      slots[0]!.resolve({
+        type: "message.updated",
+        properties: {
+          sessionID: root,
+          info: {
+            id: "correctable-final-message",
+            role: "assistant",
+            parentID: promptId,
+          },
+        },
+      });
+      slots[1]!.resolve(step(0.1));
+      slots[2]!.resolve(step(0.2));
+      slots[3]!.resolve(step(0.2));
+      slots[4]!.resolve({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "idle" } },
+      });
+      const observed = Array.from(
+        yield* Fiber.join(observedFiber).pipe(Effect.timeout("2 seconds")),
+      );
+      const costs = observed.filter((event) => event.type === "turn.cost.updated");
+      NodeAssert.deepEqual(
+        costs.map((event) => event.payload.totalCostUsd),
+        [0.1, 0.2, 0.2],
+      );
+      NodeAssert.equal(costs.at(-1)?.payload.status, "final");
+      const completed = observed.find((event) => event.type === "turn.completed");
+      NodeAssert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        NodeAssert.equal(completed.payload.totalCostUsd, 0.2);
+        NodeAssert.equal(completed.turnId, turn.turnId);
+      }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("replaces corrected parent step costs and invalidates a missing correction", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-corrected-parent-step-cost");
+      const root = "http://127.0.0.1:9999/session";
+      const busy = promiseWithResolvers<unknown>();
+      const slots = Array.from({ length: 6 }, () => promiseWithResolvers<unknown>());
+      runtimeMock.state.subscribedEvents = [busy.promise, ...slots.map((slot) => slot.promise)];
+      const observedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const sending = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Work",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "opencode/kimi-k3",
+          ),
+        })
+        .pipe(Effect.forkChild);
+      busy.resolve({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "busy" } },
+      });
+      const turn = yield* Fiber.join(sending);
+      const promptId = (runtimeMock.state.promptCalls[0] as { messageID: string }).messageID;
+      const step = (cost?: number) => ({
+        type: "message.part.updated",
+        properties: {
+          sessionID: root,
+          part: {
+            id: "correctable-step",
+            sessionID: root,
+            messageID: "correctable-message",
+            type: "step-finish",
+            reason: "stop",
+            ...(cost === undefined ? {} : { cost }),
+            tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+          },
+        },
+      });
+      slots[0]!.resolve({
+        type: "message.updated",
+        properties: {
+          sessionID: root,
+          info: { id: "correctable-message", role: "assistant", parentID: promptId },
+        },
+      });
+      slots[1]!.resolve(step(0.1));
+      slots[2]!.resolve(step(0.2));
+      slots[3]!.resolve(step(0.2));
+      slots[4]!.resolve(step());
+      slots[5]!.resolve({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "idle" } },
+      });
+      const observed = Array.from(
+        yield* Fiber.join(observedFiber).pipe(Effect.timeout("2 seconds")),
+      );
+      const costs = observed.filter((event) => event.type === "turn.cost.updated");
+      NodeAssert.deepEqual(
+        costs.map((event) => event.payload.totalCostUsd),
+        [0.1, 0.2, 0],
+      );
+      NodeAssert.ok(costs.every((event) => event.turnId === turn.turnId));
+      NodeAssert.ok(costs.every((event) => event.payload.status !== "final"));
+      const completed = observed.find((event) => event.type === "turn.completed");
+      NodeAssert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        NodeAssert.equal(completed.payload.totalCostUsd, undefined);
+      }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect(
+    "streams an owned parent and nested child cost, then finalizes after both children settle",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-live-nested-cost");
+        const root = "http://127.0.0.1:9999/session";
+        const busy = promiseWithResolvers<unknown>();
+        const events = Array.from({ length: 9 }, () => promiseWithResolvers<unknown>());
+        runtimeMock.state.subscribedEvents = [busy.promise, ...events.map((slot) => slot.promise)];
+        const collected = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId),
+          Stream.takeUntil(
+            (event) => event.type === "turn.cost.updated" && event.payload.status === "final",
+          ),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const sending = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "Work",
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("opencode"),
+              "opencode/kimi-k3",
+            ),
+          })
+          .pipe(Effect.forkChild);
+        busy.resolve({
+          type: "session.status",
+          properties: { sessionID: root, status: { type: "busy" } },
+        });
+        const turn = yield* Fiber.join(sending);
+        const promptId = (runtimeMock.state.promptCalls[0] as { messageID: string }).messageID;
+        const step = (sessionID: string, messageID: string, id: string, cost: number) => ({
+          type: "message.part.updated",
+          properties: {
+            sessionID,
+            part: {
+              id,
+              sessionID,
+              messageID,
+              type: "step-finish",
+              reason: "stop",
+              cost,
+              tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+            },
+          },
+        });
+        events[0]!.resolve({
+          type: "message.updated",
+          properties: {
+            sessionID: root,
+            info: { id: "main-cost-message", role: "assistant", parentID: promptId },
+          },
+        });
+        events[1]!.resolve(step(root, "main-cost-message", "main-cost-part", 0.2));
+        events[2]!.resolve({
+          type: "session.created",
+          properties: { info: { id: "child-cost-1", parentID: root } },
+        });
+        events[3]!.resolve(step("child-cost-1", "child-message", "child-cost-part", 0.3));
+        events[4]!.resolve({
+          type: "session.created",
+          properties: { info: { id: "child-cost-2", parentID: "child-cost-1" } },
+        });
+        events[5]!.resolve(step("child-cost-2", "nested-message", "nested-cost-part", 0.4));
+        events[6]!.resolve({
+          type: "session.status",
+          properties: { sessionID: "child-cost-2", status: { type: "idle" } },
+        });
+        events[7]!.resolve({
+          type: "session.status",
+          properties: { sessionID: "child-cost-1", status: { type: "idle" } },
+        });
+        events[8]!.resolve({
+          type: "session.status",
+          properties: { sessionID: root, status: { type: "idle" } },
+        });
+        const observed = Array.from(yield* Fiber.join(collected).pipe(Effect.timeout("2 seconds")));
+        const costs = observed.filter((event) => event.type === "turn.cost.updated");
+        NodeAssert.deepEqual(
+          costs.map((event) => event.payload.totalCostUsd),
+          [0.2, 0.5, 0.9, 0.9],
+        );
+        NodeAssert.ok(costs.every((event) => event.turnId === turn.turnId));
+        NodeAssert.ok(costs.slice(0, -1).every((event) => event.payload.status !== "final"));
+        NodeAssert.equal(costs.at(-1)?.payload.status, "final");
+        NodeAssert.equal(
+          observed.find((event) => event.type === "turn.completed")?.turnId,
+          turn.turnId,
+        );
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
+  it.effect(
+    "corrects a completed turn when its background child settles without charging the next turn",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-background-cost-correction");
+        const root = "http://127.0.0.1:9999/session";
+        const busy = promiseWithResolvers<unknown>();
+        const slots = Array.from({ length: 13 }, () => promiseWithResolvers<unknown>());
+        runtimeMock.state.subscribedEvents = [busy.promise, ...slots.map((slot) => slot.promise)];
+        const firstEvents = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId),
+          Stream.takeUntil((event) => event.type === "turn.completed"),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const sending = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "Start",
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("opencode"),
+              "opencode/kimi-k3",
+            ),
+          })
+          .pipe(Effect.forkChild);
+        busy.resolve({
+          type: "session.status",
+          properties: { sessionID: root, status: { type: "busy" } },
+        });
+        const first = yield* Fiber.join(sending);
+        const promptId = (runtimeMock.state.promptCalls[0] as { messageID: string }).messageID;
+        const step = (sessionID: string, messageID: string, id: string, cost: number) => ({
+          type: "message.part.updated",
+          properties: {
+            sessionID,
+            part: {
+              id,
+              sessionID,
+              messageID,
+              type: "step-finish",
+              reason: "stop",
+              cost,
+              tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+            },
+          },
+        });
+        slots[0]!.resolve({
+          type: "message.updated",
+          properties: {
+            sessionID: root,
+            info: { id: "background-main", role: "assistant", parentID: promptId },
+          },
+        });
+        slots[1]!.resolve(step(root, "background-main", "background-main-part", 0.2));
+        slots[2]!.resolve({
+          type: "session.created",
+          properties: { info: { id: "background-child", parentID: root } },
+        });
+        slots[3]!.resolve({
+          type: "session.status",
+          properties: { sessionID: root, status: { type: "idle" } },
+        });
+        const initial = Array.from(
+          yield* Fiber.join(firstEvents).pipe(Effect.timeout("2 seconds")),
+        );
+        NodeAssert.ok(
+          initial.some(
+            (event) =>
+              event.type === "turn.cost.updated" &&
+              event.payload.totalCostUsd === 0.2 &&
+              event.payload.status !== "final",
+          ),
+        );
+        const corrected = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) => event.threadId === threadId && event.type === "turn.cost.updated",
+          ),
+          Stream.takeUntil(
+            (event) => event.type === "turn.cost.updated" && event.payload.status === "final",
+          ),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        slots[4]!.resolve(step("background-child", "child-message", "background-child-part", 0.3));
+        slots[5]!.resolve(step("background-child", "child-message", "background-child-part", 0.3));
+        slots[6]!.resolve({
+          type: "session.status",
+          properties: { sessionID: "background-child", status: { type: "idle" } },
+        });
+        const costs = Array.from(yield* Fiber.join(corrected).pipe(Effect.timeout("2 seconds")));
+        NodeAssert.deepEqual(
+          costs.map((event) => event.payload.totalCostUsd),
+          [0.5, 0.5],
+        );
+        NodeAssert.ok(costs.every((event) => event.turnId === first.turnId));
+        NodeAssert.equal(costs[0]?.payload.status, undefined);
+        NodeAssert.equal(costs[1]?.payload.status, "final");
+        const lateCorrection = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.threadId === threadId &&
+              event.turnId === first.turnId &&
+              event.type === "turn.cost.updated" &&
+              event.payload.totalCostUsd === 0.7,
+          ),
+          Stream.runHead,
+          Effect.forkChild,
+        );
+        slots[7]!.resolve(step("background-child", "child-message", "late-child-part", 0.2));
+        const late = yield* Fiber.join(lateCorrection).pipe(Effect.timeout("2 seconds"));
+        NodeAssert.equal(late._tag, "Some");
+        if (late._tag === "Some" && late.value.type === "turn.cost.updated") {
+          NodeAssert.equal(late.value.turnId, first.turnId);
+          NodeAssert.equal(late.value.payload.status, "final");
+        }
+        const nextCosts = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) => event.threadId === threadId && event.type === "turn.cost.updated",
+          ),
+          Stream.takeUntil(
+            (event) => event.type === "turn.cost.updated" && event.payload.status === "final",
+          ),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        const nextSend = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "Continue",
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("opencode"),
+              "opencode/kimi-k3",
+            ),
+          })
+          .pipe(Effect.forkChild);
+        slots[8]!.resolve({
+          type: "session.status",
+          properties: { sessionID: root, status: { type: "busy" } },
+        });
+        const second = yield* Fiber.join(nextSend);
+        const secondPromptId = (runtimeMock.state.promptCalls[1] as { messageID: string })
+          .messageID;
+        slots[9]!.resolve({
+          type: "message.updated",
+          properties: {
+            sessionID: root,
+            info: { id: "next-main", role: "assistant", parentID: secondPromptId },
+          },
+        });
+        slots[10]!.resolve(step("background-child", "child-message", "background-child-part", 0.3));
+        slots[11]!.resolve(step(root, "next-main", "next-main-part", 0.4));
+        slots[12]!.resolve({
+          type: "session.status",
+          properties: { sessionID: root, status: { type: "idle" } },
+        });
+        const next = Array.from(yield* Fiber.join(nextCosts).pipe(Effect.timeout("2 seconds")));
+        NodeAssert.notEqual(second.turnId, first.turnId);
+        NodeAssert.deepEqual(
+          next.map((event) => event.payload.totalCostUsd),
+          [0.4, 0.4],
+        );
+        NodeAssert.ok(next.every((event) => event.turnId === second.turnId));
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
+  it.effect("charges a resumed child only for steps from its new parent turn", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-resumed-child-cost");
+      const root = "http://127.0.0.1:9999/session";
+      const child = "ses_resumed_cost_child";
+      const enqueue = makeOpenCodeEventQueue();
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const costs = adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "turn.cost.updated"),
+        Stream.takeUntil(
+          (event) => event.type === "turn.cost.updated" && event.payload.status === "final",
+        ),
+        Stream.runCollect,
+      );
+      const selection = createModelSelection(
+        ProviderInstanceId.make("opencode"),
+        "opencode/kimi-k3",
+      );
+      const firstCosts = yield* costs.pipe(Effect.forkChild);
+      const firstSend = yield* adapter
+        .sendTurn({ threadId, input: "Start", modelSelection: selection })
+        .pipe(Effect.forkChild);
+      enqueue({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "busy" } },
+      });
+      const first = yield* Fiber.join(firstSend).pipe(Effect.timeout("2 seconds"));
+      const firstPrompt = (runtimeMock.state.promptCalls[0] as { messageID: string }).messageID;
+      const step = (sessionID: string, messageID: string, id: string, cost: number) => ({
+        type: "message.part.updated",
+        properties: {
+          sessionID,
+          part: {
+            id,
+            sessionID,
+            messageID,
+            type: "step-finish",
+            reason: "stop",
+            cost,
+            tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+          },
+        },
+      });
+      enqueue({
+        type: "message.updated",
+        properties: {
+          sessionID: root,
+          info: { id: "first-main", role: "assistant", parentID: firstPrompt },
+        },
+      });
+      enqueue(step(root, "first-main", "first-main-step", 0.2));
+      enqueue({ type: "session.created", properties: { info: { id: child, parentID: root } } });
+      enqueue(step(child, "first-child", "first-child-step", 0.3));
+      enqueue({
+        type: "session.status",
+        properties: { sessionID: child, status: { type: "idle" } },
+      });
+      enqueue({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "idle" } },
+      });
+      const initial = Array.from(yield* Fiber.join(firstCosts).pipe(Effect.timeout("2 seconds")));
+      NodeAssert.equal(initial.at(-1)?.payload.totalCostUsd, 0.5);
+      NodeAssert.equal(initial.at(-1)?.turnId, first.turnId);
+
+      const secondCosts = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      const secondSend = yield* adapter
+        .sendTurn({ threadId, input: "Continue", modelSelection: selection })
+        .pipe(Effect.forkChild);
+      enqueue({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "busy" } },
+      });
+      const second = yield* Fiber.join(secondSend).pipe(Effect.timeout("2 seconds"));
+      NodeAssert.notEqual(first.turnId, second.turnId);
+      enqueue({
+        type: "session.status",
+        properties: { sessionID: child, status: { type: "busy" } },
+      });
+      enqueue(step(child, "second-child", "second-child-step", 0.4));
+      // Finish the child and parent through the live subscription queue.
+      enqueue({
+        type: "session.status",
+        properties: { sessionID: child, status: { type: "idle" } },
+      });
+      enqueue({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "idle" } },
+      });
+      const next = Array.from(
+        yield* Fiber.join(secondCosts).pipe(Effect.timeout("2 seconds")),
+      ).filter((event) => event.type === "turn.cost.updated");
+      NodeAssert.equal(next.at(-1)?.turnId, second.turnId);
+      NodeAssert.equal(next.at(-1)?.payload.totalCostUsd, 0.4);
+      NodeAssert.ok(
+        next.every((event) => event.turnId === first.turnId || event.turnId === second.turnId),
+      );
+      NodeAssert.ok(
+        next
+          .filter((event) => event.turnId === first.turnId)
+          .every((event) => event.payload.totalCostUsd === 0.5),
+      );
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("keeps deleted child costs in the parent turn's final total", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-deleted-child-cost");
+      const root = "http://127.0.0.1:9999/session";
+      const busy = promiseWithResolvers<unknown>();
+      const slots = Array.from({ length: 6 }, () => promiseWithResolvers<unknown>());
+      runtimeMock.state.subscribedEvents = [busy.promise, ...slots.map((slot) => slot.promise)];
+      const costsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event): event is Extract<typeof event, { type: "turn.cost.updated" }> =>
+            event.threadId === threadId && event.type === "turn.cost.updated",
+        ),
+        Stream.takeUntil(
+          (event) => event.type === "turn.cost.updated" && event.payload.status === "final",
+        ),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const sending = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Work",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "opencode/kimi-k3",
+          ),
+        })
+        .pipe(Effect.forkChild);
+      busy.resolve({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "busy" } },
+      });
+      const turn = yield* Fiber.join(sending);
+      const promptId = (runtimeMock.state.promptCalls[0] as { messageID: string }).messageID;
+      const step = (sessionID: string, messageID: string, id: string, cost: number) => ({
+        type: "message.part.updated",
+        properties: {
+          sessionID,
+          part: {
+            id,
+            sessionID,
+            messageID,
+            type: "step-finish",
+            reason: "stop",
+            cost,
+            tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+          },
+        },
+      });
+      slots[0]!.resolve({
+        type: "message.updated",
+        properties: {
+          sessionID: root,
+          info: { id: "deleted-main", role: "assistant", parentID: promptId },
+        },
+      });
+      slots[1]!.resolve(step(root, "deleted-main", "deleted-main-part", 0.2));
+      slots[2]!.resolve({
+        type: "session.created",
+        properties: { info: { id: "deleted-child", parentID: root } },
+      });
+      slots[3]!.resolve(step("deleted-child", "deleted-child-message", "deleted-child-part", 0.3));
+      slots[4]!.resolve({
+        type: "session.deleted",
+        properties: { info: { id: "deleted-child", parentID: root } },
+      });
+      slots[5]!.resolve({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "idle" } },
+      });
+      const costs = Array.from(yield* Fiber.join(costsFiber).pipe(Effect.timeout("2 seconds")));
+      NodeAssert.equal(costs.at(-1)?.turnId, turn.turnId);
+      NodeAssert.equal(costs.at(-1)?.payload.totalCostUsd, 0.5);
+      NodeAssert.equal(costs.at(-1)?.payload.status, "final");
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect(
+    "defers a final cost until queued child ancestry resolves without charging foreign sessions",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-pending-child-cost");
+        const root = "http://127.0.0.1:9999/session";
+        const child = "pending-cost-child";
+        const foreign = "foreign-cost-child";
+        const busy = promiseWithResolvers<unknown>();
+        const slots = Array.from({ length: 6 }, () => promiseWithResolvers<unknown>());
+        const lookup = promiseWithResolvers<void>();
+        runtimeMock.state.subscribedEvents = [busy.promise, ...slots.map((slot) => slot.promise)];
+        runtimeMock.state.sessionParentById.set(child, root);
+        runtimeMock.state.sessionParentById.set(foreign, "other-root");
+        runtimeMock.state.transientErrorSessionIds.add(child);
+        runtimeMock.state.sessionGetObserved = (id) => {
+          if (id === child) lookup.resolve(undefined);
+        };
+        const costsFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event): event is Extract<typeof event, { type: "turn.cost.updated" }> =>
+              event.threadId === threadId && event.type === "turn.cost.updated",
+          ),
+          Stream.takeUntil(
+            (event) => event.type === "turn.cost.updated" && event.payload.status === "final",
+          ),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const sending = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "Work",
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("opencode"),
+              "opencode/kimi-k3",
+            ),
+          })
+          .pipe(Effect.forkChild);
+        busy.resolve({
+          type: "session.status",
+          properties: { sessionID: root, status: { type: "busy" } },
+        });
+        const turn = yield* Fiber.join(sending);
+        const promptId = (runtimeMock.state.promptCalls[0] as { messageID: string }).messageID;
+        const step = (sessionID: string, messageID: string, id: string, cost: number) => ({
+          type: "message.part.updated",
+          properties: {
+            sessionID,
+            part: {
+              id,
+              sessionID,
+              messageID,
+              type: "step-finish",
+              reason: "stop",
+              cost,
+              tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+            },
+          },
+        });
+        slots[0]!.resolve({
+          type: "message.updated",
+          properties: {
+            sessionID: root,
+            info: { id: "pending-main", role: "assistant", parentID: promptId },
+          },
+        });
+        slots[1]!.resolve(step(root, "pending-main", "pending-main-part", 0.2));
+        slots[2]!.resolve(step(child, "pending-child-message", "pending-child-part", 0.3));
+        slots[3]!.resolve({
+          type: "session.status",
+          properties: { sessionID: child, status: { type: "idle" } },
+        });
+        slots[4]!.resolve(step(foreign, "foreign-message", "foreign-part", 10));
+        yield* Effect.promise(() => lookup.promise).pipe(Effect.timeout("2 seconds"));
+        const completed = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
+          Stream.runHead,
+          Effect.forkChild,
+        );
+        slots[5]!.resolve({
+          type: "session.status",
+          properties: { sessionID: root, status: { type: "idle" } },
+        });
+        // The parent can complete while ancestry is still being retried. Its cost cannot finalize yet.
+        yield* Fiber.join(completed).pipe(Effect.timeout("2 seconds"));
+        NodeAssert.equal(costsFiber.pollUnsafe(), undefined);
+        runtimeMock.state.transientErrorSessionIds.delete(child);
+        yield* advanceTestClock(250);
+        yield* advanceTestClock(500);
+        yield* advanceTestClock(1_000);
+        yield* advanceTestClock(2_000);
+        const costs = Array.from(yield* Fiber.join(costsFiber).pipe(Effect.timeout("2 seconds")));
+        NodeAssert.equal(costs.at(-1)?.turnId, turn.turnId);
+        NodeAssert.equal(costs.at(-1)?.payload.totalCostUsd, 0.5);
+        NodeAssert.equal(costs.at(-1)?.payload.status, "final");
+        NodeAssert.ok(costs.every((event) => event.payload.totalCostUsd < 10));
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
   it.effect("sums owned OpenCode step usage and marks unresolved usage partial", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
@@ -4502,7 +5255,13 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         },
       }).pipe(Effect.provideService(Crypto.Crypto, gatedCrypto));
 
+      const firstCostSeen = yield* Deferred.make<void>();
       const completedFiber = yield* adapter.streamEvents.pipe(
+        Stream.tap((event) =>
+          event.threadId === threadId && event.type === "turn.cost.updated"
+            ? Deferred.succeed(firstCostSeen, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        ),
         Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
         Stream.take(2),
         Stream.runCollect,
@@ -4569,6 +5328,8 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         },
       });
       yield* Deferred.await(firstStepWriteStarted);
+      yield* Deferred.succeed(firstStepWriteRelease, undefined);
+      yield* Deferred.await(firstCostSeen);
       blockNextUuid = true;
       firstIdle.resolve({
         id: "evt-token-handoff-first-idle",
@@ -4578,7 +5339,6 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           status: { type: "idle" },
         },
       });
-      yield* Deferred.succeed(firstStepWriteRelease, undefined);
       yield* Deferred.await(terminalUuidStarted);
 
       runtimeMock.state.sessionStatus = "busy";

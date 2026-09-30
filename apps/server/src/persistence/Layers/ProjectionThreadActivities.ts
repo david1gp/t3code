@@ -93,6 +93,14 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
               payload_json = excluded.payload_json,
               sequence = excluded.sequence,
               created_at = excluded.created_at
+            WHERE NOT (
+              projection_thread_activities.kind = 'usage.cost'
+              AND CASE
+                WHEN json_valid(projection_thread_activities.payload_json)
+                THEN json_extract(projection_thread_activities.payload_json, '$.status')
+              END = 'final'
+              AND json_extract(excluded.payload_json, '$.status') = 'provisional'
+            )
           `,
   });
 

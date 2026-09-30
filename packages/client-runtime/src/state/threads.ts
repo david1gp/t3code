@@ -601,12 +601,23 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         return [...olderRows.filter((row) => !seen.has(row.id)), ...loadedRows];
       };
       const seenCheckpoints = new Set(loaded.checkpoints.map((row) => row.turnId));
+      const loadedCostTurnIds = new Set((loaded.reportedCosts ?? []).map((row) => row.turnId));
       merged = {
         // Thread metadata stays the loaded (newer) snapshot's; only the
         // windowed collections gain rows from the older page.
         ...loaded,
         messages: mergeById(older.messages, loaded.messages),
         activities: mergeById(older.activities, loaded.activities),
+        ...(older.reportedCosts !== undefined || loaded.reportedCosts !== undefined
+          ? {
+              // Summaries are not windowed history. Keep the loaded snapshot's
+              // value for a turn, while allowing an older page to fill gaps.
+              reportedCosts: [
+                ...(older.reportedCosts ?? []).filter((row) => !loadedCostTurnIds.has(row.turnId)),
+                ...(loaded.reportedCosts ?? []),
+              ],
+            }
+          : {}),
         proposedPlans: mergeById(older.proposedPlans, loaded.proposedPlans),
         checkpoints: [
           ...older.checkpoints.filter((row) => !seenCheckpoints.has(row.turnId)),

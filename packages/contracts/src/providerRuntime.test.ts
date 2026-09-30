@@ -6,6 +6,30 @@ import { classifyTaskAgentKind, ProviderRuntimeEvent } from "./providerRuntime.t
 const decodeRuntimeEvent = Schema.decodeUnknownSync(ProviderRuntimeEvent);
 
 describe("ProviderRuntimeEvent", () => {
+  it("accepts only finite nonnegative cost updates", () => {
+    const costEvent = {
+      type: "turn.cost.updated",
+      eventId: "event-cost-update",
+      provider: "opencode",
+      createdAt: "2026-02-28T00:00:00.000Z",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      payload: { totalCostUsd: 0 },
+    };
+
+    expect(decodeRuntimeEvent(costEvent).type).toBe("turn.cost.updated");
+    expect(
+      decodeRuntimeEvent({ ...costEvent, payload: { totalCostUsd: 0, status: "final" } }),
+    ).toMatchObject({ type: "turn.cost.updated", payload: { totalCostUsd: 0, status: "final" } });
+    expect(() => decodeRuntimeEvent({ ...costEvent, payload: { totalCostUsd: -0.01 } })).toThrow();
+    expect(() =>
+      decodeRuntimeEvent({ ...costEvent, payload: { totalCostUsd: Infinity } }),
+    ).toThrow();
+    expect(() =>
+      decodeRuntimeEvent({ ...costEvent, payload: { totalCostUsd: Infinity, status: "final" } }),
+    ).toThrow();
+  });
+
   it("requires input and output totals for complete turn usage", () => {
     const completeEvent = {
       type: "turn.completed",

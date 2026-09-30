@@ -10,6 +10,7 @@ import type {
   OrchestrationSession,
   OrchestrationThread,
   OrchestrationThreadActivity,
+  OrchestrationThreadReportedCost,
   ThreadPullRequestLink,
   TurnId,
 } from "@t3tools/contracts";
@@ -637,6 +638,9 @@ export function applyThreadDetailEvent(
         thread.activities,
         Arr.filter((activity) => activity.turnId === null || retainedTurnIds.has(activity.turnId)),
       );
+      const reportedCosts = (thread.reportedCosts ?? []).filter((cost) =>
+        retainedTurnIds.has(cost.turnId),
+      );
       const latestCheckpoint = checkpoints.at(-1) ?? null;
 
       return {
@@ -647,6 +651,7 @@ export function applyThreadDetailEvent(
           messages,
           proposedPlans,
           activities,
+          ...(thread.reportedCosts === undefined ? {} : { reportedCosts }),
           latestTurn:
             latestCheckpoint === null
               ? null
@@ -668,6 +673,7 @@ export function applyThreadDetailEvent(
     // ── Activities ──────────────────────────────────────────────────
     case "thread.activity-appended": {
       const activity = event.payload.activity;
+      const reportedCosts = updateReportedCost(thread.reportedCosts, activity);
       // A resolvable context-window update supersedes earlier resolvable ones
       // for the same turn: consumers only read the latest value (walking the
       // array backwards), and providers stream these updates continuously, so
@@ -698,6 +704,7 @@ export function applyThreadDetailEvent(
           thread: {
             ...thread,
             activities,
+            ...(reportedCosts === thread.reportedCosts ? {} : { reportedCosts }),
             updatedAt: event.occurredAt,
           },
         };
@@ -720,7 +727,12 @@ export function applyThreadDetailEvent(
 
       return {
         kind: "updated",
-        thread: { ...thread, activities, updatedAt: event.occurredAt },
+        thread: {
+          ...thread,
+          activities,
+          ...(reportedCosts === thread.reportedCosts ? {} : { reportedCosts }),
+          updatedAt: event.occurredAt,
+        },
       };
     }
 
@@ -733,6 +745,37 @@ export function applyThreadDetailEvent(
 
   // Forward-compatible: ignore unrecognized event types.
   return { kind: "unchanged" };
+}
+
+/** Keep authoritative per-turn usage outside the bounded activity window. */
+function updateReportedCost(
+  reportedCosts: OrchestrationThread["reportedCosts"],
+  activity: OrchestrationThreadActivity,
+): ReadonlyArray<OrchestrationThreadReportedCost> | undefined {
+  if (activity.kind !== "usage.cost" || activity.turnId === null) return reportedCosts;
+  const payload = activity.payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return reportedCosts;
+  const { totalCostUsd, status } = payload as Record<string, unknown>;
+  if (
+    typeof totalCostUsd !== "number" ||
+    !Number.isFinite(totalCostUsd) ||
+    totalCostUsd < 0 ||
+    (status !== undefined && status !== "provisional" && status !== "final")
+  ) {
+    return reportedCosts;
+  }
+  const next: OrchestrationThreadReportedCost = {
+    turnId: activity.turnId,
+    totalCostUsd,
+    // Older servers omitted status; preserve their established interpretation as final.
+    status: status === "provisional" ? "provisional" : "final",
+  };
+  const previous = reportedCosts?.find((cost) => cost.turnId === activity.turnId);
+  if (previous?.status === "final" && next.status === "provisional") return reportedCosts;
+  if (previous?.totalCostUsd === next.totalCostUsd && previous.status === next.status) {
+    return reportedCosts;
+  }
+  return [...(reportedCosts ?? []).filter((cost) => cost.turnId !== activity.turnId), next];
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

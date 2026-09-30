@@ -164,6 +164,7 @@ const ThreadRealtimeErrorType = Schema.Literal("thread.realtime.error");
 const ThreadRealtimeClosedType = Schema.Literal("thread.realtime.closed");
 const TurnStartedType = Schema.Literal("turn.started");
 const TurnCompletedType = Schema.Literal("turn.completed");
+const TurnCostUpdatedType = Schema.Literal("turn.cost.updated");
 const TurnAbortedType = Schema.Literal("turn.aborted");
 const TurnPlanUpdatedType = Schema.Literal("turn.plan.updated");
 const TurnProposedDeltaType = Schema.Literal("turn.proposed.delta");
@@ -350,7 +351,7 @@ const TurnCompletedPayload = Schema.Struct({
   stopReason: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
   usage: Schema.optional(Schema.Unknown),
   modelUsage: Schema.optional(UnknownRecordSchema),
-  totalCostUsd: Schema.optional(Schema.Number),
+  totalCostUsd: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
   /** Identity at the time of the turn, rather than the thread's mutable selection. */
   costModel: Schema.optional(Schema.String),
   costSessionId: Schema.optional(Schema.String),
@@ -358,6 +359,16 @@ const TurnCompletedPayload = Schema.Struct({
   tokenUsage: Schema.optional(TurnTokenUsage),
 });
 export type TurnCompletedPayload = typeof TurnCompletedPayload.Type;
+
+const TurnCostUpdatedPayload = Schema.Struct({
+  totalCostUsd: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** A complete cost snapshot may arrive after the parent turn settles. */
+  status: Schema.optional(Schema.Literals(["provisional", "final"])),
+  /** Identity at the time of the turn, rather than the thread's mutable selection. */
+  costModel: Schema.optional(Schema.String),
+  costSessionId: Schema.optional(Schema.String),
+});
+export type TurnCostUpdatedPayload = typeof TurnCostUpdatedPayload.Type;
 
 const TurnAbortedPayload = Schema.Struct({
   reason: TrimmedNonEmptyStringSchema,
@@ -933,6 +944,14 @@ const ProviderRuntimeTurnCompletedEvent = Schema.Struct({
 });
 export type ProviderRuntimeTurnCompletedEvent = typeof ProviderRuntimeTurnCompletedEvent.Type;
 
+const ProviderRuntimeTurnCostUpdatedEvent = Schema.Struct({
+  ...ProviderRuntimeEventBase.fields,
+  type: TurnCostUpdatedType,
+  turnId: TurnId,
+  payload: TurnCostUpdatedPayload,
+});
+export type ProviderRuntimeTurnCostUpdatedEvent = typeof ProviderRuntimeTurnCostUpdatedEvent.Type;
+
 const ProviderRuntimeTurnAbortedEvent = Schema.Struct({
   ...ProviderRuntimeEventBase.fields,
   type: TurnAbortedType,
@@ -1194,6 +1213,7 @@ export const ProviderRuntimeEventV2 = Schema.Union([
   ProviderRuntimeThreadRealtimeClosedEvent,
   ProviderRuntimeTurnStartedEvent,
   ProviderRuntimeTurnCompletedEvent,
+  ProviderRuntimeTurnCostUpdatedEvent,
   ProviderRuntimeTurnAbortedEvent,
   ProviderRuntimeTurnPlanUpdatedEvent,
   ProviderRuntimeTurnProposedDeltaEvent,

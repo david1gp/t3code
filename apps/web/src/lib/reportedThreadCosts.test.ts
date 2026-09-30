@@ -21,6 +21,32 @@ function makeActivity(
 }
 
 describe("reported thread costs", () => {
+  it("keeps the label provisional for any latest counted turn, until its final report replaces it", () => {
+    const completedTurn = makeActivity("activity-1", "turn-completed", {
+      totalCostUsd: 0.2,
+      status: "provisional",
+    });
+    const currentTurn = makeActivity("activity-2", "turn-current", {
+      totalCostUsd: 0.2,
+      status: "provisional",
+    });
+
+    expect(deriveReportedThreadCosts([completedTurn, currentTurn]).hasProvisionalCost).toBe(true);
+    expect(
+      deriveReportedThreadCosts([
+        completedTurn,
+        currentTurn,
+        makeActivity("activity-3", "turn-completed", { totalCostUsd: 0.25, status: "final" }),
+        makeActivity("activity-4", "turn-current", { totalCostUsd: 0.3, status: "final" }),
+      ]).hasProvisionalCost,
+    ).toBe(false);
+    // Older payloads without status are final reports.
+    expect(
+      deriveReportedThreadCosts([makeActivity("activity-5", "legacy", { totalCostUsd: 0.1 })])
+        .hasProvisionalCost,
+    ).toBe(false);
+  });
+
   it("uses the latest valid report per turn and totals turns once", () => {
     const result = deriveReportedThreadCosts([
       makeActivity("activity-1", "turn-1", { totalCostUsd: 0.2 }),
@@ -51,6 +77,44 @@ describe("reported thread costs", () => {
     const newer = makeActivity("activity-2", "turn-1", { totalCostUsd: 0.4 });
     const older = makeActivity("activity-1", "turn-1", { totalCostUsd: 0.2 });
     expect(deriveReportedThreadCosts([newer, older]).totalUsd).toBe(0.4);
+  });
+
+  it("prefers cumulative summaries over a windowed activity list and uses live updates", () => {
+    const oldTurn = TurnId.make("old-turn");
+    const recentTurn = TurnId.make("recent-turn");
+    const activityWindow = [makeActivity("activity-1", "recent-turn", { totalCostUsd: 0.3 })];
+    const summary = [
+      { turnId: oldTurn, totalCostUsd: 0.7, status: "final" as const },
+      { turnId: recentTurn, totalCostUsd: 0.4, status: "provisional" as const },
+    ];
+
+    expect(deriveReportedThreadCosts(activityWindow, summary)).toMatchObject({
+      totalUsd: 1.1,
+      hasProvisionalCost: true,
+    });
+    expect(deriveReportedThreadCosts(activityWindow, summary).byTurnId.get(oldTurn)).toBe(0.7);
+    expect(
+      deriveReportedThreadCosts(activityWindow, [
+        { turnId: oldTurn, totalCostUsd: 0.8, status: "final" },
+        { turnId: recentTurn, totalCostUsd: 0.4, status: "provisional" },
+      ]).totalUsd,
+    ).toBeCloseTo(1.2);
+  });
+
+  it("falls back to activity history when the server has no summary", () => {
+    expect(
+      deriveReportedThreadCosts([makeActivity("activity-1", "legacy", { totalCostUsd: 0.2 })])
+        .totalUsd,
+    ).toBe(0.2);
+  });
+
+  it("leaves an overflowing aggregate unknown", () => {
+    expect(
+      deriveReportedThreadCosts([
+        makeActivity("activity-1", "turn-1", { totalCostUsd: Number.MAX_VALUE }),
+        makeActivity("activity-2", "turn-2", { totalCostUsd: Number.MAX_VALUE }),
+      ]).totalUsd,
+    ).toBeNull();
   });
 
   it("formats reported amounts as USD", () => {

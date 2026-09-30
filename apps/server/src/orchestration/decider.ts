@@ -2146,6 +2146,27 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      const activityPayload = command.activity.payload;
+      const isProvisionalUsageCost =
+        command.activity.kind === "usage.cost" &&
+        typeof activityPayload === "object" &&
+        activityPayload !== null &&
+        "status" in activityPayload &&
+        activityPayload.status === "provisional";
+      if (
+        isProvisionalUsageCost &&
+        thread.activities.some(
+          (activity) =>
+            activity.id === command.activity.id &&
+            activity.kind === "usage.cost" &&
+            typeof activity.payload === "object" &&
+            activity.payload !== null &&
+            "status" in activity.payload &&
+            activity.payload.status === "final",
+        )
+      ) {
+        return [];
+      }
       const requestId =
         typeof command.activity.payload === "object" &&
         command.activity.payload !== null &&

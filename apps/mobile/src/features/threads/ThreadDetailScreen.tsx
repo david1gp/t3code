@@ -19,6 +19,7 @@ import type {
   EnvironmentId,
   MessageId,
   ModelSelection,
+  OrchestrationThread,
   OrchestrationThreadActivity,
   OrchestrationThreadShell,
   ProviderApprovalDecision,
@@ -125,6 +126,7 @@ export interface ThreadDetailScreenProps {
   readonly onDismissFeedback: (id: MessageId) => void;
   readonly selectedThreadFeed: ReadonlyArray<ThreadFeedEntry>;
   readonly threadActivities: ReadonlyArray<OrchestrationThreadActivity>;
+  readonly reportedCosts?: OrchestrationThread["reportedCosts"];
   readonly activeWorkStartedAt: string | null;
   readonly isCompacting: boolean;
   /**
@@ -685,8 +687,8 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   );
   const selectedInstanceId = props.selectedThread.modelSelection.instanceId;
   const reportedCosts = useMemo(
-    () => threadReportedCosts(props.threadActivities),
-    [props.threadActivities],
+    () => threadReportedCosts(props.threadActivities, props.reportedCosts),
+    [props.reportedCosts, props.threadActivities],
   );
   useStreamingHaptics(props.selectedThread.id, props.selectedThreadFeed);
   const selectedProviderSkills = useMemo(() => {
@@ -925,7 +927,9 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               agentLabel={agentLabel}
               latestTurn={props.selectedThread.latestTurn}
               reportedCostByTurn={reportedCosts.byTurnId}
+              provisionalCostByTurn={reportedCosts.provisionalByTurnId}
               reportedThreadCostUsd={reportedCosts.totalUsd}
+              reportedThreadCostProvisional={reportedCosts.hasProvisionalCost}
               activeWorkStartedAt={props.activeWorkStartedAt}
               listRef={listRef}
               freeze={freeze}

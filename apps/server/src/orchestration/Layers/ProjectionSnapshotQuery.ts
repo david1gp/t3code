@@ -143,6 +143,17 @@ const ProjectionThreadActivityDbRowSchema = ProjectionThreadActivity.mapFields(
 const ProjectionThreadActivityIdRowSchema = Schema.Struct({
   activityId: ProjectionThreadActivity.fields.activityId,
 });
+const ProjectionThreadReportedCostRowSchema = Schema.Struct({
+  turnId: TurnId,
+  payload: Schema.String,
+});
+const ProjectionThreadReportedCostPayloadSchema = Schema.Struct({
+  totalCostUsd: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+  status: Schema.optional(Schema.Literals(["provisional", "final"])),
+});
+const decodeReportedCostPayload = Schema.decodeUnknownOption(
+  Schema.fromJsonString(ProjectionThreadReportedCostPayloadSchema),
+);
 const ProjectionThreadSessionDbRowSchema = ProjectionThreadSession;
 const ProjectionThreadRuntimeContextDbRowSchema = Schema.Struct({
   titleState: Schema.NullOr(Schema.fromJsonString(ThreadTitleState)),
@@ -597,6 +608,19 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         FROM projection_threads
         ORDER BY created_at ASC, thread_id ASC
       `,
+  });
+
+  // Activity hydration is intentionally capped at 500, but reported cost is a
+  // one-row-per-turn summary and must cover the whole thread for detail loads.
+  const listThreadReportedCostRows = SqlSchema.findAll({
+    Request: Schema.Struct({ threadId: ThreadId }),
+    Result: ProjectionThreadReportedCostRowSchema,
+    execute: ({ threadId }) => sql`
+      SELECT turn_id AS "turnId", payload_json AS "payload"
+      FROM projection_thread_activities
+      WHERE thread_id = ${threadId} AND kind = 'usage.cost' AND turn_id IS NOT NULL
+      ORDER BY sequence ASC, created_at ASC, activity_id ASC
+    `,
   });
 
   const listActiveThreadRows = SqlSchema.findAll({
@@ -3615,6 +3639,37 @@ pending_approval_requests AS (
       ...(query === undefined ? {} : { query }),
     });
 
+  const getThreadReportedCosts = (threadId: ThreadId) =>
+    listThreadReportedCostRows({ threadId }).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.getThreadDetailSnapshot:reportedCosts:query",
+          "ProjectionSnapshotQuery.getThreadDetailSnapshot:reportedCosts:decodeRows",
+        ),
+      ),
+      Effect.map((rows) => {
+        const latestByTurn = new Map<
+          TurnId,
+          {
+            readonly turnId: TurnId;
+            readonly totalCostUsd: number;
+            readonly status: "provisional" | "final";
+          }
+        >();
+        for (const row of rows) {
+          const payload = decodeReportedCostPayload(row.payload);
+          if (Option.isSome(payload)) {
+            latestByTurn.set(row.turnId, {
+              turnId: row.turnId,
+              totalCostUsd: payload.value.totalCostUsd,
+              status: payload.value.status ?? "final",
+            });
+          }
+        }
+        return [...latestByTurn.values()];
+      }),
+    );
+
   // Bounds pathological fan-out: one user turn that spawned hundreds of
   // subagent turns still pages in bounded chunks, at the cost of splitting the
   // fan-out group across pages (the cursor continues the same group). Also
@@ -3643,8 +3698,12 @@ pending_approval_requests AS (
             if (Option.isNone(thread)) {
               return Option.none<OrchestrationThreadDetailSnapshot>();
             }
+            const reportedCosts = yield* getThreadReportedCosts(threadId);
             const { snapshotSequence } = yield* getSnapshotSequence();
-            return Option.some({ snapshotSequence, thread: thread.value });
+            return Option.some({
+              snapshotSequence,
+              thread: { ...thread.value, reportedCosts },
+            });
           }
 
           // A malformed or foreign-thread cursor falls back to the first page
@@ -3717,6 +3776,7 @@ pending_approval_requests AS (
             return Option.none<OrchestrationThreadDetailSnapshot>();
           }
 
+          const reportedCosts = yield* getThreadReportedCosts(threadId);
           const { snapshotSequence } = yield* getSnapshotSequence();
           const watermarkRow = yield* getThreadEventWatermarkRow({
             threadId,
@@ -3735,7 +3795,7 @@ pending_approval_requests AS (
           });
           return Option.some({
             snapshotSequence,
-            thread: thread.value,
+            thread: { ...thread.value, reportedCosts },
             page: {
               beforeCursor:
                 hasMore && oldest !== undefined

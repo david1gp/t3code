@@ -270,7 +270,9 @@ export interface ThreadFeedProps {
   readonly agentLabel: string;
   readonly latestTurn: ThreadFeedLatestTurn | null;
   readonly reportedCostByTurn: ReadonlyMap<TurnId, number>;
+  readonly provisionalCostByTurn: ReadonlySet<TurnId>;
   readonly reportedThreadCostUsd: number | null;
+  readonly reportedThreadCostProvisional: boolean;
   readonly activeWorkStartedAt: string | null;
   readonly listRef: RefObject<LegendListRef | null>;
   readonly freeze: SharedValue<boolean>;
@@ -1374,6 +1376,7 @@ function renderFeedEntry(
     | "dispatchingMessageId"
     | "onEditPendingMessage"
     | "reportedCostByTurn"
+    | "provisionalCostByTurn"
   > & {
     readonly copiedRowId: string | null;
     readonly expandedWorkRows: Record<string, boolean>;
@@ -1553,6 +1556,12 @@ function renderFeedEntry(
     const reportedTurnCost = message.turnId
       ? props.reportedCostByTurn.get(message.turnId)
       : undefined;
+    const reportedTurnCostProvisional = message.turnId
+      ? props.provisionalCostByTurn.has(message.turnId)
+      : false;
+    const reportedTurnCostLabel = reportedTurnCostProvisional
+      ? "Reported so far"
+      : "Reported turn cost";
 
     if (isUser) {
       const referenceIds = new Set(
@@ -1762,10 +1771,10 @@ function renderFeedEntry(
             </Text>
             {reportedTurnCost !== undefined ? (
               <Text
-                accessibilityLabel={`Reported turn cost: ${formatReportedCost(reportedTurnCost)}`}
+                accessibilityLabel={`${reportedTurnCostLabel}: ${formatReportedCost(reportedTurnCost)}`}
                 className="font-t3-medium text-xs tabular-nums text-foreground-secondary"
               >
-                · Reported turn cost: {formatReportedCost(reportedTurnCost)}
+                · {reportedTurnCostLabel}: {formatReportedCost(reportedTurnCost)}
               </Text>
             ) : null}
           </View>
@@ -2779,6 +2788,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
           {renderFeedEntry(info, {
             environmentId: props.environmentId,
             reportedCostByTurn: props.reportedCostByTurn,
+            provisionalCostByTurn: props.provisionalCostByTurn,
             dispatchingMessageId: props.dispatchingMessageId,
             onEditPendingMessage: props.onEditPendingMessage,
             copiedRowId,
@@ -2854,6 +2864,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       onToggleWorkRow,
       props.environmentId,
       props.reportedCostByTurn,
+      props.provisionalCostByTurn,
       props.onUseArtifactTemplate,
       props.skills,
       renderMarkdownImage,
@@ -3003,7 +3014,11 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
                 {props.reportedThreadCostUsd !== null ? (
                   <View className="items-center py-3">
                     <Text className="font-t3-medium text-xs tabular-nums text-foreground-secondary">
-                      {formatReportedCost(props.reportedThreadCostUsd)}
+                      {`${
+                        props.latestTurn?.state === "running" || props.reportedThreadCostProvisional
+                          ? "Reported so far"
+                          : "Reported cost"
+                      }: ${formatReportedCost(props.reportedThreadCostUsd)}`}
                     </Text>
                   </View>
                 ) : null}

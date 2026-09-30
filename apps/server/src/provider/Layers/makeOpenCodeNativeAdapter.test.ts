@@ -604,6 +604,7 @@ it.effect(
           "item.started",
           "item.updated",
           "item.completed",
+          "turn.cost.updated",
           "thread.token-usage.updated",
           "turn.completed",
         ],
@@ -644,6 +645,825 @@ it.effect(
       yield* adapter.stopSession(threadId);
       assert.deepStrictEqual(fake.calls, ["start:/tmp/native-v2", "send:hello", "stop"]);
     }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "reports main and nested child step costs during a turn and includes them at completion",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+      });
+      const events: ProviderRuntimeEvent[] = [];
+      const firstCost = yield* Deferred.make<void>();
+      const done = yield* Deferred.make<void>();
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "turn.cost.updated")
+            yield* Deferred.succeed(firstCost, undefined).pipe(Effect.ignore);
+          if (event.type === "turn.completed")
+            yield* Deferred.succeed(done, undefined).pipe(Effect.ignore);
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession({
+        ...start,
+        modelSelection: { instanceId: ProviderInstanceId.make("opencode"), model: "openai/gpt" },
+      });
+      const turn = yield* adapter.sendTurn({ threadId, input: "launch nested work" });
+      fake.emit({ type: "turn.started", turnID: turn.turnId });
+      const step = (sessionID: string, assistantMessageID: string, cost: number) => ({
+        type: "step.completed" as const,
+        sessionID,
+        turnID: turn.turnId,
+        step: {
+          sessionID,
+          assistantMessageID,
+          finish: "stop" as const,
+          cost,
+          tokens: { input: 2, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+        },
+      });
+      fake.emit(step("ses_native", "msg_main", 0.125));
+      yield* Deferred.await(firstCost);
+      assert.deepStrictEqual(
+        events.filter((event) => event.type === "turn.cost.updated").map((event) => event.payload),
+        [{ totalCostUsd: 0.125, costSessionId: "ses_native", costModel: "openai/gpt" }],
+      );
+      const child = { sessionID: "ses_child", parentSessionID: "ses_native", turnID: turn.turnId };
+      const nested = { sessionID: "ses_nested", parentSessionID: "ses_child", turnID: turn.turnId };
+      fake.emit({ type: "child.attached", ...child, info: {} });
+      fake.emit({ type: "child.attached", ...nested, info: {} });
+      fake.emit(step("ses_child", "msg_child", 0.25));
+      fake.emit(step("ses_child", "msg_child", 0.25));
+      fake.emit(step("ses_child", "msg_child", 0.375));
+      fake.emit(step("ses_nested", "msg_nested", 0.5));
+      fake.emit({ type: "child.completed", ...nested });
+      fake.emit({ type: "child.completed", ...child });
+      fake.emit({ type: "turn.completed", turnID: turn.turnId });
+      yield* Deferred.await(done);
+      yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
+      assert.deepStrictEqual(
+        events
+          .filter((event) => event.type === "turn.cost.updated")
+          .map((event) => event.payload.totalCostUsd),
+        [0.125, 0.375, 0.5, 1],
+      );
+      const terminal = events.find((event) => event.type === "turn.completed");
+      assert.equal(terminal?.type === "turn.completed" && terminal.payload.totalCostUsd, 1);
+      assert.equal(
+        terminal?.type === "turn.completed" && terminal.payload.tokenUsage?.usageScope,
+        "main_agent",
+      );
+      assert.equal(
+        terminal?.type === "turn.completed" && terminal.payload.tokenUsage?.inputTokens,
+        2,
+      );
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("finalizes child-only cost when the child finishes after the parent turn", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const events: ProviderRuntimeEvent[] = [];
+    const finished = yield* Deferred.make<void>();
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.gen(function* () {
+        events.push(event);
+        if (event.type === "turn.cost.updated" && event.payload.status === "final")
+          yield* Deferred.succeed(finished, undefined).pipe(Effect.ignore);
+      }),
+    ).pipe(Effect.forkChild);
+    yield* adapter.startSession({
+      ...start,
+      modelSelection: { instanceId: ProviderInstanceId.make("opencode"), model: "openai/gpt" },
+    });
+    const turn = yield* adapter.sendTurn({ threadId, input: "delegate the whole turn" });
+    fake.emit({ type: "turn.started", turnID: turn.turnId });
+    const child = { sessionID: "ses_child", parentSessionID: "ses_native", turnID: turn.turnId };
+    fake.emit({ type: "child.attached", ...child, info: {} });
+    fake.emit({ type: "turn.completed", turnID: turn.turnId });
+    fake.emit({
+      type: "step.completed",
+      sessionID: child.sessionID,
+      turnID: turn.turnId,
+      step: {
+        sessionID: child.sessionID,
+        assistantMessageID: "child-step",
+        finish: "stop",
+        cost: 0.25,
+        tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    });
+    fake.emit({ type: "child.completed", ...child });
+    yield* Deferred.await(finished);
+    yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
+    const terminal = events.find((event) => event.type === "turn.completed");
+    assert.equal(terminal?.type === "turn.completed" && terminal.payload.totalCostUsd, undefined);
+    assert.deepStrictEqual(
+      events.filter((event) => event.type === "turn.cost.updated").map((event) => event.payload),
+      [
+        { totalCostUsd: 0.25, costSessionId: "ses_native", costModel: "openai/gpt" },
+        {
+          totalCostUsd: 0.25,
+          status: "final",
+          costSessionId: "ses_native",
+          costModel: "openai/gpt",
+        },
+      ],
+    );
+    const finalCost = events.findIndex(
+      (event) => event.type === "turn.cost.updated" && event.payload.status === "final",
+    );
+    const parentCompletion = events.findIndex((event) => event.type === "turn.completed");
+    assert.ok(parentCompletion >= 0 && finalCost > parentCompletion);
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("does not finalize child cost when a parent step is unresolved or invalid", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const events: ProviderRuntimeEvent[] = [];
+    const barrier = yield* Deferred.make<void>();
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.gen(function* () {
+        events.push(event);
+        if (event.type === "turn.completed" && event.turnId === "msg_user_3")
+          yield* Deferred.succeed(barrier, undefined).pipe(Effect.ignore);
+      }),
+    ).pipe(Effect.forkChild);
+    yield* adapter.startSession(start);
+    const tokens = { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } };
+    for (const incomplete of ["unresolved", "invalid"] as const) {
+      const turn = yield* adapter.sendTurn({ threadId, input: incomplete });
+      fake.emit({ type: "turn.started", turnID: turn.turnId });
+      const child = {
+        sessionID: `ses_${incomplete}`,
+        parentSessionID: "ses_native",
+        turnID: turn.turnId,
+      };
+      fake.emit({ type: "child.attached", ...child, info: {} });
+      if (incomplete === "unresolved") {
+        fake.emit({
+          type: "step.failed",
+          sessionID: "ses_native",
+          turnID: turn.turnId,
+          step: {
+            sessionID: "ses_native",
+            assistantMessageID: "main-step",
+            error: { type: "step.error", message: "No cost" },
+          },
+        });
+      } else {
+        fake.emit({
+          type: "step.completed",
+          sessionID: "ses_native",
+          turnID: turn.turnId,
+          step: {
+            sessionID: "ses_native",
+            assistantMessageID: "main-step",
+            finish: "stop",
+            cost: -1,
+            tokens,
+          },
+        });
+      }
+      fake.emit({ type: "turn.completed", turnID: turn.turnId });
+      fake.emit({
+        type: "step.completed",
+        sessionID: child.sessionID,
+        turnID: turn.turnId,
+        step: {
+          sessionID: child.sessionID,
+          assistantMessageID: "child-step",
+          finish: "stop",
+          cost: 0.25,
+          tokens,
+        },
+      });
+      fake.emit({ type: "child.completed", ...child });
+    }
+    const next = yield* adapter.sendTurn({ threadId, input: "barrier" });
+    fake.emit({ type: "turn.started", turnID: next.turnId });
+    fake.emit({ type: "turn.completed", turnID: next.turnId });
+    yield* Deferred.await(barrier);
+    yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
+    assert.deepStrictEqual(
+      events.filter((event) => event.type === "turn.cost.updated").map((event) => event.payload),
+      [
+        { totalCostUsd: 0.25, costSessionId: "ses_native" },
+        { totalCostUsd: 0.25, costSessionId: "ses_native" },
+      ],
+    );
+    assert.deepStrictEqual(
+      events
+        .filter((event) => event.type === "turn.completed")
+        .map((event) => event.payload.totalCostUsd),
+      [undefined, undefined, undefined],
+    );
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "finalizes an old turn only after every background child settles, without charging the next turn",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+      });
+      const events: ProviderRuntimeEvent[] = [];
+      const finished = yield* Deferred.make<void>();
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "turn.cost.updated" && event.payload.status === "final")
+            yield* Deferred.succeed(finished, undefined).pipe(Effect.ignore);
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession({
+        ...start,
+        modelSelection: { instanceId: ProviderInstanceId.make("opencode"), model: "openai/old" },
+      });
+      const first = yield* adapter.sendTurn({ threadId, input: "launch background work" });
+      fake.emit({ type: "turn.started", turnID: first.turnId });
+      const step = (sessionID: string, turnID: string, id: string, cost: number) => ({
+        type: "step.completed" as const,
+        sessionID,
+        turnID,
+        step: {
+          sessionID,
+          assistantMessageID: id,
+          finish: "stop" as const,
+          cost,
+          tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+        },
+      });
+      fake.emit(step("ses_native", first.turnId, "main-old", 0.1));
+      const child = { sessionID: "ses_child", parentSessionID: "ses_native", turnID: first.turnId };
+      const nested = {
+        sessionID: "ses_nested",
+        parentSessionID: "ses_child",
+        turnID: first.turnId,
+      };
+      fake.emit({ type: "child.attached", ...child, info: {} });
+      fake.emit({ type: "child.attached", ...nested, info: {} });
+      fake.emit({ type: "turn.completed", turnID: first.turnId });
+      const second = yield* adapter.sendTurn({ threadId, input: "new turn" });
+      fake.emit({ type: "turn.started", turnID: second.turnId });
+      fake.emit(step("ses_native", second.turnId, "main-new", 0.2));
+      fake.emit(step("ses_child", first.turnId, "child-old", 0.3));
+      fake.emit(step("ses_child", first.turnId, "child-old", 0.3));
+      fake.emit({ type: "child.completed", ...child });
+      fake.emit(step("ses_nested", first.turnId, "nested-old", 0.4));
+      fake.emit({ type: "turn.completed", turnID: second.turnId });
+      fake.emit({ type: "child.completed", ...nested });
+      yield* Deferred.await(finished);
+      yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
+      const oldUpdates = events.filter(
+        (event) => event.type === "turn.cost.updated" && event.turnId === first.turnId,
+      );
+      assert.deepStrictEqual(
+        oldUpdates.map((event) => event.payload),
+        [
+          { totalCostUsd: 0.1, costSessionId: "ses_native", costModel: "openai/old" },
+          { totalCostUsd: 0.4, costSessionId: "ses_native", costModel: "openai/old" },
+          {
+            totalCostUsd: 0.8,
+            costSessionId: "ses_native",
+            costModel: "openai/old",
+          },
+          {
+            totalCostUsd: 0.8,
+            status: "final",
+            costSessionId: "ses_native",
+            costModel: "openai/old",
+          },
+        ],
+      );
+      const terminals = events.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+          event.type === "turn.completed",
+      );
+      assert.deepStrictEqual(
+        terminals.map((event) => event.payload.totalCostUsd),
+        [undefined, 0.2],
+      );
+      assert.deepStrictEqual(
+        events
+          .filter(
+            (event): event is Extract<ProviderRuntimeEvent, { type: "turn.cost.updated" }> =>
+              event.type === "turn.cost.updated" && event.turnId === second.turnId,
+          )
+          .map((event) => event.payload.totalCostUsd),
+        [0.2],
+      );
+      fake.emit(step("ses_nested", first.turnId, "late-duplicate", 9));
+      assert.equal(events.filter((event) => event.type === "turn.cost.updated").length, 5);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "keeps late child cost provisional when a background child has incomplete accounting",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+      });
+      const events: ProviderRuntimeEvent[] = [];
+      const barrier = yield* Deferred.make<void>();
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "turn.completed" && event.turnId === "msg_user_2")
+            yield* Deferred.succeed(barrier, undefined).pipe(Effect.ignore);
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession(start);
+      const first = yield* adapter.sendTurn({ threadId, input: "background" });
+      fake.emit({ type: "turn.started", turnID: first.turnId });
+      const tokens = { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } };
+      fake.emit({
+        type: "step.completed",
+        sessionID: "ses_native",
+        turnID: first.turnId,
+        step: {
+          sessionID: "ses_native",
+          assistantMessageID: "main-step",
+          finish: "stop",
+          cost: 0.1,
+          tokens,
+        },
+      });
+      const child = { sessionID: "ses_child", parentSessionID: "ses_native", turnID: first.turnId };
+      fake.emit({ type: "child.attached", ...child, info: {} });
+      fake.emit({ type: "turn.completed", turnID: first.turnId });
+      fake.emit({
+        type: "step.completed",
+        sessionID: child.sessionID,
+        turnID: first.turnId,
+        step: {
+          sessionID: child.sessionID,
+          assistantMessageID: "child-step",
+          finish: "stop",
+          cost: 0.25,
+          tokens,
+        },
+      });
+      fake.emit({
+        type: "step.failed",
+        sessionID: child.sessionID,
+        turnID: first.turnId,
+        step: {
+          sessionID: child.sessionID,
+          assistantMessageID: "unpriced-child-step",
+          error: { type: "step.error", message: "No cost" },
+        },
+      });
+      fake.emit({ type: "child.completed", ...child });
+      const second = yield* adapter.sendTurn({ threadId, input: "barrier" });
+      fake.emit({ type: "turn.started", turnID: second.turnId });
+      fake.emit({ type: "turn.completed", turnID: second.turnId });
+      yield* Deferred.await(barrier);
+      yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
+      assert.deepStrictEqual(
+        events
+          .filter((event) => event.type === "turn.cost.updated" && event.turnId === first.turnId)
+          .map((event) => event.payload),
+        [
+          { totalCostUsd: 0.1, costSessionId: "ses_native" },
+          { totalCostUsd: 0.35, costSessionId: "ses_native" },
+        ],
+      );
+      assert.deepStrictEqual(
+        events
+          .filter((event) => event.type === "turn.completed")
+          .map((event) => event.payload.totalCostUsd),
+        [undefined, undefined],
+      );
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("charges a priced failed parent attempt once alongside its retry", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const events: ProviderRuntimeEvent[] = [];
+    const done = yield* Deferred.make<void>();
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.gen(function* () {
+        events.push(event);
+        if (event.type === "turn.completed")
+          yield* Deferred.succeed(done, undefined).pipe(Effect.ignore);
+      }),
+    ).pipe(Effect.forkChild);
+    yield* adapter.startSession(start);
+    const turn = yield* adapter.sendTurn({ threadId, input: "retry" });
+    fake.emit({ type: "turn.started", turnID: turn.turnId });
+    const failed = (cost: number) => ({
+      type: "step.failed" as const,
+      sessionID: "ses_native",
+      turnID: turn.turnId,
+      step: {
+        sessionID: "ses_native",
+        assistantMessageID: "msg_attempt",
+        error: { type: "provider.rate-limit", message: "Retry" },
+        cost,
+      },
+    });
+    fake.emit(failed(0.2));
+    fake.emit(failed(0.2));
+    fake.emit(failed(0.3));
+    fake.emit({
+      type: "step.completed",
+      sessionID: "ses_native",
+      turnID: turn.turnId,
+      step: {
+        sessionID: "ses_native",
+        assistantMessageID: "msg_retry",
+        finish: "stop",
+        cost: 0.4,
+        tokens: { input: 2, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    });
+    fake.emit(failed(0.3));
+    fake.emit({ type: "turn.completed", turnID: turn.turnId });
+    yield* Deferred.await(done);
+    yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
+    assert.deepStrictEqual(
+      events
+        .filter((event) => event.type === "turn.cost.updated")
+        .map((event) => event.payload.totalCostUsd),
+      [0.2, 0.3, 0.7],
+    );
+    const terminal = events.find((event) => event.type === "turn.completed");
+    assert.equal(terminal?.type === "turn.completed" && terminal.payload.totalCostUsd, 0.7);
+    assert.equal(
+      terminal?.type === "turn.completed" && terminal.payload.tokenUsage?.usageStatus,
+      "partial",
+    );
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "finalizes a priced failed child step without charging duplicates or a later completion",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+      });
+      const events: ProviderRuntimeEvent[] = [];
+      const done = yield* Deferred.make<void>();
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "turn.cost.updated" && event.payload.status === "final")
+            yield* Deferred.succeed(done, undefined).pipe(Effect.ignore);
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession(start);
+      const turn = yield* adapter.sendTurn({ threadId, input: "child retry" });
+      fake.emit({ type: "turn.started", turnID: turn.turnId });
+      const child = { sessionID: "ses_child", parentSessionID: "ses_native", turnID: turn.turnId };
+      fake.emit({ type: "child.attached", ...child, info: {} });
+      fake.emit({ type: "turn.completed", turnID: turn.turnId });
+      const failed = (cost: number) => ({
+        type: "step.failed" as const,
+        sessionID: child.sessionID,
+        turnID: turn.turnId,
+        step: {
+          sessionID: child.sessionID,
+          assistantMessageID: "child-attempt",
+          error: { type: "step.error", message: "Retry" },
+          cost,
+        },
+      });
+      fake.emit(failed(0.1));
+      fake.emit(failed(0.1));
+      fake.emit(failed(0.25));
+      fake.emit({
+        type: "step.completed",
+        sessionID: child.sessionID,
+        turnID: turn.turnId,
+        step: {
+          sessionID: child.sessionID,
+          assistantMessageID: "child-retry",
+          finish: "stop",
+          cost: 0.5,
+          tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+        },
+      });
+      fake.emit({ type: "child.completed", ...child });
+      yield* Deferred.await(done);
+      yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
+      assert.deepStrictEqual(
+        events
+          .filter((event) => event.type === "turn.cost.updated")
+          .map((event) => [event.payload.totalCostUsd, event.payload.status]),
+        [
+          [0.1, undefined],
+          [0.25, undefined],
+          [0.75, undefined],
+          [0.75, "final"],
+        ],
+      );
+      assert.equal(
+        events.find((event) => event.type === "turn.completed")?.payload.totalCostUsd,
+        undefined,
+      );
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "replaces a failed attempt when its completed cost arrives and rejects unpriced corrections",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+      });
+      const events: ProviderRuntimeEvent[] = [];
+      const done = yield* Deferred.make<void>();
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "turn.completed")
+            yield* Deferred.succeed(done, undefined).pipe(Effect.ignore);
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession(start);
+      const turn = yield* adapter.sendTurn({ threadId, input: "corrected failure" });
+      fake.emit({ type: "turn.started", turnID: turn.turnId });
+      const tokens = { input: 2, output: 1, reasoning: 0, cache: { read: 0, write: 0 } };
+      const failed = (id: string, cost?: number) => ({
+        type: "step.failed" as const,
+        sessionID: "ses_native",
+        turnID: turn.turnId,
+        step: {
+          sessionID: "ses_native",
+          assistantMessageID: id,
+          error: { type: "step.error", message: "Try again" },
+          ...(cost === undefined ? {} : { cost }),
+          tokens,
+        },
+      });
+      fake.emit(failed("corrected", 0.3));
+      fake.emit({
+        type: "step.completed",
+        sessionID: "ses_native",
+        turnID: turn.turnId,
+        step: {
+          sessionID: "ses_native",
+          assistantMessageID: "corrected",
+          finish: "stop",
+          cost: 0.4,
+          tokens,
+        },
+      });
+      fake.emit(failed("corrected", 0.3));
+      fake.emit(failed("unpriced", 0.25));
+      fake.emit(failed("unpriced", -1));
+      fake.emit(failed("missing"));
+      fake.emit({ type: "turn.completed", turnID: turn.turnId });
+      yield* Deferred.await(done);
+      yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
+      assert.deepStrictEqual(
+        events
+          .filter((event) => event.type === "turn.cost.updated")
+          .map((event) => event.payload.totalCostUsd),
+        [0.3, 0.4, 0.65, 0.4],
+      );
+      const terminal = events.find((event) => event.type === "turn.completed");
+      assert.equal(terminal?.type === "turn.completed" && terminal.payload.totalCostUsd, undefined);
+      assert.equal(
+        terminal?.type === "turn.completed" && terminal.payload.tokenUsage?.inputTokens,
+        2,
+      );
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("deduplicates corrected costs and excludes steps from older turns", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const events: ProviderRuntimeEvent[] = [];
+    const done = yield* Deferred.make<void>();
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.gen(function* () {
+        events.push(event);
+        if (event.type === "turn.completed" && event.turnId === "msg_user_2")
+          yield* Deferred.succeed(done, undefined).pipe(Effect.ignore);
+      }),
+    ).pipe(Effect.forkChild);
+    yield* adapter.startSession(start);
+    const first = yield* adapter.sendTurn({ threadId, input: "old" });
+    fake.emit({ type: "turn.started", turnID: first.turnId });
+    const step = (turnID: string, cost: number) => ({
+      type: "step.completed" as const,
+      sessionID: "ses_native",
+      turnID,
+      step: {
+        sessionID: "ses_native",
+        assistantMessageID: "msg_step",
+        finish: "stop" as const,
+        cost,
+        tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    });
+    fake.emit(step(first.turnId, 0.9));
+    fake.emit({ type: "turn.completed", turnID: first.turnId });
+    const second = yield* adapter.sendTurn({ threadId, input: "new" });
+    fake.emit({ type: "turn.started", turnID: second.turnId });
+    fake.emit(step(first.turnId, 0.9));
+    fake.emit(step(second.turnId, 0.2));
+    fake.emit(step(second.turnId, 0.2));
+    fake.emit(step(second.turnId, 0.4));
+    fake.emit({ type: "turn.completed", turnID: second.turnId });
+    yield* Deferred.await(done);
+    assert.deepStrictEqual(
+      events
+        .filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "turn.cost.updated" }> =>
+            event.type === "turn.cost.updated" && event.turnId === second.turnId,
+        )
+        .map((event) => event.payload.totalCostUsd),
+      [0.2, 0.4],
+    );
+    const terminal = events.find(
+      (event) => event.type === "turn.completed" && event.turnId === second.turnId,
+    );
+    assert.equal(terminal?.type === "turn.completed" && terminal.payload.totalCostUsd, 0.4);
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("omits terminal cost when a step is unresolved or a child is still running", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const events: ProviderRuntimeEvent[] = [];
+    const done = yield* Deferred.make<void>();
+    let completed = 0;
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.gen(function* () {
+        events.push(event);
+        if (event.type === "turn.completed" && ++completed === 6)
+          yield* Deferred.succeed(done, undefined).pipe(Effect.ignore);
+      }),
+    ).pipe(Effect.forkChild);
+    yield* adapter.startSession(start);
+    const first = yield* adapter.sendTurn({ threadId, input: "no accounting" });
+    fake.emit({ type: "turn.started", turnID: first.turnId });
+    fake.emit({ type: "turn.completed", turnID: first.turnId });
+    const second = yield* adapter.sendTurn({ threadId, input: "partial accounting" });
+    fake.emit({ type: "turn.started", turnID: second.turnId });
+    const tokens = { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } };
+    fake.emit({
+      type: "step.completed",
+      sessionID: "ses_native",
+      turnID: second.turnId,
+      step: {
+        sessionID: "ses_native",
+        assistantMessageID: "msg_good",
+        finish: "stop",
+        cost: 0.2,
+        tokens,
+      },
+    });
+    fake.emit({
+      type: "step.failed",
+      sessionID: "ses_native",
+      turnID: second.turnId,
+      step: {
+        sessionID: "ses_native",
+        assistantMessageID: "msg_missing",
+        error: { type: "step.error", message: "No cost" },
+      },
+    });
+    fake.emit({ type: "turn.completed", turnID: second.turnId });
+    const third = yield* adapter.sendTurn({ threadId, input: "background child" });
+    fake.emit({ type: "turn.started", turnID: third.turnId });
+    fake.emit({
+      type: "step.completed",
+      sessionID: "ses_native",
+      turnID: third.turnId,
+      step: {
+        sessionID: "ses_native",
+        assistantMessageID: "msg_other",
+        finish: "stop",
+        cost: 0.3,
+        tokens,
+      },
+    });
+    fake.emit({
+      type: "child.attached",
+      sessionID: "ses_running",
+      parentSessionID: "ses_native",
+      turnID: third.turnId,
+      info: {},
+    });
+    fake.emit({ type: "turn.completed", turnID: third.turnId });
+    const fourth = yield* adapter.sendTurn({ threadId, input: "unpriced child" });
+    fake.emit({ type: "turn.started", turnID: fourth.turnId });
+    fake.emit({
+      type: "step.completed",
+      sessionID: "ses_native",
+      turnID: fourth.turnId,
+      step: {
+        sessionID: "ses_native",
+        assistantMessageID: "msg_fourth",
+        finish: "stop",
+        cost: 0.4,
+        tokens,
+      },
+    });
+    const unpriced = {
+      sessionID: "ses_unpriced",
+      parentSessionID: "ses_native",
+      turnID: fourth.turnId,
+    };
+    fake.emit({ type: "child.attached", ...unpriced, info: {} });
+    fake.emit({ type: "child.completed", ...unpriced });
+    fake.emit({ type: "turn.completed", turnID: fourth.turnId });
+    const fifth = yield* adapter.sendTurn({ threadId, input: "invalid accounting" });
+    fake.emit({ type: "turn.started", turnID: fifth.turnId });
+    fake.emit({
+      type: "step.completed",
+      sessionID: "ses_native",
+      turnID: fifth.turnId,
+      step: {
+        sessionID: "ses_native",
+        assistantMessageID: "msg_fifth",
+        finish: "stop",
+        cost: -1,
+        tokens,
+      },
+    });
+    fake.emit({ type: "turn.completed", turnID: fifth.turnId });
+    const sixth = yield* adapter.sendTurn({ threadId, input: "reported free step" });
+    fake.emit({ type: "turn.started", turnID: sixth.turnId });
+    fake.emit({
+      type: "step.completed",
+      sessionID: "ses_native",
+      turnID: sixth.turnId,
+      step: {
+        sessionID: "ses_native",
+        assistantMessageID: "msg_sixth",
+        finish: "stop",
+        cost: 0,
+        tokens,
+      },
+    });
+    fake.emit({ type: "turn.completed", turnID: sixth.turnId });
+    yield* Deferred.await(done);
+    yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
+    assert.deepStrictEqual(
+      events
+        .filter((event) => event.type === "turn.completed")
+        .map((event) => event.payload.totalCostUsd),
+      [undefined, undefined, undefined, undefined, undefined, 0],
+    );
+    assert.deepStrictEqual(
+      events
+        .filter((event) => event.type === "turn.cost.updated")
+        .map((event) => event.payload.totalCostUsd),
+      [0.2, 0.3, 0.4, 0],
+    );
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.provide(testLayer)),
 );
 
 it.effect(

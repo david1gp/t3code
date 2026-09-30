@@ -5,6 +5,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
   type OrchestrationEvent,
   type OrchestrationReadModel,
   type OrchestrationSession,
@@ -797,6 +798,35 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
       });
       const routineEvents = Array.isArray(routineResult) ? routineResult : [routineResult];
       expect(routineEvents.map((event) => event.type)).toEqual(["thread.activity-appended"]);
+    }),
+  );
+
+  it.effect("does not publish a late provisional cost after its final activity", () =>
+    Effect.gen(function* () {
+      const finalActivity = {
+        id: EventId.make("usage-cost:thread-1:turn-1"),
+        tone: "info" as const,
+        kind: "usage.cost" as const,
+        summary: "Provider reported turn cost",
+        payload: { totalCostUsd: 0.3, status: "final" },
+        turnId: TurnId.make("turn-1"),
+        createdAt: NOW,
+      };
+      const result = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.activity.append",
+          commandId: CommandId.make("cmd-late-provisional-cost"),
+          threadId: ThreadId.make("thread-1"),
+          activity: {
+            ...finalActivity,
+            payload: { totalCostUsd: 0.12, status: "provisional" },
+          },
+          createdAt: NOW,
+        },
+        readModel: makeReadModel(null, null, null, [finalActivity]),
+      });
+
+      expect(result).toEqual([]);
     }),
   );
 

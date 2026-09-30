@@ -2910,13 +2910,13 @@ export default function ChatView(props: ChatViewProps) {
   );
   const selectedProvider = selectedProviderEntry?.driverKind ?? requestedDriverKind;
   const reportedThreadCosts = useMemo(
-    () => deriveReportedThreadCosts(activeThread?.activities ?? EMPTY_ACTIVITIES),
-    [activeThread?.activities],
+    () =>
+      deriveReportedThreadCosts(
+        activeThread?.activities ?? EMPTY_ACTIVITIES,
+        activeThread?.reportedCosts,
+      ),
+    [activeThread?.activities, activeThread?.reportedCosts],
   );
-  const reportedThreadCostLabel =
-    reportedThreadCosts.totalUsd === null
-      ? null
-      : formatReportedCostUsd(reportedThreadCosts.totalUsd);
   const activeProviderInstanceId = selectedProviderEntry?.instanceId ?? null;
   const activeProviderStatus = selectedProviderEntry?.snapshot ?? null;
   const { enabled: interactionModeEnabled, interactionMode } = resolveComposerInteractionMode({
@@ -2933,6 +2933,12 @@ export default function ChatView(props: ChatViewProps) {
     conversationProviderStatus !== null &&
     conversationProviderStatus.supportsConversationRollback !== false;
   const phase = derivePhase(activeThread?.session ?? null);
+  const reportedThreadCostLabel =
+    reportedThreadCosts.totalUsd === null
+      ? null
+      : `${phase === "running" || reportedThreadCosts.hasProvisionalCost ? "Reported so far" : "Reported cost"}: ${formatReportedCostUsd(
+          reportedThreadCosts.totalUsd,
+        )}`;
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
   const latestCheckpointCompletedAt = activeThread?.checkpoints.at(-1)?.completedAt ?? null;
   const workspaceMutationId = useMemo(() => {

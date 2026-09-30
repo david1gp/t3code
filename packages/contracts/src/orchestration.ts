@@ -670,6 +670,13 @@ export const OrchestrationThreadActivity = Schema.Struct({
 });
 export type OrchestrationThreadActivity = typeof OrchestrationThreadActivity.Type;
 
+export const OrchestrationThreadReportedCost = Schema.Struct({
+  turnId: TurnId,
+  totalCostUsd: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+  status: Schema.Literals(["provisional", "final"]),
+});
+export type OrchestrationThreadReportedCost = typeof OrchestrationThreadReportedCost.Type;
+
 const OrchestrationLatestTurnState = Schema.Literals([
   "running",
   "interrupted",
@@ -847,6 +854,8 @@ export const OrchestrationThread = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
   activities: Schema.Array(OrchestrationThreadActivity),
+  // Optional for compatibility with snapshots from older servers.
+  reportedCosts: Schema.optional(Schema.Array(OrchestrationThreadReportedCost)),
   checkpoints: Schema.Array(OrchestrationCheckpointSummary),
   session: Schema.NullOr(OrchestrationSession),
 });

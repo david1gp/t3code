@@ -3005,13 +3005,36 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
           '2026-03-01T00:04:00.000Z'
         FROM activity_rows
       `;
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        ) VALUES
+          ('usage-cost:thread-w:legacy-turn', 'thread-w', 'turn-legacy', 'info', 'usage.cost',
+            'Provider reported turn cost', '{"totalCostUsd":0.4}', 1,
+            '2026-03-01T00:00:00.000Z'),
+          ('usage-cost:thread-w:final-turn', 'thread-w', 'turn-final', 'info', 'usage.cost',
+            'Provider reported turn cost', '{"totalCostUsd":0.1,"status":"final"}', 2,
+            '2026-03-01T00:00:00.000Z'),
+          ('usage-cost:thread-w:invalid-status', 'thread-w', 'turn-invalid-status', 'info', 'usage.cost',
+            'Provider reported turn cost', '{"totalCostUsd":0.9,"status":"settled"}', 3,
+            '2026-03-01T00:00:00.000Z'),
+          ('usage-cost:thread-w:turn-1', 'thread-w', 'turn-1', 'info', 'usage.cost',
+            'Provider reported turn cost', '{"totalCostUsd":0.25,"status":"provisional"}', 502,
+            '2026-03-01T00:00:00.000Z'),
+          ('usage-cost:thread-w:turn-5', 'thread-w', 'turn-5', 'info', 'usage.cost',
+            'Provider reported turn cost', '{"totalCostUsd":-1,"status":"final"}', 503,
+            '2026-03-01T00:04:00.000Z')
+      `;
 
       const fullDetail = yield* snapshotQuery.getThreadDetailById(threadW);
       assert.equal(fullDetail._tag, "Some");
       if (fullDetail._tag === "Some") {
         assert.equal(fullDetail.value.activities.length, 500);
-        assert.equal(fullDetail.value.activities[0]?.id, asEventId("activity-0002"));
-        assert.equal(fullDetail.value.activities.at(-1)?.id, asEventId("activity-0501"));
+        assert.equal(fullDetail.value.activities[0]?.id, asEventId("activity-0004"));
+        assert.equal(
+          fullDetail.value.activities.at(-1)?.id,
+          asEventId("usage-cost:thread-w:turn-5"),
+        );
       }
 
       const windowedDetail = yield* snapshotQuery.getThreadDetailSnapshot(threadW, {
@@ -3020,8 +3043,35 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
       assert.equal(windowedDetail._tag, "Some");
       if (windowedDetail._tag === "Some") {
         assert.equal(windowedDetail.value.thread.activities.length, 500);
-        assert.equal(windowedDetail.value.thread.activities[0]?.id, asEventId("activity-0002"));
-        assert.equal(windowedDetail.value.thread.activities.at(-1)?.id, asEventId("activity-0501"));
+        assert.deepEqual(windowedDetail.value.thread.reportedCosts, [
+          { turnId: asTurnId("turn-legacy"), totalCostUsd: 0.4, status: "final" },
+          { turnId: asTurnId("turn-final"), totalCostUsd: 0.1, status: "final" },
+          { turnId: asTurnId("turn-1"), totalCostUsd: 0.25, status: "provisional" },
+        ]);
+        assert.equal(
+          windowedDetail.value.thread.reportedCosts.reduce(
+            (total, cost) => total + cost.totalCostUsd,
+            0,
+          ),
+          0.75,
+        );
+      }
+
+      // Projector upserts corrections under the same activity id. The detail
+      // summary reflects the current row and does not retain cost history.
+      yield* sql`
+        UPDATE projection_thread_activities
+        SET payload_json = '{"totalCostUsd":0.5,"status":"final"}'
+        WHERE activity_id = 'usage-cost:thread-w:turn-1'
+      `;
+      const corrected = yield* snapshotQuery.getThreadDetailSnapshot(threadW);
+      assert.equal(corrected._tag, "Some");
+      if (corrected._tag === "Some") {
+        assert.deepEqual(corrected.value.thread.reportedCosts, [
+          { turnId: asTurnId("turn-legacy"), totalCostUsd: 0.4, status: "final" },
+          { turnId: asTurnId("turn-final"), totalCostUsd: 0.1, status: "final" },
+          { turnId: asTurnId("turn-1"), totalCostUsd: 0.5, status: "final" },
+        ]);
       }
 
       yield* sql`
@@ -3113,7 +3163,10 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
         const projectedFullSnapshot = projectThreadDetailSnapshot(fullSnapshot.value);
         const projectedRawBaseline = projectThreadDetailSnapshot({
           snapshotSequence: fullSnapshot.value.snapshotSequence,
-          thread: detailWithPinnedRequests.value,
+          thread: {
+            ...detailWithPinnedRequests.value,
+            reportedCosts: fullSnapshot.value.thread.reportedCosts,
+          },
         });
         assert.deepStrictEqual(projectedFullSnapshot, projectedRawBaseline);
 
