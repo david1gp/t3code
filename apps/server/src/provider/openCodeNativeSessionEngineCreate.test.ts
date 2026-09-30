@@ -123,6 +123,7 @@ const sessionFixture = async (
   let prompts = 0;
   const promptBodies: Record<string, unknown>[] = [];
   const inventoryRequests: string[] = [];
+  let rejectedInventory: "command" | "skill" | undefined;
   const commandBodies: Array<{ path: string; body: Record<string, unknown> }> = [];
   let heldCommand: NodeHttp.ServerResponse | undefined;
   let commandRequested: (() => void) | undefined;
@@ -181,6 +182,10 @@ const sessionFixture = async (
     const url = new URL(req.url!, "http://fixture");
     if (url.pathname === "/api/command" || url.pathname === "/api/skill") {
       inventoryRequests.push(req.url!);
+      if (url.pathname === `/api/${rejectedInventory}`) {
+        res.writeHead(503).end();
+        return;
+      }
       send(res, {
         location: { directory },
         data:
@@ -292,6 +297,9 @@ const sessionFixture = async (
     promptCount: () => prompts,
     promptBodies,
     inventoryRequests,
+    setInventoryFailure: (endpoint?: "command" | "skill") => {
+      rejectedInventory = endpoint;
+    },
     commandBodies,
     holdNextCommand: () => {
       const requested = new Promise<void>((resolve) => {
@@ -527,6 +535,55 @@ const commandTurnExpect = (test: Awaited<ReturnType<typeof sessionFixture>>, tur
 };
 
 describe("native command and skill HTTP admission", () => {
+  it.each([
+    { inventory: "command", text: "/review rejected" },
+    { inventory: "skill", text: "$review rejected" },
+  ] as const)(
+    "rejects send-time $inventory discovery HTTP failure without invoking a turn and permits a later ordinary prompt",
+    async ({ inventory, text }) => {
+      const test = await sessionFixture();
+      try {
+        const inventoryRequestStart = test.inventoryRequests.length;
+        test.setInventoryFailure(inventory);
+        expect(await test.engine.send(text)).toMatchObject({
+          success: false,
+          rejected: true,
+          error: { operation: "session.prompt", detail: expect.stringContaining("503") },
+        });
+        expect(
+          test.inventoryRequests
+            .slice(inventoryRequestStart)
+            .map((request) => new URL(request, "http://fixture").pathname),
+        ).toContain(`/api/${inventory}`);
+        expect(test.commandBodies).toEqual([]);
+        expect(test.promptCount()).toBe(0);
+        expect(test.promptBodies).toEqual([]);
+        expect(test.events.map((event) => event.type)).toEqual(["session.ready"]);
+
+        test.setInventoryFailure();
+        const next = await test.engine.send("ordinary after inventory failure");
+        expect(next.success).toBe(true);
+        if (!next.success) throw new Error("Ordinary admission after inventory failure failed");
+        expect(test.promptCount()).toBe(1);
+        expect(test.promptBodies).toEqual([
+          { id: next.data.turnID, text: "ordinary after inventory failure" },
+        ]);
+        expect(test.commandBodies).toEqual([]);
+        test.write("session.execution.started", {}, undefined, 101);
+        test.write("session.execution.succeeded", {}, undefined, 102);
+        await test.wait(
+          (event) => event.type === "turn.completed" && event.turnID === next.data.turnID,
+        );
+        expect(test.events.filter((event) => event.type.startsWith("turn."))).toEqual([
+          { type: "turn.started", turnID: next.data.turnID },
+          { type: "turn.completed", turnID: next.data.turnID },
+        ]);
+      } finally {
+        await test.close();
+      }
+    },
+  );
+
   it("dispatches registry commands with native name/args and correlates the complete turn when events precede the 204", async () => {
     const receipts = commandTransportReceipts();
     const test = await sessionFixture(receipts.fetch);
