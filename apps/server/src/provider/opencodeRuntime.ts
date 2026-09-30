@@ -203,8 +203,19 @@ export type OpenCodeSlashCommand = Pick<Command, "name" | "description" | "sourc
 /** Command templates stay in OpenCode, which expands arguments and runs MCP prompts. */
 export const loadOpenCodeCommands = (client: OpencodeClient) =>
   runOpenCodeSdk("command.list", (signal) => client.command.list(undefined, { signal })).pipe(
-    Effect.map((result): ReadonlyArray<OpenCodeSlashCommand> =>
-      (result.data ?? []).map(({ name, description, source, hints }) => ({
+    Effect.flatMap((result) =>
+      result.error
+        ? Effect.fail(
+            new OpenCodeRuntimeError({
+              operation: "command.list",
+              detail: "Command discovery failed.",
+              cause: result.error,
+            }),
+          )
+        : Effect.succeed(result.data ?? []),
+    ),
+    Effect.map((commands): ReadonlyArray<OpenCodeSlashCommand> =>
+      commands.map(({ name, description, source, hints }) => ({
         name,
         ...(description === undefined ? {} : { description }),
         ...(source === undefined ? {} : { source }),
@@ -948,12 +959,7 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
 
   const loadOpenCodeInventory: OpenCodeRuntimeShape["loadOpenCodeInventory"] = (client) =>
     Effect.all(
-      [
-        loadProviders(client),
-        loadAgents(client),
-        loadSkills(client),
-        loadOpenCodeCommands(client).pipe(Effect.orElseSucceed(() => [])),
-      ],
+      [loadProviders(client), loadAgents(client), loadSkills(client), loadOpenCodeCommands(client)],
       {
         concurrency: "unbounded",
       },

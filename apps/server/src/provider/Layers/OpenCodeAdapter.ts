@@ -4251,12 +4251,63 @@ export function makeOpenCodeAdapter(
 
       const text = input.input?.trim();
       const commandMatch = text?.match(/^\/([^\s/]+)(?:\s+([\s\S]*))?$/);
-      const nativeCommand = commandMatch
+      const skillMatch = text?.match(/^\$([^\s/$"'`\\]+)(?:\s+([\s\S]*))?$/);
+      const skills = skillMatch
+        ? yield* openCodeRuntime.loadOpenCodeSkills(context.client).pipe(
+            Effect.timeout("10 seconds"),
+            Effect.mapError((cause) =>
+              OpenCodeRuntimeError.is(cause)
+                ? toRequestError(cause)
+                : new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "app.skills",
+                    detail: "OpenCode skill discovery did not complete within 10 seconds.",
+                    cause,
+                  }),
+            ),
+          )
+        : [];
+      const nativeSkill = skills.find((skill) => skill.name === skillMatch?.[1]);
+      const commandName = nativeSkill?.name ?? commandMatch?.[1];
+      const nativeCommand = commandName
         ? (yield* loadOpenCodeCommands(context.client).pipe(
             Effect.timeout("10 seconds"),
-            Effect.orElseSucceed(() => []),
-          )).find((command) => command.name === commandMatch[1])
+            Effect.mapError((cause) =>
+              OpenCodeRuntimeError.is(cause)
+                ? toRequestError(cause)
+                : new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "command.list",
+                    detail: "OpenCode command discovery did not complete within 10 seconds.",
+                    cause,
+                  }),
+            ),
+          )).find((command) => command.name === commandName)
         : undefined;
+      const commandArguments = (nativeSkill ? skillMatch?.[2] : commandMatch?.[2]) ?? "";
+      if (nativeSkill) {
+        // OpenCode 1.x registers skills as commands, but existing commands win
+        // name collisions. Leave template expansion and that precedence native.
+        if (!nativeCommand) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: `OpenCode skill '${nativeSkill.name}' has no native command entry. This OpenCode version cannot invoke it as a skill chip.`,
+          });
+        }
+        const argumentTokens =
+          commandArguments.match(
+            /(?:[^\s"'`\\]|\\[\s\S]|"(?:\\[\s\S]|[^"\\])*"|'[^']*'|`(?:\\[\s\S]|[^`\\])*`)+/g,
+          ) ?? [];
+        if (argumentTokens.some((token) => skills.some((skill) => token === `$${skill.name}`))) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue:
+              "OpenCode 1.x can invoke only one skill chip per native command. Submit additional skills separately.",
+          });
+        }
+      }
       // OpenCode ingests images, text, and PDFs natively; formats its model
       // paths reject ride only as the prompt's file path line.
       const fileParts = toOpenCodeFileParts({
@@ -4417,7 +4468,7 @@ export function makeOpenCodeAdapter(
                       sessionID: context.openCodeSessionId,
                       messageID: messageId,
                       command: nativeCommand.name,
-                      arguments: commandMatch?.[2] ?? "",
+                      arguments: commandArguments,
                       model: `${parsedModel.providerID}/${parsedModel.modelID}`,
                       ...(context.activeAgent ? { agent: context.activeAgent } : {}),
                       ...(context.activeVariant ? { variant: context.activeVariant } : {}),

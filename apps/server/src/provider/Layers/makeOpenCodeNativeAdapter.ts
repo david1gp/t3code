@@ -28,6 +28,7 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import { openCodeNativeSessionEngineCreate } from "../openCodeNativeSessionEngineCreate.ts";
+import type { OpenCodeNativeInventory } from "../openCodeNativeInventorySchema.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 
 const provider = ProviderDriverKind.make("opencode");
@@ -197,6 +198,7 @@ export const makeOpenCodeNativeAdapter = (options: {
   readonly serverPassword?: string;
   readonly instanceId?: ProviderInstanceId;
   readonly engineCreate?: typeof openCodeNativeSessionEngineCreate;
+  readonly inventory?: (directory: string) => OpenCodeNativeInventory | undefined;
 }) =>
   Effect.gen(function* () {
     const config = yield* ServerConfig;
@@ -1008,6 +1010,7 @@ export const makeOpenCodeNativeAdapter = (options: {
           let ctx!: Context;
           const engine = (options.engineCreate ?? openCodeNativeSessionEngineCreate)({
             url: options.url,
+            ...(options.inventory ? { inventory: options.inventory } : {}),
             ...(options.serverPassword ? { serverPassword: options.serverPassword } : {}),
             onEvent: (event) => {
               if (ctx) onEvent(ctx, event);

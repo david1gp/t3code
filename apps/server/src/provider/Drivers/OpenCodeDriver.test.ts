@@ -3,6 +3,7 @@ import * as NodeHttp from "node:http";
 import type * as NodeNet from "node:net";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { createOpencodeClient } from "@opencode-ai/sdk/v2";
 import { expect, it } from "@effect/vitest";
 import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -228,5 +229,47 @@ it.layer(testLayer)("OpenCodeDriver chat protocol routing", (it) => {
         { url: "", directory: "/tmp/local-thread" },
       ]);
     }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "does not turn a failed legacy cwd command request into a cached compact-only snapshot",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* fixture(404);
+        const instance = yield* OpenCodeDriver.create(input("legacy-cwd", server.url)).pipe(
+          Effect.provideService(OpenCodeRuntime, {
+            ...runtime,
+            connectToOpenCodeServer: () =>
+              Effect.succeed({
+                url: server.url,
+                version: "1.18.32",
+                external: true,
+                exitCode: null,
+              }),
+            createOpenCodeSdkClient: ({ baseUrl, directory }) =>
+              createOpencodeClient({
+                baseUrl,
+                directory,
+                fetch: Object.assign(
+                  async (request: string | Request | URL) => {
+                    const route = new URL(
+                      request instanceof Request ? request.url : request.toString(),
+                    ).pathname;
+                    return route === "/command"
+                      ? new Response("Unavailable", { status: 503 })
+                      : Response.json([]);
+                  },
+                  { preconnect: () => undefined },
+                ),
+              }),
+            loadOpenCodeSkills: () => Effect.succeed([]),
+          }),
+        );
+        const probe = instance.snapshotForCwd;
+        expect(probe).toBeDefined();
+        if (!probe) return;
+        const result = yield* Effect.exit(probe("/workspace"));
+        expect(result._tag).toBe("Failure");
+      }).pipe(Effect.scoped),
   );
 });

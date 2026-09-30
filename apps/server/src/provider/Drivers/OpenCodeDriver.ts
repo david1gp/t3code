@@ -49,6 +49,7 @@ import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment
 import { openCodeProtocolProbe } from "../openCodeProtocolProbe.ts";
 import { openCodeNativeInventoryLoad } from "../openCodeNativeInventoryLoad.ts";
 import { openCodeNativeInventoryMap } from "../openCodeNativeInventoryMap.ts";
+import type { OpenCodeNativeInventory } from "../openCodeNativeInventorySchema.ts";
 import {
   enrichProviderSnapshotWithVersionAdvisory,
   makeCachedProviderMaintenanceResolution,
@@ -157,11 +158,13 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
             ),
           )
         : { protocol: "legacy" as const };
+      const nativeInventories = new Map<string, OpenCodeNativeInventory>();
       const adapter =
         protocol.protocol === "native"
           ? yield* makeOpenCodeNativeAdapter({
               url: effectiveConfig.serverUrl,
               instanceId,
+              inventory: (directory) => nativeInventories.get(directory),
               ...(effectiveConfig.serverPassword
                 ? { serverPassword: effectiveConfig.serverPassword }
                 : {}),
@@ -204,6 +207,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
                   ? { serverPassword: effectiveConfig.serverPassword }
                   : {}),
               });
+              nativeInventories.set(directory, inventory);
               return { protocol: "native" as const, inventory, version: probe.version };
             }),
           ),
@@ -245,10 +249,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         Effect.all(
           {
             skills: openCodeRuntime.loadOpenCodeSkills(client),
-            commands: loadOpenCodeCommands(client).pipe(
-              Effect.timeout("10 seconds"),
-              Effect.orElseSucceed(() => []),
-            ),
+            commands: loadOpenCodeCommands(client).pipe(Effect.timeout("10 seconds")),
           },
           { concurrency: "unbounded" },
         );
@@ -272,6 +273,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
                         ? { serverPassword: effectiveConfig.serverPassword }
                         : {}),
                     });
+                    nativeInventories.set(cwd, inventory);
                     return { protocol: "native" as const, inventory };
                   }
                   const inventory = yield* Effect.scoped(

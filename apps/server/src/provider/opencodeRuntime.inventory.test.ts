@@ -111,6 +111,31 @@ it.layer(testLayer)("OpenCodeRuntime inventory", (it) => {
     }),
   );
 
+  it.effect(
+    "fails inventory loading when legacy command discovery fails instead of caching an empty catalog",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* OpenCodeRuntime;
+        const client = createOpencodeClient({
+          baseUrl: "http://opencode.test",
+          fetch: Object.assign(
+            async (input: string | Request | URL) => {
+              const route = new URL(input instanceof Request ? input.url : input.toString())
+                .pathname;
+              return route === "/command"
+                ? new Response("Unavailable", { status: 503 })
+                : Response.json(
+                    route === "/provider" ? { connected: ["openai"], all: [], default: {} } : [],
+                  );
+            },
+            { preconnect: () => undefined },
+          ),
+        });
+        const result = yield* Effect.exit(runtime.loadOpenCodeInventory(client));
+        NodeAssert.equal(result._tag, "Failure");
+      }),
+  );
+
   it.effect("keeps provider inventory when agent discovery fails", () =>
     Effect.gen(function* () {
       const runtime = yield* OpenCodeRuntime;
@@ -129,6 +154,7 @@ it.layer(testLayer)("OpenCodeRuntime inventory", (it) => {
           agents: () => Promise.reject(new Error("agents endpoint unavailable")),
           skills: () => Promise.resolve({ data: [] }),
         },
+        command: { list: () => Promise.resolve({ data: [] }) },
       } as unknown as OpencodeClient;
 
       const inventory = yield* runtime.loadOpenCodeInventory(client);
@@ -157,6 +183,7 @@ it.layer(testLayer)("OpenCodeRuntime inventory", (it) => {
           agents: () => Promise.resolve({ data: [] }),
           skills: () => Promise.reject(new Error("skills endpoint unavailable")),
         },
+        command: { list: () => Promise.resolve({ data: [] }) },
       } as unknown as OpencodeClient;
 
       const inventory = yield* runtime.loadOpenCodeInventory(client);
@@ -195,6 +222,7 @@ it.layer(testLayer)("OpenCodeRuntime inventory", (it) => {
               ],
             }),
         },
+        command: { list: () => Promise.resolve({ data: [] }) },
       } as unknown as OpencodeClient;
 
       const inventory = yield* runtime.loadOpenCodeInventory(client);

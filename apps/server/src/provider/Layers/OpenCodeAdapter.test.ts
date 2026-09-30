@@ -41,6 +41,8 @@ import {
   OpenCodeRuntime,
   OpenCodeRuntimeError,
   type OpenCodeRuntimeShape,
+  type OpenCodeSkill,
+  type OpenCodeSlashCommand,
 } from "../opencodeRuntime.ts";
 import {
   isOpenCodeNotFound,
@@ -159,6 +161,12 @@ const runtimeMock = {
     messageFailures: 0,
     promptCalls: [] as Array<unknown>,
     commandCalls: [] as Array<Record<string, unknown>>,
+    commandListCalls: 0,
+    commands: [] as OpenCodeSlashCommand[],
+    commandListError: null as string | null,
+    skillListCalls: 0,
+    skills: [] as OpenCodeSkill[],
+    skillListError: null as OpenCodeRuntimeError | null,
     commandImplementation: null as
       | ((input: Record<string, unknown>, signal?: AbortSignal) => Promise<void>)
       | null,
@@ -227,6 +235,12 @@ const runtimeMock = {
     this.state.messageFailures = 0;
     this.state.promptCalls.length = 0;
     this.state.commandCalls.length = 0;
+    this.state.commandListCalls = 0;
+    this.state.commandListError = null;
+    this.state.commands = [{ name: "review", source: "command", hints: ["$ARGUMENTS"] }];
+    this.state.skillListCalls = 0;
+    this.state.skills = [];
+    this.state.skillListError = null;
     this.state.commandImplementation = null;
     this.state.summarizeCalls.length = 0;
     this.state.promptAsyncError = null;
@@ -317,9 +331,12 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
   createOpenCodeSdkClient: ({ baseUrl, serverPassword }) =>
     ({
       command: {
-        list: async () => ({
-          data: [{ name: "review", source: "command", hints: ["$ARGUMENTS"] }],
-        }),
+        list: async () => {
+          runtimeMock.state.commandListCalls += 1;
+          if (runtimeMock.state.commandListError)
+            return { error: { message: runtimeMock.state.commandListError } };
+          return { data: runtimeMock.state.commands };
+        },
       },
       session: {
         create: async (input: Record<string, unknown>) => {
@@ -647,7 +664,12 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         cause: null,
       }),
     ),
-  loadOpenCodeSkills: () => Effect.succeed([]),
+  loadOpenCodeSkills: () =>
+    Effect.gen(function* () {
+      runtimeMock.state.skillListCalls += 1;
+      if (runtimeMock.state.skillListError) return yield* runtimeMock.state.skillListError;
+      return runtimeMock.state.skills;
+    }),
   loadInventoryFromCli: () =>
     Effect.fail(
       new OpenCodeRuntimeError({
@@ -1760,6 +1782,285 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.equal((yield* adapter.listSessions())[0]?.activeTurnId, undefined);
       yield* adapter.stopSession(threadId);
     }),
+  );
+
+  for (const source of ["skill", "command"] as const) {
+    it.effect(
+      `dispatches a leading native skill chip with the canonical receipt (native source: ${source})`,
+      () =>
+        Effect.gen(function* () {
+          const adapter = yield* OpenCodeAdapter;
+          const threadId = asThreadId(`thread-native-skill-chip-${source}`);
+          runtimeMock.state.skills = [
+            { name: "code-style", location: "/skills/code-style/SKILL.md" },
+          ];
+          // The native registry contains only the winning entry for a name.
+          runtimeMock.state.commands = [{ name: "code-style", source, hints: [] }];
+          const publish = makeOpenCodeEventQueue();
+          const completion = promiseWithResolvers<void>();
+          let responseSettled = false;
+          runtimeMock.state.commandImplementation = async (input) => {
+            publish({
+              type: "message.updated",
+              properties: {
+                sessionID: input.sessionID,
+                info: { id: input.messageID, role: "user" },
+              },
+            });
+            await completion.promise;
+            responseSettled = true;
+          };
+          runtimeMock.state.abortImplementation = async () => completion.resolve(undefined);
+          yield* adapter.startSession({
+            provider: ProviderDriverKind.make("opencode"),
+            threadId,
+            runtimeMode: "full-access",
+          });
+          const args =
+            "main\nfocus on authentication \"$code-style\" '$code-style' `$code-style` $HOME";
+          const result = yield* adapter.sendTurn({
+            threadId,
+            input: `$code-style ${args}`,
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("opencode"),
+              "openai/gpt-5",
+              [
+                { id: "agent", value: "build" },
+                { id: "variant", value: "high" },
+              ],
+            ),
+            attachments: [
+              {
+                type: "image",
+                id: "skill-chip-image",
+                name: "example.png",
+                mimeType: "image/png",
+                sizeBytes: 1,
+              },
+            ],
+          });
+          NodeAssert.equal(responseSettled, false);
+          const { messageID, parts, ...command } = runtimeMock.state.commandCalls[0]!;
+          NodeAssert.equal(typeof messageID, "string");
+          NodeAssert.deepEqual(command, {
+            sessionID: "http://127.0.0.1:9999/session",
+            command: "code-style",
+            arguments: args,
+            model: "openai/gpt-5",
+            agent: "build",
+            variant: "high",
+          });
+          const files = parts as Array<{
+            type: string;
+            mime: string;
+            filename: string;
+            url: string;
+          }>;
+          NodeAssert.equal(files.length, 1);
+          NodeAssert.equal(files[0]?.type, "file");
+          NodeAssert.equal(files[0]?.mime, "image/png");
+          NodeAssert.equal(files[0]?.filename, "example.png");
+          NodeAssert.ok(files[0]?.url.endsWith("/skill-chip-image.png"));
+          NodeAssert.equal(runtimeMock.state.promptCalls.length, 0);
+          NodeAssert.equal(runtimeMock.state.skillListCalls, 1);
+          NodeAssert.equal(runtimeMock.state.commandListCalls, 1);
+          NodeAssert.equal(result.threadId, threadId);
+          NodeAssert.deepEqual(result.resumeCursor, {
+            schemaVersion: 1,
+            sessionId: "http://127.0.0.1:9999/session",
+          });
+          NodeAssert.equal((yield* adapter.listSessions())[0]?.activeTurnId, result.turnId);
+          yield* adapter.interruptTurn(threadId, result.turnId);
+          NodeAssert.equal(runtimeMock.state.abortCalls.length, 1);
+          yield* adapter.stopSession(threadId);
+        }),
+    );
+  }
+
+  it.effect(
+    "keeps unknown variables, quoted skill literals and ordinary text on the prompt path",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-skill-chip-literals");
+        runtimeMock.state.skills = [{ name: "code-style" }];
+        runtimeMock.state.commands = [{ name: "HOME", source: "command", hints: [] }];
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        for (const [input, skillLookups] of [
+          ["$HOME explain this", 1],
+          ["$code-style_suffix explain this", 1],
+          ['"$code-style" explain this', 0],
+          ["'$code-style' explain this", 0],
+          ["`$code-style` explain this", 0],
+          ["\\$code-style explain this", 0],
+          ["Explain $code-style in ordinary text", 0],
+          ["$code-style/file explain this", 0],
+        ] as const) {
+          const priorLookups = runtimeMock.state.skillListCalls;
+          yield* adapter.sendTurn({
+            threadId,
+            input,
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("opencode"),
+              "openai/gpt-5",
+            ),
+          });
+          const prompt = runtimeMock.state.promptCalls.at(-1) as { parts: unknown; system: string };
+          NodeAssert.deepEqual(prompt.parts, [{ type: "text", text: input }]);
+          NodeAssert.equal(
+            prompt.system,
+            buildRuntimeInstructions({ harness: "OpenCode", model: "openai/gpt-5" }),
+          );
+          NodeAssert.equal(runtimeMock.state.skillListCalls - priorLookups, skillLookups);
+        }
+        NodeAssert.equal(runtimeMock.state.commandCalls.length, 0);
+        NodeAssert.equal(runtimeMock.state.commandListCalls, 0);
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
+  it.effect(
+    "rejects a native skill chip without a matching command instead of sending literal text",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-skill-chip-version-mismatch");
+        runtimeMock.state.skills = [{ name: "code-style" }];
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const error = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "$code-style main",
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("opencode"),
+              "openai/gpt-5",
+            ),
+          })
+          .pipe(Effect.flip);
+        NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+        if (error._tag === "ProviderAdapterValidationError") {
+          NodeAssert.match(error.issue, /code-style.*no native command entry/);
+        }
+        NodeAssert.equal(runtimeMock.state.commandCalls.length, 0);
+        NodeAssert.equal(runtimeMock.state.promptCalls.length, 0);
+        NodeAssert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
+  it.effect("rejects multiple unquoted native skill chips without consuming them", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-skill-chip-multiple");
+      runtimeMock.state.skills = [{ name: "code-style" }, { name: "assets" }];
+      runtimeMock.state.commands = [{ name: "code-style", source: "skill", hints: [] }];
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      for (const input of [
+        "$code-style $assets main",
+        "$code-style main\n$assets",
+        "$code-style $code-style",
+      ]) {
+        const error = yield* adapter
+          .sendTurn({
+            threadId,
+            input,
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("opencode"),
+              "openai/gpt-5",
+            ),
+          })
+          .pipe(Effect.flip);
+        NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+        if (error._tag === "ProviderAdapterValidationError") {
+          NodeAssert.match(error.issue, /only one skill chip/);
+        }
+      }
+      NodeAssert.equal(runtimeMock.state.commandCalls.length, 0);
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 0);
+      NodeAssert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect(
+    "surfaces native skill discovery failure instead of sending a claimed chip literally",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-skill-chip-discovery-error");
+        runtimeMock.state.skillListError = new OpenCodeRuntimeError({
+          operation: "app.skills",
+          detail: "skill endpoint unavailable",
+        });
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const error = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "$code-style main",
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("opencode"),
+              "openai/gpt-5",
+            ),
+          })
+          .pipe(Effect.flip);
+        NodeAssert.equal(error._tag, "ProviderAdapterRequestError");
+        if (error._tag === "ProviderAdapterRequestError") {
+          NodeAssert.equal(error.method, "app.skills");
+          NodeAssert.equal(error.detail, "skill endpoint unavailable");
+        }
+        NodeAssert.equal(runtimeMock.state.commandCalls.length, 0);
+        NodeAssert.equal(runtimeMock.state.promptCalls.length, 0);
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
+  it.effect(
+    "surfaces native command discovery failure instead of sending slash text literally",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-command-discovery-error");
+        runtimeMock.state.commandListError = "command endpoint unavailable";
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const error = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "/review main",
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("opencode"),
+              "openai/gpt-5",
+            ),
+          })
+          .pipe(Effect.flip);
+        NodeAssert.equal(error._tag, "ProviderAdapterRequestError");
+        if (error._tag === "ProviderAdapterRequestError") {
+          NodeAssert.equal(error.method, "command.list");
+          NodeAssert.equal(error.detail, "Command discovery failed.");
+        }
+        NodeAssert.equal(runtimeMock.state.commandCalls.length, 0);
+        NodeAssert.equal(runtimeMock.state.promptCalls.length, 0);
+        yield* adapter.stopSession(threadId);
+      }),
   );
 
   it.effect("recovers a native command receipt when the user-message event is lost", () =>

@@ -577,6 +577,99 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
     });
 
     describe("ProviderRegistryLive", () => {
+      it("invalidates older OpenCode cwd catalogs when native discovery gains resources", () => {
+        const base = {
+          instanceId: ProviderInstanceId.make("opencode"),
+          driver: ProviderDriverKind.make("opencode"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-09-30T02:14:00.000Z",
+          version: "2.0.18",
+          models: [],
+          slashCommands: [{ name: "compact" }],
+          skills: [],
+          workspaceSnapshots: [
+            {
+              cwd: "/stale",
+              checkedAt: "2026-09-30T02:15:00.000Z",
+              slashCommands: [{ name: "compact" }],
+              skills: [],
+            },
+            {
+              cwd: "/plugin-only",
+              checkedAt: "2026-09-30T02:15:00.000Z",
+              slashCommands: [{ name: "compact" }, { name: "usage-limits" }],
+              skills: [],
+            },
+            { cwd: "/empty", checkedAt: "2026-09-30T02:15:00.000Z", slashCommands: [], skills: [] },
+            {
+              cwd: "/custom",
+              checkedAt: "2026-09-30T02:15:00.000Z",
+              slashCommands: [{ name: "compact" }, { name: "local" }],
+              skills: [],
+            },
+            {
+              cwd: "/newer",
+              checkedAt: "2026-09-30T02:20:00.000Z",
+              slashCommands: [{ name: "compact" }],
+              skills: [],
+            },
+          ],
+        } satisfies ServerProvider;
+        const { workspaceSnapshots: _workspaceSnapshots, ...machineSnapshot } = base;
+        const refreshed = {
+          ...machineSnapshot,
+          checkedAt: "2026-09-30T02:19:00.000Z",
+          slashCommands: [{ name: "compact" }, { name: "global" }],
+        } satisfies ServerProvider;
+
+        const merged = mergeProviderSnapshot(base, refreshed);
+        assert.deepStrictEqual(
+          merged.workspaceSnapshots?.map((snapshot) => snapshot.cwd),
+          ["/newer"],
+        );
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(merged, refreshed).workspaceSnapshots,
+          merged.workspaceSnapshots,
+        );
+        // A successful refresh can recover a degraded cwd even if the machine
+        // already had the complete catalog before this probe.
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(
+            { ...base, slashCommands: refreshed.slashCommands },
+            refreshed,
+          ).workspaceSnapshots?.map((snapshot) => snapshot.cwd),
+          ["/plugin-only", "/custom", "/newer"],
+        );
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(base, { ...refreshed, status: "error", slashCommands: [] })
+            .workspaceSnapshots,
+          base.workspaceSnapshots,
+        );
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(base, { ...refreshed, slashCommands: base.slashCommands })
+            .workspaceSnapshots,
+          base.workspaceSnapshots,
+        );
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(base, {
+            ...refreshed,
+            slashCommands: base.slashCommands,
+            skills: [{ name: "assets", path: "/skills/assets/SKILL.md", enabled: true }],
+          }).workspaceSnapshots?.map((snapshot) => snapshot.cwd),
+          ["/newer"],
+        );
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(
+            { ...base, driver: ProviderDriverKind.make("pi") },
+            { ...refreshed, driver: ProviderDriverKind.make("pi") },
+          ).workspaceSnapshots,
+          base.workspaceSnapshots,
+        );
+      });
+
       it("stores workspace skills and commands without changing machine metadata", () => {
         const provider = {
           instanceId: ProviderInstanceId.make("codex"),

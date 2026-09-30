@@ -6,6 +6,7 @@ import * as NodeNet from "node:net";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import { openCodeNativeSessionEngineCreate } from "./openCodeNativeSessionEngineCreate.ts";
+import type { OpenCodeNativeInventory } from "./openCodeNativeInventorySchema.ts";
 
 const directory = "/tmp/native workspace";
 const session = { id: "ses_fixture", location: { directory } };
@@ -33,22 +34,30 @@ const send = (res: NodeHttp.ServerResponse, body: unknown) => {
 };
 
 const frame = (
-  res: NodeHttp.ServerResponse,
+  res: Pick<NodeHttp.ServerResponse, "write">,
   type: string,
   data: Record<string, unknown>,
   id: string = crypto.randomUUID(),
+  seq = 1,
 ) => {
-  res.write(
-    `data: ${JSON.stringify({
-      id: `evt_${id}`,
-      type,
-      created: Date.now(),
-      ...(type === "server.connected"
-        ? {}
-        : { durable: { aggregateID: "ses_fixture", seq: 1, version: 1 } }),
-      data,
-    })}\n\n`,
-  );
+  const event = {
+    id: `evt_${id}`,
+    type,
+    created: Date.now(),
+    ...([
+      "server.connected",
+      "session.text.delta",
+      "session.reasoning.delta",
+      "session.tool.input.delta",
+      "session.tool.progress",
+      "session.usage.updated",
+    ].includes(type)
+      ? {}
+      : { durable: { aggregateID: data.sessionID ?? "ses_fixture", seq, version: 1 } }),
+    data,
+  };
+  res.write(`data: ${JSON.stringify(event)}\n\n`);
+  return event;
 };
 
 type EngineEvent = Parameters<
@@ -82,10 +91,28 @@ const usage = {
   cost: 0.25,
   tokens: { input: 10, output: 7, reasoning: 2, cache: { read: 3, write: 4 } },
 };
-const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
+const workspaceInventory: OpenCodeNativeInventory = {
+  provider: [],
+  model: [],
+  agent: [],
+  command: [{ name: "review" }],
+  skill: [
+    { id: "native_skill_7f42", name: "review", path: "/native/opaque/review/SKILL.md" },
+    { id: "native_skill_98ab", name: "quality", path: "/native/opaque/quality/SKILL.md" },
+  ],
+};
+const sessionFixture = async (
+  fetchImpl: typeof fetch = fetch,
+  cachedInventory?: OpenCodeNativeInventory,
+) => {
   const capture = captureCreate();
   let stream: NodeHttp.ServerResponse | undefined;
   let logReads = 0;
+  const logRequests: Array<{ after: number; follow: string | null }> = [];
+  const loggedEvents: ReturnType<typeof frame>[] = [];
+  let retainLog = true;
+  let heldLog: (() => void) | undefined;
+  let logRequested: (() => void) | undefined;
   let pendingPermissions: Record<string, unknown>[] = [];
   let pendingForms: Record<string, unknown>[] = [];
   const replies: Array<{ path: string; body: Record<string, unknown> }> = [];
@@ -94,6 +121,11 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
   let rejectInterrupt = false;
   let interrupted = true;
   let prompts = 0;
+  const promptBodies: Record<string, unknown>[] = [];
+  const inventoryRequests: string[] = [];
+  const commandBodies: Array<{ path: string; body: Record<string, unknown> }> = [];
+  let heldCommand: NodeHttp.ServerResponse | undefined;
+  let commandRequested: (() => void) | undefined;
   let interrupts = 0;
   let heldPermissionList: NodeHttp.ServerResponse | undefined;
   let permissionListRequested: (() => void) | undefined;
@@ -146,16 +178,59 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
       res.writeHead(204).end();
       return;
     }
+    const url = new URL(req.url!, "http://fixture");
+    if (url.pathname === "/api/command" || url.pathname === "/api/skill") {
+      inventoryRequests.push(req.url!);
+      send(res, {
+        location: { directory },
+        data:
+          url.pathname === "/api/command" ? workspaceInventory.command : workspaceInventory.skill,
+      });
+      return;
+    }
+    if (url.pathname === "/api/session/ses_fixture/command") {
+      void bodyRead(req).then((body) => {
+        commandBodies.push({ path: url.pathname, body });
+        heldCommand = res;
+        commandRequested?.();
+        commandRequested = undefined;
+      });
+      return;
+    }
     if (req.url?.includes("/log")) {
       logReads++;
-      res.writeHead(404).end();
+      const after = Number(url.searchParams.get("after") ?? -1);
+      logRequests.push({ after, follow: url.searchParams.get("follow") });
+      const respond = () => {
+        const parentEvents = loggedEvents.filter(
+          (event) => event.durable?.aggregateID === session.id,
+        );
+        const seq = Math.max(100, ...parentEvents.map((event) => event.durable!.seq));
+        const prefix = retainLog
+          ? parentEvents.filter((event) => event.durable!.seq > after && event.durable!.seq <= seq)
+          : [];
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(
+          [...prefix, { type: "log.synced", aggregateID: session.id, seq }]
+            .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+            .join(""),
+        );
+      };
+      if (logRequested) {
+        heldLog = respond;
+        logRequested();
+        logRequested = undefined;
+        return;
+      }
+      respond();
       return;
     }
     if (req.url?.endsWith("/prompt")) {
       prompts++;
-      void bodyRead(req).then((body) =>
-        send(res, { data: { id: body.id, sessionID: session.id, type: "user" } }),
-      );
+      void bodyRead(req).then((body) => {
+        promptBodies.push(body);
+        send(res, { data: { id: body.id, sessionID: session.id, type: "user" } });
+      });
       return;
     }
     if (req.url?.endsWith("/model") || req.url?.endsWith("/agent")) {
@@ -176,17 +251,61 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
   const engine = openCodeNativeSessionEngineCreate({
     url: server.url,
     fetch: fetchImpl,
+    ...(cachedInventory ? { inventory: () => cachedInventory } : {}),
     onEvent: capture.receive,
   });
   expect((await engine.start({ directory })).success).toBe(true);
   let marker = 1000;
-  const write = (type: string, data: Record<string, unknown> = {}, id?: string) =>
-    frame(stream!, type, { sessionID: session.id, ...data }, id);
+  const write = (type: string, data: Record<string, unknown> = {}, id?: string, seq = 1) => {
+    const event = frame(stream!, type, { sessionID: session.id, ...data }, id, seq);
+    loggedEvents.push(event);
+  };
+  const writeLog = (type: string, data: Record<string, unknown> = {}, id?: string, seq = 1) => {
+    const event = frame({ write: () => true }, type, { sessionID: session.id, ...data }, id, seq);
+    loggedEvents.push(event);
+  };
   return {
     ...capture,
     engine,
     write,
+    writeLog,
+    logRequests,
+    replayLogged: () => {
+      for (const event of loggedEvents) stream!.write(`data: ${JSON.stringify(event)}\n\n`);
+    },
+    setLogRetention: (value: boolean) => {
+      retainLog = value;
+    },
+    holdNextLog: () => {
+      const requested = new Promise<void>((resolve) => {
+        logRequested = resolve;
+      });
+      return {
+        requested,
+        release: () => {
+          if (!heldLog) throw new Error("No log request to release");
+          heldLog();
+          heldLog = undefined;
+        },
+      };
+    },
     promptCount: () => prompts,
+    promptBodies,
+    inventoryRequests,
+    commandBodies,
+    holdNextCommand: () => {
+      const requested = new Promise<void>((resolve) => {
+        commandRequested = resolve;
+      });
+      return {
+        requested,
+        release: (status = 204) => {
+          if (!heldCommand) throw new Error("No command request to release");
+          heldCommand.writeHead(status).end();
+          heldCommand = undefined;
+        },
+      };
+    },
     interrupts: () => interrupts,
     disconnect: () => stream!.end(),
     logReads: () => logReads,
@@ -253,19 +372,29 @@ const sessionFixture = async (fetchImpl: typeof fetch = fetch) => {
 const stalledFetch = (stalledPath: string) => {
   const nativeFetch = globalThis.fetch;
   let stalled = false;
+  let requestReceived!: () => void;
+  const requested = new Promise<void>((resolve) => {
+    requestReceived = resolve;
+  });
   const fetchImpl = (async (
     input: Parameters<typeof globalThis.fetch>[0],
     init?: Parameters<typeof globalThis.fetch>[1],
   ) => {
     const url = new URL(input instanceof Request ? input.url : input.toString());
     if (!stalled || url.pathname !== stalledPath) return nativeFetch(input, init);
+    requestReceived();
     return await new Promise<Response>((_resolve, reject) => {
       const signal = init?.signal;
       if (!signal) return;
       signal.addEventListener("abort", () => reject(signal.reason), { once: true });
     });
   }) as typeof globalThis.fetch;
-  return { fetch: fetchImpl, stall: () => (stalled = true), resume: () => (stalled = false) };
+  return {
+    fetch: fetchImpl,
+    requested,
+    stall: () => (stalled = true),
+    resume: () => (stalled = false),
+  };
 };
 
 const stepStart = (assistantMessageID: string) => ({
@@ -278,6 +407,650 @@ const stepEnd = (assistantMessageID: string, finish = "stop") => ({
   assistantMessageID,
   finish,
   ...usage,
+});
+
+// A read-after-marker receipt proves the SSE consumer requested its next frame after
+// processing the preceding batch. This makes cross-transport race tests deterministic.
+const commandTransportReceipts = () => {
+  let commandResponseReceived!: () => void;
+  let eventBatchConsumed!: () => void;
+  let completionLogReceived!: () => void;
+  let logReads = 0;
+  const completionLogResponse = new Promise<void>((resolve) => {
+    completionLogReceived = resolve;
+  });
+  const commandResponse = new Promise<void>((resolve) => {
+    commandResponseReceived = resolve;
+  });
+  const eventBatch = new Promise<void>((resolve) => {
+    eventBatchConsumed = resolve;
+  });
+  const fetchImpl: typeof fetch = async (request, init) => {
+    const response = await fetch(request, init);
+    const path = new URL(request instanceof Request ? request.url : String(request)).pathname;
+    if (path.endsWith("/command")) commandResponseReceived();
+    if (path.endsWith("/log") && ++logReads === 2) completionLogReceived();
+    if (path !== "/api/event") return response;
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let tail = "";
+    let markerRead = false;
+    return new Response(
+      new ReadableStream<Uint8Array>(
+        {
+          async pull(controller) {
+            if (markerRead) eventBatchConsumed();
+            const result = await reader.read();
+            if (result.done) {
+              controller.close();
+              return;
+            }
+            tail = (tail + decoder.decode(result.value, { stream: true })).slice(-1000);
+            markerRead ||= tail.includes("evt_command_receipt");
+            controller.enqueue(result.value);
+          },
+          cancel: () => reader.cancel(),
+        },
+        { highWaterMark: 0 },
+      ),
+      { status: response.status, headers: response.headers },
+    );
+  };
+  return { fetch: fetchImpl, commandResponse, eventBatch, completionLogResponse };
+};
+const commandPromptWrite = (
+  test: Awaited<ReturnType<typeof sessionFixture>>,
+  id = "msg_native_command",
+  seq = 101,
+  sessionID = session.id,
+  logOnly = false,
+) =>
+  (logOnly ? test.writeLog : test.write)(
+    "session.inbox.enqueued",
+    {
+      sessionID,
+      inboxID: id,
+      item: { type: "user", delivery: "steer", payload: { text: "Expanded native template" } },
+    },
+    undefined,
+    seq,
+  );
+const commandTurnWrite = (
+  test: Awaited<ReturnType<typeof sessionFixture>>,
+  stale = false,
+  logOnly = false,
+) => {
+  const write = logOnly ? test.writeLog : test.write;
+  write("session.execution.started", {}, undefined, 102);
+  if (stale) {
+    write("session.execution.succeeded", {}, undefined, 98);
+    write("session.step.started", stepStart("msg_stale_answer"), undefined, 99);
+  }
+  write("session.step.started", stepStart("msg_native_answer"), undefined, 103);
+  write(
+    "session.text.started",
+    { assistantMessageID: "msg_native_answer", ordinal: 0 },
+    undefined,
+    104,
+  );
+  write(
+    "session.text.delta",
+    { assistantMessageID: "msg_native_answer", ordinal: 0, delta: "Reviewed with loaded skills" },
+    undefined,
+    105,
+  );
+  write(
+    "session.text.ended",
+    { assistantMessageID: "msg_native_answer", ordinal: 0, text: "Reviewed with loaded skills" },
+    undefined,
+    105,
+  );
+  write("session.step.ended", stepEnd("msg_native_answer"), undefined, 106);
+  write("session.execution.succeeded", {}, "command_receipt", 107);
+};
+const commandTurnExpect = (test: Awaited<ReturnType<typeof sessionFixture>>, turnID: string) => {
+  expect(test.events.filter((event) => event.type.startsWith("turn."))).toEqual([
+    { type: "turn.started", turnID },
+    { type: "turn.completed", turnID },
+  ]);
+  expect(test.events.find((event) => event.type === "text.completed")).toMatchObject({
+    type: "text.completed",
+    turnID,
+    sessionID: session.id,
+    assistantMessageID: "msg_native_answer",
+    text: "Reviewed with loaded skills",
+  });
+  expect(test.events.find((event) => event.type === "step.completed")).toMatchObject({
+    turnID,
+    step: { assistantMessageID: "msg_native_answer", finish: "stop", ...usage },
+  });
+};
+
+describe("native command and skill HTTP admission", () => {
+  it("dispatches registry commands with native name/args and correlates the complete turn when events precede the 204", async () => {
+    const receipts = commandTransportReceipts();
+    const test = await sessionFixture(receipts.fetch);
+    try {
+      const command = test.holdNextCommand();
+      const sending = test.engine.send('/review "two words" remaining', {
+        delivery: "queue",
+        files: [{ uri: "data:image/png;base64,cGl4ZWw=", name: "image.png" }],
+        agents: [{ name: "build" }],
+      });
+      await command.requested;
+      commandPromptWrite(test);
+      commandTurnWrite(test);
+      await receipts.eventBatch;
+      expect(test.events.map((event) => event.type)).toEqual(["session.ready"]);
+      command.release();
+      expect(await sending).toEqual({ success: true, data: { turnID: "msg_native_command" } });
+      await test.wait((event) => event.type === "turn.completed");
+      expect(test.commandBodies).toEqual([
+        {
+          path: "/api/session/ses_fixture/command",
+          body: {
+            name: "review",
+            text: '"two words" remaining',
+            delivery: "queue",
+            files: [{ uri: "data:image/png;base64,cGl4ZWw=", name: "image.png" }],
+            agents: [{ name: "build" }],
+          },
+        },
+      ]);
+      expect(test.promptCount()).toBe(0);
+      expect(test.inventoryRequests).toHaveLength(1);
+      expect(
+        new URL(test.inventoryRequests[0]!, "http://fixture").searchParams.get(
+          "location[directory]",
+        ),
+      ).toBe(directory);
+      commandTurnExpect(test, "msg_native_command");
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("recovers the native parent enqueue from the completion log when the 204 precedes SSE, deduplicating the late feed", async () => {
+    const receipts = commandTransportReceipts();
+    const test = await sessionFixture(receipts.fetch);
+    try {
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review args");
+      await command.requested;
+      commandPromptWrite(test, "msg_native_command", 101, session.id, true);
+      commandTurnWrite(test, false, true);
+      command.release();
+      await receipts.commandResponse;
+      commandPromptWrite(test, "msg_stale", 99);
+      test.write("session.execution.started", {}, undefined, 99);
+      commandPromptWrite(test, "msg_unrelated", 101, "ses_unrelated");
+      test.write("session.execution.succeeded", { sessionID: "ses_unrelated" }, undefined, 102);
+      test.write(
+        "session.inbox.enqueued",
+        {
+          inboxID: "msg_synthetic",
+          item: { type: "synthetic", delivery: "steer", payload: { text: "not a user prompt" } },
+        },
+        undefined,
+        101,
+      );
+      expect(await sending).toEqual({ success: true, data: { turnID: "msg_native_command" } });
+      await test.wait((event) => event.type === "turn.completed");
+      test.replayLogged();
+      test.write("session.usage.updated", { ...usage, cost: 9000 }, undefined, 109);
+      await test.wait((event) => event.type === "usage.updated" && event.cost === 9000);
+      commandTurnExpect(test, "msg_native_command");
+      expect(test.events.filter((event) => event.type === "text.completed")).toHaveLength(1);
+      expect(test.logRequests).toEqual([
+        { after: -1, follow: "false" },
+        { after: 100, follow: "false" },
+      ]);
+      expect(
+        test.events.some(
+          (event) =>
+            "turnID" in event &&
+            ["msg_stale", "msg_unrelated", "msg_synthetic"].includes(event.turnID),
+        ),
+      ).toBe(false);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("completes a successful command with no parent enqueue and permits a subsequent ordinary turn", async () => {
+    const test = await sessionFixture();
+    try {
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review noop");
+      await command.requested;
+      command.release();
+      const result = await sending;
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error("Command receipt failed");
+      expect(result.data.turnID).toMatch(/^command_/);
+      expect(test.events.filter((event) => event.type.startsWith("turn."))).toEqual([
+        { type: "turn.started", turnID: result.data.turnID },
+        { type: "turn.completed", turnID: result.data.turnID },
+      ]);
+      expect(test.logReads()).toBe(2);
+      const next = await test.engine.send("ordinary after noop");
+      expect(next.success).toBe(true);
+      if (!next.success) throw new Error("Ordinary admission failed");
+      test.write("session.execution.started", {}, undefined, 101);
+      test.write("session.execution.succeeded", {}, undefined, 102);
+      await test.wait(
+        (event) => event.type === "turn.completed" && event.turnID === next.data.turnID,
+      );
+      expect(next.data.turnID).not.toBe(result.data.turnID);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("links and settles child-only command events buffered before the 204 without a parent inbox", async () => {
+    const receipts = commandTransportReceipts();
+    const test = await sessionFixture(receipts.fetch);
+    try {
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review child only");
+      await command.requested;
+      test.write("session.created", {
+        sessionID: "ses_command_child",
+        parentID: session.id,
+        projectID: "proj_fixture",
+        slug: "child",
+        location: { directory },
+        agent: "review",
+        version: "2.0.18",
+      });
+      test.write("session.execution.started", { sessionID: "ses_command_child" }, undefined, 2);
+      test.write(
+        "session.execution.succeeded",
+        { sessionID: "ses_command_child" },
+        "command_receipt",
+        3,
+      );
+      await receipts.eventBatch;
+      expect(test.events.map((event) => event.type)).toEqual(["session.ready"]);
+      command.release();
+      const result = await sending;
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error("Child command receipt failed");
+      const scope = {
+        sessionID: "ses_command_child",
+        parentSessionID: session.id,
+        turnID: result.data.turnID,
+      };
+      expect(test.events.filter((event) => event.type.startsWith("child."))).toEqual([
+        { type: "child.attached", ...scope, info: { agent: "review", directory } },
+        { type: "child.started", ...scope },
+        { type: "child.completed", ...scope },
+      ]);
+      expect(test.events.filter((event) => event.type.startsWith("turn."))).toEqual([
+        { type: "turn.started", turnID: result.data.turnID },
+        { type: "turn.completed", turnID: result.data.turnID },
+      ]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("attaches a child from the logged command prefix and accepts its lagged SSE completion", async () => {
+    const test = await sessionFixture();
+    try {
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review logged child");
+      await command.requested;
+      const tool = { assistantMessageID: "msg_command_tool", id: "tool_command_child" };
+      test.writeLog("session.tool.input.started", { ...tool, name: "subagent" }, undefined, 101);
+      test.writeLog(
+        "session.tool.called",
+        { ...tool, input: { agent: "review", prompt: "inspect" }, executed: false },
+        undefined,
+        102,
+      );
+      test.writeLog(
+        "session.tool.success",
+        {
+          ...tool,
+          executed: true,
+          content: [{ type: "text", text: "Child launched" }],
+          metadata: { sessionID: "ses_logged_child", status: "running" },
+        },
+        undefined,
+        103,
+      );
+      command.release();
+      const result = await sending;
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error("Logged child command failed");
+      const scope = {
+        sessionID: "ses_logged_child",
+        parentSessionID: session.id,
+        parentToolKey: "ses_fixture:msg_command_tool:tool:tool_command_child",
+        turnID: result.data.turnID,
+      };
+      expect(test.events.find((event) => event.type === "child.attached")).toMatchObject({
+        type: "child.attached",
+        ...scope,
+      });
+      test.write("session.execution.started", { sessionID: "ses_logged_child" }, undefined, 2);
+      test.write("session.execution.succeeded", { sessionID: "ses_logged_child" }, undefined, 3);
+      await test.wait((event) => event.type === "child.completed");
+      expect(test.events.filter((event) => event.type === "child.completed")).toEqual([
+        { type: "child.completed", ...scope },
+      ]);
+      expect(test.events.filter((event) => event.type.startsWith("turn."))).toEqual([
+        { type: "turn.started", turnID: result.data.turnID },
+        { type: "turn.completed", turnID: result.data.turnID },
+      ]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("keeps an existing turn open when a steering command has no parent enqueue", async () => {
+    const test = await sessionFixture();
+    try {
+      const turnID = await test.admit();
+      test.write("session.execution.started");
+      await test.wait((event) => event.type === "turn.started");
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review noop steer");
+      await command.requested;
+      command.release();
+      expect(await sending).toEqual({ success: true, data: { turnID } });
+      expect(test.events.filter((event) => event.type.startsWith("turn."))).toEqual([
+        { type: "turn.started", turnID },
+      ]);
+      test.write("session.execution.succeeded", {}, undefined, 101);
+      await test.wait((event) => event.type === "turn.completed");
+      expect(test.events.filter((event) => event.type === "turn.completed")).toEqual([
+        { type: "turn.completed", turnID },
+      ]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it.each([true, false])(
+    "drains a non-retained post-command watermark before deciding parent enqueue presence (%s)",
+    async (hasParent) => {
+      const receipts = commandTransportReceipts();
+      const test = await sessionFixture(receipts.fetch);
+      try {
+        const command = test.holdNextCommand();
+        const sending = test.engine.send("/review SSE behind without persistence");
+        let settled = false;
+        void sending.then(() => {
+          settled = true;
+        });
+        await command.requested;
+        test.setLogRetention(false);
+        if (hasParent) {
+          commandPromptWrite(test, "msg_native_command", 101, session.id, true);
+          commandTurnWrite(test, false, true);
+        } else {
+          test.writeLog(
+            "session.metadata.updated",
+            { metadata: { command: "state only" } },
+            undefined,
+            101,
+          );
+        }
+        command.release();
+        await receipts.completionLogResponse;
+        // An unrelated live frame drains the consumer without satisfying the parent prefix.
+        test.write("session.usage.updated", { ...usage, cost: 9000 }, "command_receipt_prefix");
+        await receipts.eventBatch;
+        expect(settled).toBe(false);
+        expect(test.events.map((event) => event.type)).toEqual(["session.ready"]);
+        if (hasParent) {
+          commandPromptWrite(test);
+          commandTurnWrite(test);
+        } else {
+          // Every durable sequence counts, even when its type has no UI translation.
+          test.write(
+            "session.metadata.updated",
+            { metadata: { command: "state only" } },
+            undefined,
+            101,
+          );
+        }
+        const result = await sending;
+        expect(result.success).toBe(true);
+        if (!result.success) throw new Error("SSE prefix drain failed");
+        if (hasParent) {
+          expect(result.data.turnID).toBe("msg_native_command");
+          commandTurnExpect(test, result.data.turnID);
+        } else {
+          expect(result.data.turnID).toMatch(/^command_/);
+          expect(test.events.filter((event) => event.type.startsWith("turn."))).toEqual([
+            { type: "turn.started", turnID: result.data.turnID },
+            { type: "turn.completed", turnID: result.data.turnID },
+          ]);
+        }
+        expect(test.logReads()).toBe(2);
+      } finally {
+        await test.close();
+      }
+    },
+  );
+
+  it.each(["disconnect", "stop"] as const)(
+    "unblocks an incomplete non-retained prefix on %s without a ghost turn",
+    async (action) => {
+      const receipts = commandTransportReceipts();
+      const test = await sessionFixture(receipts.fetch);
+      try {
+        const command = test.holdNextCommand();
+        const sending = test.engine.send("/review lost prefix");
+        await command.requested;
+        test.setLogRetention(false);
+        commandPromptWrite(test, "msg_unretained", 101, session.id, true);
+        command.release();
+        await receipts.completionLogResponse;
+        test.write("session.usage.updated", { ...usage, cost: 9000 }, "command_receipt_prefix");
+        await receipts.eventBatch;
+        if (action === "disconnect") {
+          test.disconnect();
+          await test.wait((event) => event.type === "stream.lost");
+        } else {
+          await test.engine.stop();
+        }
+        expect(await sending).toMatchObject({
+          success: false,
+          error: { operation: "session.command" },
+        });
+        expect(test.events.some((event) => event.type.startsWith("turn."))).toBe(false);
+      } finally {
+        await test.close();
+      }
+    },
+  );
+
+  it("keeps unknown slash commands literal on ordinary /prompt and produces a complete turn", async () => {
+    const test = await sessionFixture();
+    try {
+      const sending = await test.engine.send("/not-registered keep these args");
+      expect(sending.success).toBe(true);
+      if (!sending.success) throw new Error("Prompt admission failed");
+      expect(test.promptBodies).toEqual([
+        { id: sending.data.turnID, text: "/not-registered keep these args" },
+      ]);
+      expect(test.commandBodies).toEqual([]);
+      expect(test.logReads()).toBe(0);
+      commandTurnWrite(test);
+      await test.wait((event) => event.type === "turn.completed");
+      commandTurnExpect(test, sending.data.turnID);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("does not leave a ghost turn after a command HTTP failure even if native execution events arrived first", async () => {
+    const receipts = commandTransportReceipts();
+    const test = await sessionFixture(receipts.fetch);
+    try {
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review rejected");
+      await command.requested;
+      commandPromptWrite(test);
+      commandTurnWrite(test);
+      await receipts.eventBatch;
+      command.release(503);
+      expect(await sending).toMatchObject({
+        success: false,
+        error: { operation: "session.command" },
+      });
+      expect(test.events.map((event) => event.type)).toEqual(["session.ready"]);
+      expect((await test.engine.send("do not replay uncertain work")).success).toBe(false);
+      expect(test.promptCount()).toBe(0);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("unblocks command admission on stream loss without inventing a running turn", async () => {
+    const receipts = commandTransportReceipts();
+    const test = await sessionFixture(receipts.fetch);
+    try {
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review lost");
+      await command.requested;
+      const completion = test.holdNextLog();
+      command.release();
+      await receipts.commandResponse;
+      await completion.requested;
+      test.disconnect();
+      await test.wait((event) => event.type === "stream.lost");
+      completion.release();
+      expect(await sending).toMatchObject({
+        success: false,
+        error: { operation: "session.command" },
+      });
+      expect(test.events.map((event) => event.type)).toEqual(["session.ready", "stream.lost"]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("loads real native skill IDs and exact mentions without removing args, multiple skills or unknown/literal variables", async () => {
+    const test = await sessionFixture();
+    try {
+      const text = '$review compare $quality with $UNKNOWN and "$review" ` $literal `';
+      const sending = await test.engine.send(text, { files: [{ uri: "file:///tmp/context.txt" }] });
+      expect(sending.success).toBe(true);
+      if (!sending.success) throw new Error("Skill admission failed");
+      expect(test.promptBodies).toEqual([
+        {
+          id: sending.data.turnID,
+          text,
+          files: [{ uri: "file:///tmp/context.txt" }],
+          skills: [
+            { id: "native_skill_7f42", mention: { start: 0, end: 7, text: "$review" } },
+            { id: "native_skill_98ab", mention: { start: 16, end: 24, text: "$quality" } },
+          ],
+        },
+      ]);
+      expect(test.inventoryRequests).toHaveLength(1);
+      expect(test.inventoryRequests[0]).toMatch(/^\/api\/skill\?/);
+      expect(
+        new URL(test.inventoryRequests[0]!, "http://fixture").searchParams.get(
+          "location[directory]",
+        ),
+      ).toBe(directory);
+      commandTurnWrite(test);
+      await test.wait((event) => event.type === "turn.completed");
+      commandTurnExpect(test, sending.data.turnID);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("reuses cached raw inventory and keeps command and skill namespaces distinct", async () => {
+    const test = await sessionFixture(fetch, workspaceInventory);
+    try {
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review $review inspect $quality and $MISSING");
+      await command.requested;
+      commandPromptWrite(test);
+      commandTurnWrite(test);
+      command.release();
+      expect(await sending).toEqual({ success: true, data: { turnID: "msg_native_command" } });
+      await test.wait((event) => event.type === "turn.completed");
+      expect(test.commandBodies[0]?.body).toEqual({
+        name: "review",
+        text: "$review inspect $quality and $MISSING",
+        skills: [
+          { id: "native_skill_7f42", mention: { start: 0, end: 7, text: "$review" } },
+          { id: "native_skill_98ab", mention: { start: 16, end: 24, text: "$quality" } },
+        ],
+      });
+      expect(test.inventoryRequests).toEqual([]);
+      commandTurnExpect(test, "msg_native_command");
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("preserves steer delivery and canonical identity, then admits an ordinary fresh turn after command completion", async () => {
+    const test = await sessionFixture();
+    try {
+      const originalID = await test.admit();
+      test.write("session.execution.started");
+      await test.wait((event) => event.type === "turn.started");
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review while running");
+      await command.requested;
+      commandPromptWrite(test);
+      commandTurnWrite(test);
+      command.release();
+      expect(await sending).toEqual({ success: true, data: { turnID: originalID } });
+      await test.wait((event) => event.type === "turn.completed");
+      expect(test.commandBodies[0]?.body).toEqual({
+        name: "review",
+        text: "while running",
+        delivery: "steer",
+      });
+      commandTurnExpect(test, originalID);
+      const next = await test.engine.send("ordinary after command");
+      expect(next.success).toBe(true);
+      if (!next.success) throw new Error("Ordinary admission after command failed");
+      expect(next.data.turnID).not.toBe(originalID);
+      expect(test.promptBodies[1]).toEqual({
+        id: next.data.turnID,
+        text: "ordinary after command",
+      });
+      test.write("session.execution.started", {}, undefined, 109);
+      test.write("session.execution.succeeded", {}, undefined, 110);
+      await test.wait(
+        (event) => event.type === "turn.completed" && event.turnID === next.data.turnID,
+      );
+      expect(test.events.filter((event) => event.type === "turn.completed")).toEqual([
+        { type: "turn.completed", turnID: originalID },
+        { type: "turn.completed", turnID: next.data.turnID },
+      ]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("does not look up inventory for ordinary prompts without skill references", async () => {
+    const test = await sessionFixture();
+    try {
+      const sending = await test.engine.send("ordinary plain text");
+      expect(sending.success).toBe(true);
+      if (!sending.success) throw new Error("Ordinary admission failed");
+      expect(test.inventoryRequests).toEqual([]);
+      expect(test.logReads()).toBe(0);
+      commandTurnWrite(test);
+      await test.wait((event) => event.type === "turn.completed");
+      commandTurnExpect(test, sending.data.turnID);
+    } finally {
+      await test.close();
+    }
+  });
 });
 
 describe("native v2.0.18 session slice", () => {
@@ -297,8 +1070,10 @@ describe("native v2.0.18 session slice", () => {
       onEvent: () => {},
     });
     try {
+      stalled.stall();
       vi.useFakeTimers();
       const starting = engine.start({ directory });
+      await stalled.requested;
       await vi.advanceTimersByTimeAsync(15_000);
       expect(await starting).toMatchObject({
         success: false,

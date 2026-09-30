@@ -3,10 +3,22 @@ import * as NodeCrypto from "node:crypto";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 
-import type { FormInfo, PermissionRequest, V2Event } from "@opencode/client";
+import type {
+  FormInfo,
+  PermissionRequest,
+  SessionPromptInput,
+  SessionLogOutput,
+  V2Event,
+} from "@opencode/client";
 
 import { openCodeNativeClientCreate } from "./openCodeNativeClientCreate.ts";
+import {
+  type OpenCodeNativeInventory,
+  openCodeNativeInventorySchema,
+} from "./openCodeNativeInventorySchema.ts";
 import { OpenCodeRuntimeError } from "./opencodeRuntime.ts";
+
+type NativeFrame = V2Event | Exclude<SessionLogOutput, { type: "log.synced" }>;
 
 type Result<T> =
   | { readonly success: true; readonly data: T }
@@ -91,6 +103,15 @@ const nativeEvent = Schema.Union([
     model: Schema.optionalKey(Schema.Struct({ id: Schema.String, providerID: Schema.String })),
     version: Schema.String,
   }),
+  event("session.inbox.enqueued", {
+    ...base,
+    inboxID: Schema.String,
+    item: Schema.Struct({
+      type: Schema.Literal("user"),
+      delivery: Schema.Literals(["steer", "queue"]),
+      payload: Schema.Struct({ text: Schema.String }),
+    }),
+  }),
   event("session.execution.started", base),
   event("session.execution.succeeded", base),
   event("session.execution.failed", { ...base, error: nativeError }),
@@ -161,13 +182,15 @@ const nativeEvent = Schema.Union([
 ]);
 type NativeEvent = typeof nativeEvent.Type;
 type Data<T extends NativeEvent["type"]> = Extract<NativeEvent, { type: T }>["data"];
-const nativeEventFromClient = (message: V2Event) =>
+const nativeEventFromClient = (message: NativeFrame) =>
   Schema.decodeUnknownExit(nativeEvent)({
     id: message.id,
     created: "created" in message ? message.created : undefined,
     type: message.type,
     data: message.data,
   });
+const commandInventoryDecode = Schema.decodeExit(openCodeNativeInventorySchema.command);
+const skillInventoryDecode = Schema.decodeExit(openCodeNativeInventorySchema.skill);
 const REQUEST_TIMEOUT_MS = 15_000;
 const requestWithDeadline = async <T>(
   parent: AbortSignal | undefined,
@@ -390,6 +413,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
   readonly url: string;
   readonly serverPassword?: string;
   readonly fetch?: typeof fetch;
+  readonly inventory?: (directory: string) => OpenCodeNativeInventory | undefined;
   readonly onEvent: (event: Event) => void;
 }) => {
   const client = openCodeNativeClientCreate(input);
@@ -397,6 +421,8 @@ export const openCodeNativeSessionEngineCreate = (input: {
   let abort: AbortController | undefined;
   let connected = false;
   let active: Work | undefined;
+  let commandWork: Work | undefined;
+  const dispatchedEvents = new Set<string>();
   let lastTurnID: string | undefined;
   const children = new Map<string, Work>();
   const childParents = new Map<string, string>();
@@ -405,7 +431,11 @@ export const openCodeNativeSessionEngineCreate = (input: {
   let switching = false;
   let uncertain = false;
   let disconnected = false;
-  let admissionEvents: V2Event[] = [];
+  let admissionEvents: NativeFrame[] = [];
+  const admissionSequences = new Set<number>();
+  let admissionWake: (() => void) | undefined;
+  let nativeSequence = -1;
+  let turnSequenceFloor = 0;
   // Woken whenever the main turn settles or the engine loses its stream.
   const idleWaiters = new Set<() => void>();
   const idleNotify = () => {
@@ -480,7 +510,15 @@ export const openCodeNativeSessionEngineCreate = (input: {
     forms.set(form.id, { form, turnID: lastTurnID, replying: false });
     emit({ type: "form.created", turnID: lastTurnID, form });
   };
-  const dispatch = (message: V2Event) => {
+  const dispatch = (message: NativeFrame) => {
+    if (dispatchedEvents.has(message.id)) return;
+    if (
+      "durable" in message &&
+      message.durable.aggregateID === session?.id &&
+      message.durable.seq < turnSequenceFloor
+    )
+      return;
+    boundedAdd(dispatchedEvents, message.id);
     if (message.type === "permission.replied") {
       requestSettle(
         "permission",
@@ -661,6 +699,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
     emit({ type: "child.completed", ...child.scope });
   };
   const translate = (message: NativeEvent) => {
+    if (message.type === "session.inbox.enqueued") return;
     if (message.type === "session.created") {
       const data = message.data;
       if (!data.parentID || !/^ses_[\w-]+$/.test(data.sessionID)) return;
@@ -677,9 +716,15 @@ export const openCodeNativeSessionEngineCreate = (input: {
       const existing = children.get(data.sessionID);
       const parent =
         data.parentID === session?.id
-          ? (active ?? (existing?.scope.parentSessionID === session?.id ? existing : undefined))
+          ? (active ??
+            commandWork ??
+            (existing?.scope.parentSessionID === session?.id ? existing : undefined))
           : children.get(data.parentID);
-      if (!parent || (parent.terminal && parent !== existing) || data.sessionID === data.parentID)
+      if (
+        !parent ||
+        (parent.terminal && parent !== existing && parent !== commandWork) ||
+        data.sessionID === data.parentID
+      )
         return;
       if (existing && existing.scope.parentSessionID !== data.parentID) return;
       if (existing?.terminal) return;
@@ -1003,6 +1048,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
     disconnected = true;
     connected = false;
     admissionEvents = [];
+    admissionWake?.();
     idleNotify();
     if (session && abort && !abort.signal.aborted)
       emit({ type: "stream.lost", sessionID: session.id });
@@ -1031,9 +1077,22 @@ export const openCodeNativeSessionEngineCreate = (input: {
             typeof messageSessionID !== "string" ||
             (messageSessionID !== session.id &&
               !children.has(messageSessionID) &&
-              message.type !== "session.created")
+              message.type !== "session.created" &&
+              !(
+                admitting &&
+                admissionEvents.some(
+                  (event) =>
+                    event.type === "session.created" && event.data.sessionID === messageSessionID,
+                )
+              ))
           )
             continue;
+          if ("durable" in message && message.durable.aggregateID === session.id) {
+            nativeSequence = Math.max(nativeSequence, message.durable.seq);
+            // Count every parent durable frame, including types the UI does not translate.
+            if (admitting) admissionSequences.add(message.durable.seq);
+            admissionWake?.();
+          }
           // The global /api/event feed is volatile. Dedup within one subscription only;
           // do not use its event id as a durable replay cursor.
           // The official union adds durable/location fields that this engine does
@@ -1327,7 +1386,10 @@ export const openCodeNativeSessionEngineCreate = (input: {
         switching = false;
       }
     },
-    send: async (text: string): Promise<Result<{ readonly turnID: string }>> => {
+    send: async (
+      text: string,
+      attachments: Pick<SessionPromptInput, "files" | "agents" | "skills" | "delivery"> = {},
+    ): Promise<Result<{ readonly turnID: string }>> => {
       if (!session || !connected || disconnected || !abort || abort.signal.aborted)
         return fail("session.prompt", "Session event stream is not ready.");
       const currentSession = session;
@@ -1337,6 +1399,276 @@ export const openCodeNativeSessionEngineCreate = (input: {
         return rejectSend("A message is still being admitted. Try again in a moment.");
       if (!text.trim()) return rejectSend("Prompt text is required.");
       admitting = true;
+      admissionSequences.clear();
+      const controller = abort;
+      const slash = /^\s*\/(\S+)(?:\s+|$)/u.exec(text);
+      const cached = input.inventory?.(currentSession.location.directory);
+      let command: string | undefined;
+      let skills = attachments.skills;
+      try {
+        if (slash) {
+          const inventory =
+            cached?.command ??
+            (await requestWithDeadline(controller.signal, async (signal) => {
+              const response = await client.command.list(
+                { location: currentSession.location },
+                { signal },
+              );
+              const decoded = commandInventoryDecode(response);
+              if (
+                Exit.isFailure(decoded) ||
+                decoded.value.location.directory !== currentSession.location.directory
+              )
+                throw new Error("Invalid native command inventory or mismatched location.");
+              return decoded.value.data;
+            }));
+          if (inventory.some((entry) => entry.name === slash[1])) command = slash[1];
+        }
+        const promptText = command ? text.slice(slash![0].length) : text;
+        const references = Array.from(
+          promptText.matchAll(/(?<![\w$\\`'"])\$([\w./-]+)(?=$|[\s,;:!?])/gu),
+        );
+        if (references.length) {
+          const inventory =
+            cached?.skill ??
+            (await requestWithDeadline(controller.signal, async (signal) => {
+              const response = await client.skill.list(
+                { location: currentSession.location },
+                { signal },
+              );
+              const decoded = skillInventoryDecode(response);
+              if (
+                Exit.isFailure(decoded) ||
+                decoded.value.location.directory !== currentSession.location.directory
+              )
+                throw new Error("Invalid native skill inventory or mismatched location.");
+              return decoded.value.data;
+            }));
+          const resolved = references.flatMap((reference) => {
+            const skill = inventory.find((entry) => entry.name.trim() === reference[1]);
+            if (!skill) return [];
+            return [
+              {
+                id: skill.id,
+                mention: {
+                  start: reference.index,
+                  end: reference.index + reference[0].length,
+                  text: reference[0],
+                },
+              },
+            ];
+          });
+          if (resolved.length) skills = [...(skills ?? []), ...resolved];
+        }
+      } catch (cause) {
+        for (const event of admissionEvents) dispatch(event);
+        admissionEvents = [];
+        admitting = false;
+        return rejectSend(
+          cause instanceof Error ? cause.message : "Native workspace inventory failed.",
+        );
+      }
+      if (
+        controller.signal.aborted ||
+        !connected ||
+        disconnected ||
+        session?.id !== currentSession.id
+      ) {
+        admitting = false;
+        admissionEvents = [];
+        return fail("session.prompt", "Native session closed during workspace lookup.");
+      }
+      if (command) {
+        // /command has no caller id or prompt receipt. log.synced is only a live admission
+        // fence here, not a replay/recovery guarantee: even persist=false retains its watermark.
+        let after: number | undefined;
+        try {
+          for await (const event of client.session.log(
+            { sessionID: currentSession.id, after: nativeSequence, follow: false },
+            { signal: controller.signal },
+          )) {
+            if (event.type !== "log.synced" || event.aggregateID !== currentSession.id) continue;
+            after = event.seq ?? -1;
+            break;
+          }
+          if (after === undefined) throw new Error("Native command admission fence missing.");
+        } catch (cause) {
+          for (const event of admissionEvents) dispatch(event);
+          admissionEvents = [];
+          admitting = false;
+          return reject(
+            "session.command",
+            cause instanceof Error ? cause.message : "Native command admission fence failed.",
+          );
+        }
+        // Frames already buffered before the request belong to prior work.
+        for (const event of admissionEvents) dispatch(event);
+        admissionEvents = [];
+        commandWork = undefined;
+        try {
+          await requestWithDeadline(controller.signal, (signal) =>
+            client.session.command(
+              {
+                sessionID: currentSession.id,
+                name: command,
+                text: text.slice(slash![0].length),
+                ...attachments,
+                ...(skills ? { skills } : {}),
+                ...(active && !attachments.delivery ? { delivery: "steer" as const } : {}),
+              },
+              { signal },
+            ),
+          );
+        } catch (cause) {
+          // Nothing is announced before both receipts. Failed expansion/admission must not
+          // manufacture a running turn; an uncertain server outcome still fails closed.
+          uncertain = true;
+          admitting = false;
+          admissionEvents = [];
+          return fail(
+            "session.command",
+            cause instanceof Error ? cause.message : "Native command request failed.",
+          );
+        }
+        // v2.0.18 awaits the command handler before 204. Its awaited parent enqueues
+        // are committed by then, but the global SSE feed can still be behind.
+        const logged: NativeFrame[] = [];
+        let through: number | undefined;
+        try {
+          await requestWithDeadline(controller.signal, async (signal) => {
+            for await (const event of client.session.log(
+              { sessionID: currentSession.id, after, follow: false },
+              { signal },
+            )) {
+              if (event.type === "log.synced") {
+                if (event.aggregateID !== currentSession.id) continue;
+                through = event.seq ?? -1;
+                break;
+              }
+              if (event.durable.aggregateID !== currentSession.id || event.durable.seq <= after)
+                continue;
+              logged.push(event);
+            }
+            if (through === undefined || through < after)
+              throw new Error("Native command completion watermark missing or regressed.");
+          });
+        } catch (cause) {
+          uncertain = true;
+          admitting = false;
+          admissionEvents = [];
+          return fail(
+            "session.command",
+            cause instanceof Error ? cause.message : "Native command completion receipt failed.",
+          );
+        }
+        // With persistence disabled the marker can beat its global SSE prefix. Drain
+        // exactly the committed watermark, woken by frame arrival, stream loss or stop.
+        const watermark = through!;
+        for (const event of logged) {
+          if ("durable" in event) admissionSequences.add(event.durable.seq);
+        }
+        let covered = after;
+        const prefixComplete = () => {
+          while (covered < watermark && admissionSequences.has(covered + 1)) covered++;
+          return covered === watermark;
+        };
+        const streamAvailable = () =>
+          !controller.signal.aborted &&
+          connected &&
+          !disconnected &&
+          session?.id === currentSession.id;
+        while (!prefixComplete() && streamAvailable()) {
+          await new Promise<void>((wake) => {
+            admissionWake = wake;
+          });
+        }
+        admissionWake = undefined;
+        if (!streamAvailable()) {
+          uncertain = true;
+          admitting = false;
+          admissionEvents = [];
+          return fail(
+            "session.command",
+            "Native session event stream closed during command admission.",
+          );
+        }
+        // Replay the ordered parent prefix first, then the SSE tail/children. dispatch
+        // deduplicates IDs across both transports, including SSE arriving after this drain.
+        admissionEvents = [...logged, ...admissionEvents];
+        const promptEvent = admissionEvents.find(
+          (event) =>
+            event.type === "session.inbox.enqueued" &&
+            event.data.sessionID === currentSession.id &&
+            event.data.item.type === "user" &&
+            event.durable.aggregateID === currentSession.id &&
+            event.durable.seq > after &&
+            event.durable.seq <= watermark,
+        );
+        const prompt =
+          promptEvent?.type === "session.inbox.enqueued"
+            ? { id: promptEvent.data.inboxID, seq: promptEvent.durable.seq }
+            : undefined;
+        if (!prompt) {
+          const steering = active;
+          const turnID =
+            steering?.scope.turnID ?? `command_${NodeCrypto.randomUUID().replaceAll("-", "")}`;
+          commandWork = steering ?? workCreate({ turnID, sessionID: currentSession.id });
+          if (!steering) {
+            active = commandWork;
+            turnSequenceFloor = after + 1;
+            lastTurnID = turnID;
+            workStart(commandWork);
+          }
+          for (const event of admissionEvents) dispatch(event);
+          admissionEvents = [];
+          admitting = false;
+          if (!steering && commandWork && !commandWork.terminal) {
+            workSettle(commandWork);
+            active = undefined;
+            idleNotify();
+            emit({ type: "turn.completed", turnID });
+          }
+          const reconciled = await reconcilePending(false);
+          if (!reconciled.success) {
+            uncertain = true;
+            return reconciled;
+          }
+          return { success: true, data: { turnID } };
+        }
+        // A prior running turn may have settled while the command expanded. Drain only that
+        // prefix against it, then bind the new prompt (or steer) before its execution frames.
+        const prefix = admissionEvents.filter(
+          (event) =>
+            "durable" in event &&
+            event.durable.aggregateID === currentSession.id &&
+            event.durable.seq < prompt.seq,
+        );
+        for (const event of prefix) dispatch(event);
+        const turnID = active?.scope.turnID ?? prompt.id;
+        if (!active) {
+          active = workCreate({ turnID, sessionID: currentSession.id });
+          turnSequenceFloor = prompt.seq;
+          lastTurnID = turnID;
+        }
+        for (const event of admissionEvents) {
+          if (
+            "durable" in event &&
+            event.durable.aggregateID === currentSession.id &&
+            event.durable.seq < prompt.seq
+          )
+            continue;
+          dispatch(event);
+        }
+        admissionEvents = [];
+        admitting = false;
+        const reconciled = await reconcilePending(false);
+        if (!reconciled.success) {
+          uncertain = true;
+          return reconciled;
+        }
+        return { success: true, data: { turnID } };
+      }
+      commandWork = undefined;
       const id = `msg_${NodeCrypto.randomUUID().replaceAll("-", "")}`;
       // A send while a turn runs is a steer: OpenCode injects it into the running
       // execution, and the message continues the same T3 turn.
@@ -1346,7 +1678,6 @@ export const openCodeNativeSessionEngineCreate = (input: {
         lastTurnID = id;
       }
       const turnID = steering?.scope.turnID ?? id;
-      const controller = abort;
       let receipt: unknown;
       try {
         receipt = await requestWithDeadline(controller.signal, (signal) =>
@@ -1355,7 +1686,9 @@ export const openCodeNativeSessionEngineCreate = (input: {
               sessionID: currentSession.id,
               id,
               text,
-              ...(steering ? { delivery: "steer" as const } : {}),
+              ...attachments,
+              ...(skills ? { skills } : {}),
+              ...(steering && !attachments.delivery ? { delivery: "steer" as const } : {}),
             },
             { signal },
           ),
@@ -1541,10 +1874,17 @@ export const openCodeNativeSessionEngineCreate = (input: {
         }
       }
       abort.abort();
+      admissionWake?.();
+      admissionWake = undefined;
+      admissionSequences.clear();
       abort = undefined;
       connected = false;
       active = undefined;
+      commandWork = undefined;
+      dispatchedEvents.clear();
       lastTurnID = undefined;
+      nativeSequence = -1;
+      turnSequenceFloor = 0;
       permissions.clear();
       forms.clear();
       settledRequests.clear();

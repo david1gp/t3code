@@ -204,6 +204,34 @@ export const mergeProviderSnapshot = (
     return nextProvider;
   }
   const savedAccount = carrySavedAntigravityAccount(previousProvider, nextProvider);
+  const previousCommands = new Set(previousProvider.slashCommands.map((command) => command.name));
+  const previousSkills = new Set(
+    previousProvider.skills.map((skill) => `${skill.name}\0${skill.path}`),
+  );
+  const hasOpenCodeResources =
+    nextProvider.driver === ProviderDriverKind.make("opencode") &&
+    nextProvider.installed &&
+    nextProvider.status !== "error" &&
+    (nextProvider.skills.length > 0 ||
+      nextProvider.slashCommands.some((command) => command.name !== "compact"));
+  const gainedOpenCodeResources =
+    hasOpenCodeResources &&
+    (nextProvider.slashCommands.some(
+      (command) => command.name !== "compact" && !previousCommands.has(command.name),
+    ) ||
+      nextProvider.skills.some((skill) => !previousSkills.has(`${skill.name}\0${skill.path}`)));
+  // A full base probe makes older empty/compact-only cwd discovery retryable,
+  // even when the base already knew these resources. New resources invalidate
+  // other older cwd catalogs too; unchanged populated catalogs stay cached.
+  const workspaceSnapshots = hasOpenCodeResources
+    ? previousProvider.workspaceSnapshots?.filter(
+        (snapshot) =>
+          snapshot.checkedAt >= nextProvider.checkedAt ||
+          (!gainedOpenCodeResources &&
+            (snapshot.skills.length > 0 ||
+              snapshot.slashCommands.some((command) => command.name !== "compact"))),
+      )
+    : previousProvider.workspaceSnapshots;
   // "Google account access is not checked yet" describes the probe, not the
   // account; it must not outlive the state it explained.
   const { message: _uncheckedMessage, ...nextWithoutMessage } = nextProvider;
@@ -213,8 +241,8 @@ export const mergeProviderSnapshot = (
     models: mergeProviderModels(nextProvider, previousProvider.models, nextProvider.models),
     ...(nextProvider.workspaceSnapshots !== undefined
       ? { workspaceSnapshots: nextProvider.workspaceSnapshots }
-      : previousProvider.workspaceSnapshots !== undefined
-        ? { workspaceSnapshots: previousProvider.workspaceSnapshots }
+      : workspaceSnapshots !== undefined
+        ? { workspaceSnapshots }
         : {}),
     ...(shouldRetainMissingOpenCodeMetadata(nextProvider)
       ? {
