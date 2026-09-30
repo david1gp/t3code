@@ -3211,6 +3211,147 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
     }),
   );
 
+  it.effect("checks whether existing task lifecycle activities are suppressed", () =>
+    Effect.gen(function* () {
+      yield* seedFanOutThread();
+      const query = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`DELETE FROM projection_thread_activities`;
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        ) VALUES
+          ('task-first-complete', 'thread-w', 'turn-5', 'info', 'task.completed', 'Task done', '{"taskId":"same-task","taskType":"subagent"}', 498, '2026-03-01T00:00:02Z'),
+          ('task-replay-start', 'thread-w', NULL, 'info', 'task.started', 'Replay task', '{"taskId":"same-task","taskType":"subagent"}', 500, '2026-03-01T00:00:09Z'),
+          ('task-replay-complete', 'thread-w', NULL, 'info', 'task.completed', 'Replay task done', '{"taskId":"same-task","taskType":"subagent"}', 501, '2026-03-01T00:00:10Z'),
+          ('task-legitimate', 'thread-w', 'turn-6', 'info', 'task.started', 'New task', '{"taskId":"new-task","taskType":"subagent"}', 502, '2026-03-01T00:00:11Z'),
+          ('task-numeric-complete', 'thread-w', 'turn-5', 'info', 'task.completed', 'Malformed task id', '{"taskId":123,"taskType":"subagent"}', 503, '2026-03-01T00:00:12Z'),
+          ('task-numeric-replay', 'thread-w', NULL, 'info', 'task.started', 'Malformed replay task', '{"taskId":123,"taskType":"subagent"}', 504, '2026-03-01T00:00:13Z'),
+          ('task-empty-complete', 'thread-w', 'turn-5', 'info', 'task.completed', 'Empty task id', '{"taskId":"","taskType":"subagent"}', 505, '2026-03-01T00:00:14Z'),
+          ('task-empty-replay', 'thread-w', NULL, 'info', 'task.started', 'Empty replay task', '{"taskId":"","taskType":"subagent"}', 506, '2026-03-01T00:00:15Z')
+      `;
+
+      assert.equal(
+        yield* query.isSuppressedTaskLifecycleActivity({
+          threadId: threadW,
+          activityId: asEventId("task-replay-start"),
+        }),
+        true,
+      );
+      assert.equal(
+        yield* query.isSuppressedTaskLifecycleActivity({
+          threadId: threadW,
+          activityId: asEventId("task-replay-complete"),
+        }),
+        true,
+      );
+      assert.equal(
+        yield* query.isSuppressedTaskLifecycleActivity({
+          threadId: threadW,
+          activityId: asEventId("task-legitimate"),
+        }),
+        false,
+      );
+      assert.equal(
+        yield* query.isSuppressedTaskLifecycleActivity({
+          threadId: threadW,
+          activityId: asEventId("task-numeric-replay"),
+        }),
+        false,
+      );
+      assert.equal(
+        yield* query.isSuppressedTaskLifecycleActivity({
+          threadId: threadW,
+          activityId: asEventId("task-empty-replay"),
+        }),
+        false,
+      );
+      assert.equal(
+        yield* query.isSuppressedTaskLifecycleActivity({
+          threadId: threadW,
+          activityId: asEventId("missing-activity"),
+        }),
+        false,
+      );
+    }),
+  );
+
+  it.effect("filters turnless subagent replay before the detail activity cap", () =>
+    Effect.gen(function* () {
+      yield* seedFanOutThread();
+      const query = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`DELETE FROM projection_thread_activities`;
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        ) VALUES
+          ('task-first-start', 'thread-w', 'turn-5', 'info', 'task.started', 'First task', '{"taskId":"same-task","taskType":"subagent"}', 497, '2026-03-01T00:00:01Z'),
+          ('task-first-complete', 'thread-w', 'turn-5', 'info', 'task.completed', 'First task done', '{"taskId":"same-task","taskType":"subagent"}', 498, '2026-03-01T00:00:02Z'),
+          ('task-replay-start', 'thread-w', NULL, 'info', 'task.started', 'Replay task', '{"taskId":"same-task","taskType":"subagent"}', 500, '2026-03-01T00:00:09Z'),
+          ('task-replay-complete', 'thread-w', NULL, 'info', 'task.completed', 'Replay task done', '{"taskId":"same-task","taskType":"subagent"}', 501, '2026-03-01T00:00:10Z'),
+          ('task-progress', 'thread-w', 'turn-5', 'info', 'task.progress', 'Still useful', '{"taskId":"same-task"}', 502, '2026-03-01T00:00:11Z'),
+          ('other-task-start', 'thread-w', 'turn-5', 'info', 'task.started', 'Other task', '{"taskId":"other-task"}', 503, '2026-03-01T00:00:12Z')
+      `;
+      yield* sql`
+        WITH RECURSIVE filler(sequence) AS (
+          SELECT 1 UNION ALL SELECT sequence + 1 FROM filler WHERE sequence < 496
+        )
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        )
+        SELECT printf('filler-%03d', sequence), 'thread-w', 'turn-5', 'info', 'context-window.updated',
+          'Filler', '{}', sequence, '2026-03-01T00:00:03Z' FROM filler
+      `;
+
+      const detail = yield* query.getThreadDetailById(threadW);
+      assert.equal(detail._tag, "Some");
+      if (detail._tag !== "Some") return;
+      assert.equal(detail.value.activities.length, 500);
+      const activityIds = detail.value.activities.map((activity) => activity.id);
+      assert.equal(activityIds[0], asEventId("filler-001"));
+      assert.equal(activityIds[1], asEventId("filler-002"));
+      assert.equal(activityIds.at(-2), asEventId("task-progress"));
+      assert.equal(activityIds.at(-1), asEventId("other-task-start"));
+      assert.equal(activityIds.includes(asEventId("task-replay-start")), false);
+      assert.equal(activityIds.includes(asEventId("task-replay-complete")), false);
+      assert.equal(activityIds.includes(asEventId("task-progress")), true);
+      assert.equal(activityIds.includes(asEventId("other-task-start")), true);
+      assert.equal(activityIds.includes(asEventId("task-first-start")), true);
+      assert.equal(activityIds.includes(asEventId("task-first-complete")), true);
+      // Without replay filtering these earliest useful rows fall outside the
+      // 500-row cap, even though they fit when the replay rows are excluded.
+      assert.equal(activityIds.includes(asEventId("filler-001")), true);
+      assert.equal(activityIds.includes(asEventId("filler-003")), true);
+
+      // The same provider task id can be reused in a later turn. Turn-scoped
+      // lifecycles are not replay rows and must remain visible.
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        ) VALUES
+          ('task-reused-start', 'thread-w', 'turn-6', 'info', 'task.started', 'Reused task', '{"taskId":"same-task","taskType":"subagent"}', 504, '2026-03-01T00:00:13Z'),
+          ('task-reused-complete', 'thread-w', 'turn-6', 'info', 'task.completed', 'Reused task done', '{"taskId":"same-task","taskType":"subagent"}', 505, '2026-03-01T00:00:14Z')
+      `;
+      const reusedTurnDetail = yield* query.getThreadDetailById(threadW);
+      assert.equal(reusedTurnDetail._tag, "Some");
+      if (reusedTurnDetail._tag === "Some") {
+        const reusedIds = reusedTurnDetail.value.activities.map((activity) => activity.id);
+        assert.equal(reusedIds.includes(asEventId("task-reused-start")), true);
+        assert.equal(reusedIds.includes(asEventId("task-reused-complete")), true);
+      }
+
+      const snapshot = yield* query.getThreadDetailSnapshot(threadW, { turnLimit: 2 });
+      assert.equal(snapshot._tag, "Some");
+      if (snapshot._tag === "Some") {
+        const ids = snapshot.value.thread.activities.map((activity) => activity.id);
+        assert.equal(ids.includes(asEventId("task-replay-start")), false);
+        assert.equal(ids.includes(asEventId("task-replay-complete")), false);
+        assert.equal(ids.includes(asEventId("task-progress")), true);
+      }
+    }),
+  );
+
   it.effect("a thread with no turns returns its content unwindowed on the first page", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;

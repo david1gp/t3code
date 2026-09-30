@@ -10,6 +10,7 @@ import type {
   AgentSessionImportSource,
   ApprovalRequestId,
   CheckpointRef,
+  EventId,
   MessageId,
   OrchestrationCheckpointSummary,
   OrchestrationMessage,
@@ -77,6 +78,12 @@ export interface ProjectionThreadDetailQuery {
  * ProjectionSnapshotQueryShape - Service API for read-model snapshots.
  */
 export interface ProjectionSnapshotQueryShape {
+  /** Check whether an existing activity is excluded by the task-lifecycle replay filter. */
+  readonly isSuppressedTaskLifecycleActivity: (input: {
+    readonly threadId: ThreadId;
+    readonly activityId: EventId;
+  }) => Effect.Effect<boolean, ProjectionRepositoryError>;
+
   /** Read the latest request or resolution without loading the thread history. */
   readonly getUserInputActivity: (input: {
     readonly threadId: ThreadId;

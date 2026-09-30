@@ -9605,6 +9605,195 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("subscribeThread suppresses persisted replayed subagent lifecycle activities", () =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore;
+      const thread = makeDefaultOrchestrationReadModel().threads[0]!;
+      const appendTaskActivity = (
+        id: string,
+        kind: "task.started" | "task.completed",
+        turnId: TurnId | null,
+        taskId: string,
+      ) =>
+        store.append({
+          eventId: EventId.make(`event-${id}`),
+          aggregateKind: "thread",
+          aggregateId: defaultThreadId,
+          occurredAt: "2026-01-01T00:00:01.000Z",
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          type: "thread.activity-appended",
+          payload: {
+            threadId: defaultThreadId,
+            activity: {
+              id: EventId.make(id),
+              tone: "info",
+              kind,
+              summary: id,
+              payload: {
+                itemType: "task",
+                taskId,
+                taskType: "subagent",
+                ...(kind === "task.completed" ? { status: "completed" } : {}),
+              },
+              turnId,
+              createdAt: "2026-01-01T00:00:01.000Z",
+            },
+          },
+        });
+
+      // The turn-scoped completion must be durable before replayed turnless activity arrives.
+      const completed = yield* appendTaskActivity(
+        "original-subagent-completed",
+        "task.completed",
+        TurnId.make("turn-original"),
+        "reused-subagent",
+      );
+      const replayStart = yield* appendTaskActivity(
+        "replayed-subagent-start",
+        "task.started",
+        null,
+        "reused-subagent",
+      );
+      const replayCompletion = yield* appendTaskActivity(
+        "replayed-subagent-completion",
+        "task.completed",
+        null,
+        "reused-subagent",
+      );
+      const otherTask = yield* appendTaskActivity(
+        "unrelated-turnless-subagent",
+        "task.started",
+        null,
+        "different-subagent",
+      );
+      const liveEvents = yield* PubSub.unbounded<OrchestrationEvent>();
+
+      const isSuppressedTaskLifecycleActivity = ({ activityId }: { activityId: string }) =>
+        store
+          .readAggregateRange({
+            aggregateKind: "thread",
+            aggregateId: defaultThreadId,
+            fromSequenceExclusive: 0,
+            toSequenceInclusive: otherTask.sequence,
+          })
+          .pipe(
+            Stream.runCollect,
+            Effect.map((events) => {
+              const target = events.find(
+                (event) =>
+                  event.type === "thread.activity-appended" &&
+                  event.payload.activity.id === activityId,
+              );
+              if (target?.type !== "thread.activity-appended") return false;
+              const getTaskId = (event: typeof target) => {
+                if (event.type !== "thread.activity-appended") return undefined;
+                const payload = event.payload.activity.payload;
+                return typeof payload === "object" && payload !== null && "taskId" in payload
+                  ? payload.taskId
+                  : undefined;
+              };
+              const taskId = getTaskId(target);
+              return events.some(
+                (event) =>
+                  event.type === "thread.activity-appended" &&
+                  event.sequence < target.sequence &&
+                  event.payload.activity.kind === "task.completed" &&
+                  event.payload.activity.turnId !== null &&
+                  getTaskId(event) === taskId,
+              );
+            }),
+          );
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            latestSequence: Effect.succeed(otherTask.sequence),
+            streamDomainEvents: Stream.fromPubSub(liveEvents),
+            getThreadReplayStats: () =>
+              Effect.succeed({ eventCount: 4, payloadBytes: 1_000, hasCreateEvent: false }),
+            readThreadEvents: ({ fromSequenceExclusive, toSequenceInclusive }) =>
+              store.readAggregateRange({
+                aggregateKind: "thread",
+                aggregateId: defaultThreadId,
+                fromSequenceExclusive,
+                toSequenceInclusive,
+              }),
+          },
+          projectionSnapshotQuery: {
+            getThreadDetailSnapshot: () =>
+              Effect.gen(function* () {
+                yield* PubSub.publishAll(liveEvents, [replayStart, replayCompletion, otherTask]);
+                return Option.some({ snapshotSequence: completed.sequence, thread });
+              }),
+            isSuppressedTaskLifecycleActivity,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const liveItems = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            requestCompletionMarker: true,
+          }).pipe(
+            Stream.takeUntil((item) => item.kind === "synchronized"),
+            Stream.runCollect,
+          ),
+        ),
+      );
+      assert.deepEqual(
+        liveItems.flatMap((item) =>
+          item.kind === "event" && item.event.type === "thread.activity-appended"
+            ? [item.event.payload.activity.id]
+            : [],
+        ),
+        [EventId.make("unrelated-turnless-subagent")],
+      );
+
+      for (const afterSequence of [0, completed.sequence]) {
+        const items = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId: defaultThreadId,
+              afterSequence,
+              requestCompletionMarker: true,
+            }).pipe(
+              Stream.takeUntil((item) => item.kind === "synchronized"),
+              Stream.runCollect,
+            ),
+          ),
+        );
+        const activities = items.flatMap((item) =>
+          item.kind === "event" && item.event.type === "thread.activity-appended"
+            ? [item.event.payload.activity.id]
+            : [],
+        );
+        assert.deepEqual(
+          activities,
+          afterSequence === 0
+            ? [
+                EventId.make("original-subagent-completed"),
+                EventId.make("unrelated-turnless-subagent"),
+              ]
+            : [EventId.make("unrelated-turnless-subagent")],
+        );
+        assert.deepEqual(items.at(-1), { kind: "synchronized" });
+      }
+      assert.notEqual(replayStart.sequence, replayCompletion.sequence);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          OrchestrationEventStoreLive.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
+          NodeHttpServer.layerTest,
+        ),
+      ),
+    ),
+  );
+
   it.effect("subscribeThread resets cached history when its ID is created again", () =>
     Effect.gen(function* () {
       const thread = {

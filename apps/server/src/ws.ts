@@ -362,6 +362,31 @@ export function isThreadDetailEvent(event: OrchestrationEvent): event is Extract
   );
 }
 
+function isSuppressedTaskLifecycleCandidate(
+  event: OrchestrationEvent,
+): event is Extract<OrchestrationEvent, { type: "thread.activity-appended" }> {
+  if (event.type !== "thread.activity-appended") {
+    return false;
+  }
+  const { activity } = event.payload;
+  const payload = activity.payload;
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("taskId" in payload) ||
+    !("taskType" in payload)
+  ) {
+    return false;
+  }
+  return (
+    activity.turnId === null &&
+    (activity.kind === "task.started" || activity.kind === "task.completed") &&
+    typeof payload.taskId === "string" &&
+    payload.taskId.length > 0 &&
+    payload.taskType === "subagent"
+  );
+}
+
 const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 
 // When a resuming client's cursor is more than this many events behind the
@@ -614,6 +639,24 @@ const makeWsRpcLayer = (
         }
         return true;
       });
+      const shouldDeliverThreadActivityEvent = (event: OrchestrationEvent) =>
+        isSuppressedTaskLifecycleCandidate(event)
+          ? projectionSnapshotQuery
+              .isSuppressedTaskLifecycleActivity({
+                threadId: event.payload.threadId,
+                activityId: event.payload.activity.id,
+              })
+              .pipe(
+                Effect.map((isSuppressed) => !isSuppressed),
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationGetSnapshotError({
+                      message: `Failed to check task lifecycle activity ${event.payload.activity.id}`,
+                      cause,
+                    }),
+                ),
+              )
+          : Effect.succeed(true);
       const projectSetupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
       const worktreeSetupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
       const projectCloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
@@ -2196,6 +2239,7 @@ const makeWsRpcLayer = (
 
               const liveStream = orchestrationEngine.streamDomainEvents.pipe(
                 Stream.filter(isThisThreadDetailEvent),
+                Stream.filterEffect((event) => shouldDeliverThreadActivityEvent(event)),
                 Stream.map((event) => ({
                   kind: "event" as const,
                   event: projectActivityEvent(event, input.reasoningMessages === true),
@@ -2266,6 +2310,7 @@ const makeWsRpcLayer = (
                     .readThreadEvents({ ...range, limit: THREAD_RESUME_MAX_EVENTS })
                     .pipe(
                       Stream.filter(isThisThreadDetailEvent),
+                      Stream.filterEffect((event) => shouldDeliverThreadActivityEvent(event)),
                       Stream.map((event) => ({
                         kind: "event" as const,
                         event: projectActivityEvent(event, input.reasoningMessages === true),

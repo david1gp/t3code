@@ -3,6 +3,7 @@ import {
   ApprovalRequestId,
   ChatAttachment,
   OrchestrationMessageContext,
+  EventId,
   CheckpointRef,
   IsoDateTime,
   MessageId,
@@ -230,6 +231,13 @@ const ThreadActivityKindsLookupInput = Schema.Struct({
 });
 const ThreadActivityIdsLookupInput = Schema.Struct({
   activityIds: Schema.Array(ProjectionThreadActivity.fields.activityId),
+});
+const ThreadActivityLookupInput = Schema.Struct({
+  threadId: ThreadId,
+  activityId: EventId,
+});
+const SuppressedTaskLifecycleActivityRowSchema = Schema.Struct({
+  isSuppressed: Schema.Number,
 });
 // Windowed reads order turns by the stable keyset (anchor, turn key), where
 // anchor is requested_at and turn key is
@@ -505,6 +513,36 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
   const threadBackgroundLiveness = yield* ThreadBackgroundLivenessService;
   const threadPlanProgress = yield* ThreadPlanProgressService;
   const sql = yield* SqlClient.SqlClient;
+  // Compare lifecycle rows in their detail display order. Filtering here,
+  // before LIMIT, prevents replay noise from displacing useful activities.
+  const nonReplayTaskLifecycle = (alias: "activity" | "a") => sql`NOT (
+    ${alias === "activity" ? sql`activity.kind` : sql`a.kind`} IN ('task.started', 'task.completed')
+    AND ${alias === "activity" ? sql`activity.turn_id` : sql`a.turn_id`} IS NULL
+    AND json_type(${alias === "activity" ? sql`activity.payload_json` : sql`a.payload_json`}, '$.taskId') = 'text'
+    AND json_extract(${alias === "activity" ? sql`activity.payload_json` : sql`a.payload_json`}, '$.taskId') != ''
+    AND json_extract(${alias === "activity" ? sql`activity.payload_json` : sql`a.payload_json`}, '$.taskType') = 'subagent'
+    AND EXISTS (
+      SELECT 1
+      FROM projection_thread_activities AS earlier
+      WHERE earlier.thread_id = ${alias === "activity" ? sql`activity.thread_id` : sql`a.thread_id`}
+        AND earlier.kind = 'task.completed'
+        AND earlier.turn_id IS NOT NULL
+        AND json_extract(earlier.payload_json, '$.taskType') = 'subagent'
+        AND json_type(earlier.payload_json, '$.taskId') = 'text'
+        AND json_extract(earlier.payload_json, '$.taskId') != ''
+        AND json_extract(earlier.payload_json, '$.taskId') = json_extract(${alias === "activity" ? sql`activity.payload_json` : sql`a.payload_json`}, '$.taskId')
+        AND (
+          earlier.sequence < ${alias === "activity" ? sql`activity.sequence` : sql`a.sequence`}
+          OR (earlier.sequence IS NULL AND ${alias === "activity" ? sql`activity.sequence` : sql`a.sequence`} IS NOT NULL)
+          OR (
+            earlier.sequence IS ${alias === "activity" ? sql`activity.sequence` : sql`a.sequence`}
+            AND (earlier.created_at < ${alias === "activity" ? sql`activity.created_at` : sql`a.created_at`}
+              OR (earlier.created_at = ${alias === "activity" ? sql`activity.created_at` : sql`a.created_at`}
+                AND earlier.activity_id < ${alias === "activity" ? sql`activity.activity_id` : sql`a.activity_id`}))
+          )
+        )
+    )
+  )`;
   const repositoryIdentityResolver = yield* RepositoryIdentityResolver.RepositoryIdentityResolver;
   const repositoryIdentityResolutionConcurrency = 4;
   const resolveRepositoryIdentitiesForProjects = Effect.fn(
@@ -1464,8 +1502,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             payload_json,
             sequence,
             created_at
-          FROM projection_thread_activities
+          FROM projection_thread_activities AS activity
           WHERE thread_id = ${threadId}
+            AND ${nonReplayTaskLifecycle("activity")}
           ORDER BY
             sequence DESC,
             created_at DESC,
@@ -1513,6 +1552,30 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       ),
     );
 
+  const getSuppressedTaskLifecycleActivityRow = SqlSchema.findOneOption({
+    Request: ThreadActivityLookupInput,
+    Result: SuppressedTaskLifecycleActivityRowSchema,
+    execute: ({ threadId, activityId }) => sql`
+      SELECT CASE WHEN ${nonReplayTaskLifecycle("activity")} THEN 0 ELSE 1 END AS "isSuppressed"
+      FROM projection_thread_activities AS activity
+      WHERE activity.thread_id = ${threadId}
+        AND activity.activity_id = ${activityId}
+      LIMIT 1
+    `,
+  });
+
+  const isSuppressedTaskLifecycleActivity: ProjectionSnapshotQueryShape["isSuppressedTaskLifecycleActivity"] =
+    (input) =>
+      getSuppressedTaskLifecycleActivityRow(input).pipe(
+        Effect.map(Option.match({ onNone: () => false, onSome: (row) => row.isSuppressed === 1 })),
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionSnapshotQuery.isSuppressedTaskLifecycleActivity:query",
+            "ProjectionSnapshotQuery.isSuppressedTaskLifecycleActivity:decodeRow",
+          ),
+        ),
+      );
+
   const listActivityRowsByKind = SqlSchema.findAll({
     Request: Schema.Struct({ kind: Schema.String }),
     Result: ProjectionThreadActivityDbRowSchema,
@@ -1553,8 +1616,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     execute: ({ threadId }) =>
       sql`
         SELECT activity_id AS "activityId"
-        FROM projection_thread_activities
+        FROM projection_thread_activities AS a
         WHERE thread_id = ${threadId}
+          AND ${nonReplayTaskLifecycle("a")}
         ORDER BY
           sequence DESC,
           created_at DESC,
@@ -1578,10 +1642,11 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           payload_json AS "payload",
           sequence,
           created_at AS "createdAt"
-        FROM projection_thread_activities
+        FROM projection_thread_activities AS a
         -- The selectors already scoped these globally unique ids to the
         -- thread inside this transaction. Keep this as a primary-key lookup.
-        WHERE ${sql.in("activity_id", activityIds)}
+        WHERE ${sql.in("a.activity_id", activityIds)}
+          AND ${nonReplayTaskLifecycle("a")}
       `,
   });
 
@@ -1611,9 +1676,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             payload_json,
             sequence,
             created_at
-          FROM projection_thread_activities
+          FROM projection_thread_activities AS activity
           WHERE thread_id = ${threadId}
             AND ${sql.in("kind", activityKinds)}
+            AND ${nonReplayTaskLifecycle("activity")}
           ORDER BY
             sequence DESC,
             created_at DESC,
@@ -1966,8 +2032,9 @@ pending_approval_requests AS (
             payload_json,
             sequence,
             created_at
-          FROM projection_thread_activities
+          FROM projection_thread_activities AS activity
           WHERE thread_id = ${threadId}
+            AND ${nonReplayTaskLifecycle("activity")}
             AND (
               turn_id IN (
                 SELECT turn_id FROM projection_turns
@@ -2013,8 +2080,9 @@ pending_approval_requests AS (
     execute: ({ threadId, minAnchorAt, minTurnKey, beforeAnchorAt, beforeTurnKey }) =>
       sql`
         SELECT activity_id AS "activityId"
-        FROM projection_thread_activities
+          FROM projection_thread_activities AS activity
         WHERE thread_id = ${threadId}
+          AND ${nonReplayTaskLifecycle("activity")}
           AND (
             turn_id IN (
               SELECT turn_id FROM projection_turns
@@ -3825,6 +3893,7 @@ pending_approval_requests AS (
   return {
     getCommandReadModel,
     getUserInputActivity,
+    isSuppressedTaskLifecycleActivity,
     listActivitiesByKind,
     getSnapshot,
     getShellSnapshot,
