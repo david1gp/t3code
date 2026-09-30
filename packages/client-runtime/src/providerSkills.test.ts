@@ -170,19 +170,44 @@ describe("getProviderSlashCommandsForSlashMenu", () => {
     },
   ];
 
-  it("lets the skill alias win when a provider command has the same name", () => {
-    expect(
-      getProviderSlashCommandsForSlashMenu(commands, skills).map((command) => command.name),
-    ).toEqual(["compact"]);
-  });
+  const aliasDedupDrivers = [
+    undefined,
+    ...["codex", "claudeAgent", "cursor", "grok", "antigravity", "custom-driver"].map((kind) =>
+      ProviderDriverKind.make(kind),
+    ),
+  ];
+  const nativeDrivers = ["pi", "opencode"].map((kind) => ProviderDriverKind.make(kind));
 
-  it("keeps the provider command when the matching skill alias is hidden", () => {
-    const visibleSkills = getProviderSkillsForSlashMenu(skills, false);
+  it.each(aliasDedupDrivers)(
+    "lets the skill alias win when a provider command has the same name (driver=%s)",
+    (driver) => {
+      expect(getProviderSlashCommandsForSlashMenu(commands, skills, driver)).toEqual([commands[1]]);
+    },
+  );
 
-    expect(
-      getProviderSlashCommandsForSlashMenu(commands, visibleSkills).map((command) => command.name),
-    ).toEqual(["ask-matt", "compact"]);
-  });
+  it.each(nativeDrivers)(
+    "keeps independently invokable commands with same-named visible skills (driver=%s)",
+    (driver) => {
+      const visibleSkills = getProviderSkillsForSlashMenu(skills, true);
+
+      expect(getProviderSlashCommandsForSlashMenu(commands, visibleSkills, driver)).toEqual(
+        commands,
+      );
+      expect(visibleSkills).toEqual(skills);
+    },
+  );
+
+  it.each([...aliasDedupDrivers, ...nativeDrivers])(
+    "keeps the provider command when the matching skill alias is hidden (driver=%s)",
+    (driver) => {
+      const visibleSkills = getProviderSkillsForSlashMenu(skills, false);
+
+      expect(visibleSkills).toEqual([]);
+      expect(getProviderSlashCommandsForSlashMenu(commands, visibleSkills, driver)).toEqual(
+        commands,
+      );
+    },
+  );
 });
 
 describe("resolveProviderSkillSourceKind", () => {

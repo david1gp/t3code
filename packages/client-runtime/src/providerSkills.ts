@@ -1,4 +1,5 @@
 import type {
+  ProviderDriverKind,
   ServerProvider,
   ServerProviderSkill,
   ServerProviderSlashCommand,
@@ -68,7 +69,12 @@ export function getProviderSkillsForSlashMenu(
 export function getProviderSlashCommandsForSlashMenu(
   slashCommands: ReadonlyArray<ServerProviderSlashCommand>,
   visibleSkills: ReadonlyArray<ServerProviderSkill>,
+  providerDriverKind?: ProviderDriverKind,
 ): ServerProviderSlashCommand[] {
+  // Native commands in these providers are independent of same-named skills.
+  if (providerDriverKind === "pi" || providerDriverKind === "opencode") {
+    return [...slashCommands];
+  }
   const skillNames = new Set(visibleSkills.map((skill) => skill.name.trim().toLowerCase()));
   return slashCommands.filter((command) => !skillNames.has(command.name.trim().toLowerCase()));
 }

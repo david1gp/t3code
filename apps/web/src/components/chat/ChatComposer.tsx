@@ -2353,6 +2353,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       const providerSlashCommandItems = getProviderSlashCommandsForSlashMenu(
         selectedProviderSlashCommands,
         slashMenuSkills,
+        selectedProvider,
       ).map((command) => ({
         id: `provider-slash-command:${selectedProvider}:${command.name}`,
         type: "provider-slash-command" as const,

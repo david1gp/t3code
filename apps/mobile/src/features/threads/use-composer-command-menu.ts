@@ -345,6 +345,7 @@ export function useComposerCommandMenu({
               slashCommands: getProviderSlashCommandsForSlashMenu(
                 resolveProviderSlashCommandsForCwd(selectedProviderStatus, projectCwd),
                 visibleSkills,
+                selectedProviderStatus.driver,
               ),
             }
           : null,
