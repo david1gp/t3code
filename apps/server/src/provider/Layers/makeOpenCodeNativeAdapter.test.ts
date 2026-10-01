@@ -1774,9 +1774,9 @@ it.effect(
     }).pipe(Effect.provide(testLayer)),
 );
 
-it.effect(
-  "exposes a lost active session without inventing a turn terminal or retrying its prompt",
-  () =>
+it.effect.each([undefined, "Transport: fixture event read failed"])(
+  "exposes a lost active session without inventing a turn terminal or retrying its prompt (detail: %s)",
+  (detail) =>
     Effect.gen(function* () {
       const fake = fakeEngine();
       const adapter = yield* makeOpenCodeNativeAdapter({
@@ -1808,11 +1808,25 @@ it.effect(
         turnID: turn.turnId,
         info: { title: "Unrelated task" },
       });
-      fake.emit({ type: "stream.lost", sessionID: "ses_other" });
-      fake.emit({ type: "stream.lost", sessionID: "ses_native" });
+      fake.emit({ type: "stream.lost", sessionID: "ses_other", detail: "Unrelated stream error." });
+      fake.emit({
+        type: "stream.lost",
+        sessionID: "ses_native",
+        ...(detail === undefined ? {} : { detail }),
+      });
+      fake.emit({ type: "stream.lost", sessionID: "ses_native", detail: "Later stream closure." });
       yield* Deferred.await(exited);
       yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
-      assert.equal((yield* adapter.listSessions())[0]?.status, "error");
+      const reason = detail
+        ? `Native event stream lost; turn outcome is uncertain. ${detail}`
+        : "Native event stream lost; turn outcome is uncertain.";
+      const lostSession = (yield* adapter.listSessions())[0];
+      assert.equal(lostSession?.status, "error");
+      assert.equal(lostSession?.lastError, reason);
+      assert.deepStrictEqual(
+        events.filter((event) => event.type === "session.exited").map((event) => event.payload),
+        [{ reason, recoverable: false, exitKind: "error" }],
+      );
       assert.equal(yield* adapter.hasSession(threadId), false);
       assert.deepStrictEqual(
         events.filter((event) => event.type === "turn.completed"),
@@ -1823,7 +1837,7 @@ it.effect(
           .filter((event) => event.type === "runtime.warning")
           .map((event) => event.type === "runtime.warning" && event.payload.message),
         [
-          "The outcome of related OpenCode child session ses_background is unknown because the parent session was lost: Native event stream lost; turn outcome is uncertain.",
+          `The outcome of related OpenCode child session ses_background is unknown because the parent session was lost: ${reason}`,
         ],
       );
       assert.deepStrictEqual(

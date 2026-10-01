@@ -501,7 +501,8 @@ export const makeOpenCodeNativeAdapter = (options: {
       if (event.type === "session.ready") return;
       if (event.type === "stream.lost") {
         if (event.sessionID !== ctx.sessionId) return;
-        markLost(ctx, "Native event stream lost; turn outcome is uncertain.");
+        const reason = "Native event stream lost; turn outcome is uncertain.";
+        markLost(ctx, event.detail ? `${reason} ${event.detail}` : reason);
         return;
       }
       if (ctx.lost) return;

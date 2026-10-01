@@ -339,7 +339,7 @@ type Event =
       readonly reason: "interrupted";
       readonly interruptionReason: Data<"session.execution.interrupted">["reason"];
     }
-  | { readonly type: "stream.lost"; readonly sessionID: string };
+  | { readonly type: "stream.lost"; readonly sessionID: string; readonly detail?: string };
 
 type Block = {
   readonly kind: "text" | "reasoning";
@@ -1043,7 +1043,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
       });
     }
   };
-  const lost = () => {
+  const lost = (detail: string) => {
     if (disconnected) return;
     disconnected = true;
     connected = false;
@@ -1051,12 +1051,13 @@ export const openCodeNativeSessionEngineCreate = (input: {
     admissionWake?.();
     idleNotify();
     if (session && abort && !abort.signal.aborted)
-      emit({ type: "stream.lost", sessionID: session.id });
+      emit({ type: "stream.lost", sessionID: session.id, detail });
   };
 
   const listen = (controller: AbortController, ready: (result: Result<void>) => void) => {
     const seen = new Set<string>();
     const pump = async () => {
+      let detail = "Native session event stream closed.";
       try {
         for await (const frame of client.event.subscribe({ signal: controller.signal })) {
           const message = frame;
@@ -1142,18 +1143,20 @@ export const openCodeNativeSessionEngineCreate = (input: {
             // A stalled HTTP response must not let the live feed grow an unbounded buffer.
             if (admissionEvents.length >= 4096) {
               uncertain = true;
-              lost();
+              detail =
+                "Native session event stream admission buffer exceeded its 4096-event capacity.";
+              lost(detail);
               break;
             }
             admissionEvents.push(message);
           } else if (!uncertain) dispatch(message);
         }
-      } catch {
-        ready(fail("event.subscribe", "Native session event stream failed."));
+      } catch (cause) {
+        detail = cause instanceof Error ? cause.message : "Native session event stream failed.";
       } finally {
         if (!controller.signal.aborted) {
-          ready(fail("event.subscribe", "Native session event stream closed."));
-          lost();
+          ready(fail("event.subscribe", detail));
+          lost(detail);
         }
       }
     };

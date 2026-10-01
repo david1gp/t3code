@@ -1537,7 +1537,94 @@ describe("native v2.0.18 session slice", () => {
       expect(test.events.filter((event) => event.type === "turn.started")).toEqual([
         { type: "turn.started", turnID },
       ]);
-      expect(test.events.filter((event) => event.type === "stream.lost")).toHaveLength(1);
+      expect(test.events.filter((event) => event.type === "stream.lost")).toEqual([
+        {
+          type: "stream.lost",
+          sessionID: session.id,
+          detail: "Native session event stream closed.",
+        },
+      ]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("emits a connected fetch stream rejection once with its cause, without fabricated terminals or retry", async () => {
+    let rejectStream!: (cause: unknown) => void;
+    let eventRequests = 0;
+    const fetchImpl: typeof fetch = async (request, init) => {
+      const response = await fetch(request, init);
+      const path = new URL(request instanceof Request ? request.url : String(request)).pathname;
+      if (path !== "/api/event") return response;
+      eventRequests++;
+      const stream = new TransformStream<Uint8Array, Uint8Array>({
+        start(controller) {
+          rejectStream = (cause) => controller.error(cause);
+        },
+      });
+      return new Response(response.body!.pipeThrough(stream), {
+        status: response.status,
+        headers: response.headers,
+      });
+    };
+    const test = await sessionFixture(fetchImpl);
+    try {
+      await test.admit();
+      test.write("session.execution.started");
+      test.write("session.step.started", stepStart("msg_stream_failure"));
+      test.write("session.text.started", { assistantMessageID: "msg_stream_failure", ordinal: 0 });
+      test.write("session.tool.input.started", {
+        assistantMessageID: "msg_stream_failure",
+        id: "tool_unfinished",
+        name: "bash",
+      });
+      await test.drain();
+      rejectStream(new Error("fixture event read failed"));
+      await test.wait((event) => event.type === "stream.lost");
+      expect((await test.engine.send("never retry")).success).toBe(false);
+      await test.engine.stop();
+      expect(test.events.filter((event) => event.type === "stream.lost")).toEqual([
+        {
+          type: "stream.lost",
+          sessionID: session.id,
+          detail: "Transport: fixture event read failed",
+        },
+      ]);
+      expect(
+        test.events.filter(
+          (event) => event.type.endsWith(".completed") || event.type.endsWith(".failed"),
+        ),
+      ).toEqual([]);
+      expect(test.promptCount()).toBe(1);
+      expect(eventRequests).toBe(1);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("retains the 4096-event admission overflow cause instead of generic stream closure", async () => {
+    const test = await sessionFixture();
+    try {
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review overflow");
+      await command.requested;
+      for (let cost = 0; cost <= 4096; cost++) {
+        test.write("session.usage.updated", { ...usage, cost });
+      }
+      await test.wait((event) => event.type === "stream.lost");
+      command.release();
+      expect((await sending).success).toBe(false);
+      expect((await test.engine.send("never retry")).success).toBe(false);
+      expect(test.events.filter((event) => event.type === "stream.lost")).toEqual([
+        {
+          type: "stream.lost",
+          sessionID: session.id,
+          detail: "Native session event stream admission buffer exceeded its 4096-event capacity.",
+        },
+      ]);
+      expect(test.events.some((event) => event.type.startsWith("turn."))).toBe(false);
+      expect(test.commandBodies).toHaveLength(1);
+      expect(test.promptCount()).toBe(0);
     } finally {
       await test.close();
     }
