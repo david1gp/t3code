@@ -177,6 +177,35 @@ describe("ProviderRuntimeEvent", () => {
     expect(parsed.payload.questions[0]?.options).toHaveLength(2);
   });
 
+  it.each(["permission_approval", "tool_user_input"])(
+    "decodes honest request expiry for %s with or without a turn",
+    (requestType) => {
+      const event = {
+        type: "request.expired",
+        eventId: "event-request-expired",
+        provider: "opencode",
+        threadId: "thread-1",
+        requestId: "request-1",
+        createdAt: "2026-02-28T00:00:02.000Z",
+        payload: { requestType, reason: "Native pending requests are empty after recovery." },
+      };
+      expect(decodeRuntimeEvent(event)).toEqual(event);
+      expect(decodeRuntimeEvent({ ...event, turnId: "turn-1" })).toEqual({
+        ...event,
+        turnId: "turn-1",
+      });
+      const { requestId: _requestId, ...withoutRequestId } = event;
+      expect(() => decodeRuntimeEvent(withoutRequestId)).toThrow();
+      expect(() => decodeRuntimeEvent({ ...event, requestId: " " })).toThrow();
+      expect(() =>
+        decodeRuntimeEvent({ ...event, payload: { requestType, reason: " " } }),
+      ).toThrow();
+      expect(() =>
+        decodeRuntimeEvent({ ...event, payload: { requestType: "invalid", reason: "Expired" } }),
+      ).toThrow();
+    },
+  );
+
   it("decodes user-input.resolved with answer map", () => {
     const parsed = decodeRuntimeEvent({
       type: "user-input.resolved",

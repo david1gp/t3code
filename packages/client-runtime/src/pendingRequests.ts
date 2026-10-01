@@ -89,9 +89,11 @@ function parseQuestions(value: unknown): UserInputQuestion[] {
 const requestActivityKinds = new Set([
   "approval.requested",
   "approval.resolved",
+  "approval.expired",
   "provider.approval.respond.failed",
   "user-input.requested",
   "user-input.resolved",
+  "user-input.expired",
   "provider.user-input.respond.failed",
 ]);
 
@@ -172,6 +174,7 @@ export function derivePendingRequests(activities: ReadonlyArray<OrchestrationThr
       });
     } else if (
       activity.kind === "approval.resolved" ||
+      activity.kind === "approval.expired" ||
       (activity.kind === "provider.approval.respond.failed" &&
         isStaleRequestFailure(activity.kind, payload))
     ) {
@@ -179,6 +182,7 @@ export function derivePendingRequests(activities: ReadonlyArray<OrchestrationThr
       approvals.delete(requestId);
     } else if (
       activity.kind === "user-input.resolved" ||
+      activity.kind === "user-input.expired" ||
       (activity.kind === "provider.user-input.respond.failed" &&
         isStaleRequestFailure(activity.kind, payload))
     ) {

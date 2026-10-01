@@ -2098,7 +2098,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "provider.kind": routed.adapter.provider,
           "provider.thread_id": input.threadId,
         });
-        if (routed.isActive) {
+        const retainedNative =
+          !routed.isActive && routed.adapter.provider === "opencode"
+            ? (yield* routed.adapter.listSessions()).some(
+                (session) => session.threadId === routed.threadId && session.status === "error",
+              )
+            : false;
+        if (routed.isActive || retainedNative) {
           const session = (yield* routed.adapter.listSessions()).find(
             (session) => session.threadId === routed.threadId,
           );

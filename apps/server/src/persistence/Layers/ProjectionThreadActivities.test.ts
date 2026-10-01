@@ -13,6 +13,51 @@ const layer = it.layer(
 );
 
 layer("ProjectionThreadActivityRepository", (it) => {
+  it.effect("includes user-input expiration in lifecycle reads without unrelated payloads", () =>
+    Effect.gen(function* () {
+      const repository = yield* ProjectionThreadActivityRepository;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("thread-expiration-lifecycle");
+      const expired = {
+        activityId: EventId.make("input-expiration"),
+        threadId,
+        turnId: null,
+        tone: "info" as const,
+        kind: "user-input.expired",
+        summary: "User input expired; no answer submitted",
+        payload: { requestId: "input-1", requestType: "tool_user_input", reason: "Input absent" },
+        sequence: 1,
+        createdAt: "2026-03-01T00:00:00.000Z",
+      };
+      const requested = {
+        ...expired,
+        activityId: EventId.make("input-unrelated-request"),
+        kind: "user-input.requested",
+        payload: { requestId: "input-2", requestType: "tool_user_input", reason: "" },
+        sequence: 2,
+      };
+      yield* repository.upsert(expired);
+      yield* repository.upsert(requested);
+      yield* repository.upsert({
+        ...expired,
+        activityId: EventId.make("other-thread-expiry"),
+        threadId: ThreadId.make("other-thread"),
+      });
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        ) VALUES ('expiry-malformed-tool', ${threadId}, NULL, 'info', 'tool.completed', 'tool',
+          'not-json', 3, ${expired.createdAt}),
+          ('approval-expiration', ${threadId}, NULL, 'info', 'approval.expired', 'approval',
+          'not-json', 4, ${expired.createdAt})
+      `;
+      assert.deepEqual(yield* repository.listUserInputLifecycleByThreadId({ threadId }), [
+        expired,
+        requested,
+      ]);
+    }),
+  );
+
   it.effect("keeps a final usage cost when late provisional observations repeat", () =>
     Effect.gen(function* () {
       const repository = yield* ProjectionThreadActivityRepository;

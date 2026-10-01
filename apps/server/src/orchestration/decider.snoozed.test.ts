@@ -63,6 +63,78 @@ function makeReadModel(input: {
 }
 
 it.layer(NodeServices.layer)("snoozed thread decider", (it) => {
+  for (const requestType of ["approval", "user-input"] as const) {
+    for (const expiryFirst of [false, true]) {
+      it.effect(
+        `snooze honors ${requestType} expiry ${expiryFirst ? "before" : "after"} open without clearing unrelated work`,
+        () =>
+          Effect.gen(function* () {
+            const activity = (
+              kind: string,
+              requestId = "expired-request",
+            ): OrchestrationThread["activities"][number] => ({
+              id: EventId.make(`${kind}:${requestId}`),
+              kind,
+              tone: "info",
+              summary: kind,
+              payload: { requestId },
+              turnId: null,
+              createdAt: NOW,
+            });
+            const opened = activity(`${requestType}.requested`);
+            const expired = activity(`${requestType}.expired`);
+            const activities = expiryFirst ? [expired, opened] : [opened, expired];
+            const command = {
+              type: "thread.snooze" as const,
+              commandId: CommandId.make("expiry-snooze"),
+              threadId: ThreadId.make("thread-1"),
+              snoozedUntil: FUTURE_WAKE,
+            };
+            const result = yield* decideOrchestrationCommand({
+              command,
+              readModel: makeReadModel({ activities }),
+            });
+            const events = Array.isArray(result) ? result : [result];
+            expect(events.map((event) => event.type)).toEqual(["thread.snoozed"]);
+            for (const unrelatedType of ["approval", "user-input"]) {
+              const error = yield* decideOrchestrationCommand({
+                command,
+                readModel: makeReadModel({
+                  activities: [
+                    ...activities,
+                    activity(`${unrelatedType}.requested`, "unrelated-request"),
+                  ],
+                }),
+              }).pipe(Effect.flip);
+              expect(error._tag).toBe("OrchestrationCommandInvariantError");
+              if (error._tag === "OrchestrationCommandInvariantError")
+                expect(error.detail).toContain("pending approval or user-input request");
+            }
+            const error = yield* decideOrchestrationCommand({
+              command,
+              readModel: makeReadModel({
+                activities,
+                messages: [
+                  {
+                    id: MessageId.make("queued-after-expiry"),
+                    role: "user",
+                    text: "Continue",
+                    turnId: null,
+                    streaming: false,
+                    createdAt: "1969-12-31T23:59:30.000Z",
+                    updatedAt: "1969-12-31T23:59:30.000Z",
+                  },
+                ],
+              }),
+            }).pipe(Effect.flip);
+            expect(error._tag).toBe("OrchestrationCommandInvariantError");
+            if (error._tag === "OrchestrationCommandInvariantError")
+              expect(error.detail).toContain("queued turn start");
+          }),
+      );
+    }
+  }
+
   it.effect("snoozes a thread to a future wake time", () =>
     Effect.gen(function* () {
       const event = yield* decideOrchestrationCommand({

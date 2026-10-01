@@ -83,6 +83,70 @@ function makeSession(status: OrchestrationSession["status"]): OrchestrationSessi
 }
 
 it.layer(NodeServices.layer)("settled thread decider", (it) => {
+  for (const requestType of ["approval", "user-input"] as const) {
+    for (const expiryFirst of [false, true]) {
+      for (const automatic of [false, true]) {
+        it.effect(
+          `${automatic ? "automatic" : "manual"} settlement honors ${requestType} expiry ${expiryFirst ? "before" : "after"} open without clearing unrelated work`,
+          () =>
+            Effect.gen(function* () {
+              const activity = (
+                kind: string,
+                requestId = "expired-request",
+              ): OrchestrationThread["activities"][number] => ({
+                id: EventId.make(`${kind}:${requestId}`),
+                kind,
+                tone: "info",
+                summary: kind,
+                payload: { requestId },
+                turnId: null,
+                createdAt: NOW,
+              });
+              const opened = activity(`${requestType}.requested`);
+              const expired = activity(`${requestType}.expired`);
+              const activities = expiryFirst ? [expired, opened] : [opened, expired];
+              const command = automatic
+                ? {
+                    type: "thread.auto-settle" as const,
+                    commandId: CommandId.make("expiry-auto-settle"),
+                    threadId: ThreadId.make("thread-1"),
+                    snapshotSequence: 0,
+                    settledAt: SETTLED_AT,
+                  }
+                : {
+                    type: "thread.settle" as const,
+                    commandId: CommandId.make("expiry-settle"),
+                    threadId: ThreadId.make("thread-1"),
+                  };
+              const result = yield* decideOrchestrationCommand({
+                command,
+                readModel: makeReadModel(null, null, null, activities),
+              });
+              const events = Array.isArray(result) ? result : [result];
+              expect(events.map((event) => event.type)).toEqual(["thread.settled"]);
+              for (const unrelatedType of ["approval", "user-input"]) {
+                const error = yield* decideOrchestrationCommand({
+                  command,
+                  readModel: makeReadModel(null, null, null, [
+                    ...activities,
+                    activity(`${unrelatedType}.requested`, "unrelated-request"),
+                  ]),
+                }).pipe(Effect.flip);
+                expect(error._tag).toBe("OrchestrationThreadSettleBlockedError");
+              }
+              for (const status of ["starting", "running"] as const) {
+                const error = yield* decideOrchestrationCommand({
+                  command,
+                  readModel: makeReadModel(null, null, makeSession(status), activities),
+                }).pipe(Effect.flip);
+                expect(error._tag).toBe("OrchestrationThreadSettleBlockedError");
+              }
+            }),
+        );
+      }
+    }
+  }
+
   it.effect("preserves the activity stamp when automatically settling", () =>
     Effect.gen(function* () {
       const result = yield* decideOrchestrationCommand({

@@ -21,9 +21,18 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { derivePendingRequests } from "../../../../../packages/client-runtime/src/pendingRequests.ts";
+
+import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
+import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
+import { ServerConfig } from "../../config.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
-import { ORCHESTRATION_PROJECTOR_NAMES } from "./ProjectionPipeline.ts";
+import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
+import {
+  OrchestrationProjectionPipelineLive,
+  ORCHESTRATION_PROJECTOR_NAMES,
+} from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
 import * as ThreadBackgroundLiveness from "../ThreadBackgroundLiveness.ts";
 import * as ThreadPlanProgress from "../ThreadPlanProgress.ts";
@@ -3131,11 +3140,13 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
         const ids = new Set(
           detailWithPinnedRequests.value.activities.map((activity) => activity.id),
         );
-        assert.equal(detailWithPinnedRequests.value.activities.length, 503);
+        assert.equal(detailWithPinnedRequests.value.activities.length, 504);
         assert.equal(ids.has(asEventId("approval-old")), true);
         assert.equal(ids.has(asEventId("user-input-old")), true);
         assert.equal(ids.has(asEventId("user-input-closed")), false);
         assert.equal(ids.has(asEventId("user-input-tied-z-request")), true);
+        // Even tied ordinary resolutions must accompany a returned pinned open.
+        assert.equal(ids.has(asEventId("user-input-tied-a-resolution")), true);
       }
 
       const windowWithPinnedRequests = yield* snapshotQuery.getThreadDetailSnapshot(threadW, {
@@ -3146,11 +3157,13 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
         const ids = new Set(
           windowWithPinnedRequests.value.thread.activities.map((activity) => activity.id),
         );
-        assert.equal(windowWithPinnedRequests.value.thread.activities.length, 503);
+        assert.equal(windowWithPinnedRequests.value.thread.activities.length, 504);
         assert.equal(ids.has(asEventId("approval-old")), true);
         assert.equal(ids.has(asEventId("user-input-old")), true);
         assert.equal(ids.has(asEventId("user-input-closed")), false);
         assert.equal(ids.has(asEventId("user-input-tied-z-request")), true);
+        // Even tied ordinary resolutions must accompany a returned pinned open.
+        assert.equal(ids.has(asEventId("user-input-tied-a-resolution")), true);
       }
 
       const fullSnapshot = yield* snapshotQuery.getThreadDetailSnapshot(threadW);
@@ -3741,4 +3754,176 @@ projectionSnapshotLayer("ProjectionSnapshotQuery activities by kind", (it) => {
       assert.deepEqual(yield* query.listActivitiesByKind("nope"), []);
     }),
   );
+});
+
+it.layer(
+  OrchestrationProjectionSnapshotQueryLive.pipe(
+    Layer.provide(ThreadBackgroundLiveness.layer),
+    Layer.provide(ThreadPlanProgress.layer),
+    Layer.provide(RepositoryIdentityResolver.layer),
+    Layer.provideMerge(
+      OrchestrationProjectionPipelineLive.pipe(
+        Layer.provideMerge(OrchestrationEventStoreLive),
+        Layer.provideMerge(
+          ServerConfig.layerTest(process.cwd(), { prefix: "t3-snapshot-request-finality-" }),
+        ),
+        Layer.provideMerge(SqlitePersistenceMemory),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    ),
+  ),
+)("request finality pinning", (it) => {
+  for (const requestType of ["approval", "user-input"] as const) {
+    for (const terminal of ["expired", "resolved"] as const) {
+      it.effect(
+        `pins only matching ${requestType}.${terminal} finality before 501 fillers and a delayed recent open`,
+        () =>
+          Effect.gen(function* () {
+            const query = yield* ProjectionSnapshotQuery;
+            const pipeline = yield* OrchestrationProjectionPipeline;
+            const eventStore = yield* OrchestrationEventStore;
+            const sql = yield* SqlClient.SqlClient;
+            const threadId = ThreadId.make(`${requestType}-${terminal}-window`);
+            const now = "2026-03-01T00:00:00.000Z";
+            const later = "2026-03-01T00:00:10.000Z";
+            const fields = {
+              aggregateKind: "thread" as const,
+              aggregateId: threadId,
+              occurredAt: now,
+              commandId: null,
+              causationEventId: null,
+              correlationId: null,
+              metadata: {},
+            };
+            yield* pipeline.projectEvent(
+              yield* eventStore.append({
+                ...fields,
+                eventId: EventId.make(`${threadId}-created`),
+                type: "thread.created",
+                payload: {
+                  threadId,
+                  projectId: ProjectId.make("request-finality-project"),
+                  title: "Request finality",
+                  modelSelection: {
+                    instanceId: ProviderInstanceId.make("opencode"),
+                    model: "model",
+                  },
+                  runtimeMode: "approval-required",
+                  interactionMode: "default",
+                  branch: null,
+                  worktreePath: null,
+                  createdAt: now,
+                  updatedAt: now,
+                },
+              }),
+            );
+            const append = Effect.fnUntraced(function* (
+              kind: string,
+              requestId: string,
+              sequence: number,
+              createdAt: string,
+            ) {
+              yield* pipeline.projectEvent(
+                yield* eventStore.append({
+                  ...fields,
+                  eventId: EventId.make(`${threadId}-${sequence}-${requestId}-event`),
+                  type: "thread.activity-appended",
+                  payload: {
+                    threadId,
+                    activity: {
+                      id: EventId.make(`${threadId}-${sequence}-${requestId}`),
+                      kind,
+                      tone: "info",
+                      summary: kind,
+                      turnId: null,
+                      sequence,
+                      createdAt,
+                      payload: {
+                        requestId,
+                        requestType: kind.startsWith("user-input")
+                          ? "tool_user_input"
+                          : "permission_approval",
+                        questions: [
+                          {
+                            id: "choice",
+                            header: "Choice",
+                            question: "Which?",
+                            options: [{ label: "One", description: "First" }],
+                          },
+                        ],
+                        ...(kind.endsWith("expired")
+                          ? { reason: "Request no longer pending after recovery" }
+                          : {}),
+                      },
+                    },
+                  },
+                }),
+              );
+            });
+            yield* append(`${requestType}.${terminal}`, "closed-request", 1, later);
+            yield* sql`
+          WITH RECURSIVE filler(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM filler WHERE n < 501)
+          INSERT INTO projection_thread_activities (activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at)
+          SELECT ${threadId} || '-filler-' || n, ${threadId}, NULL, 'info', 'tool.completed', 'tool', '{}', 100 + n, ${later} FROM filler
+        `;
+            yield* sql`
+          WITH RECURSIVE old(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM old WHERE n < 30)
+          INSERT INTO projection_thread_activities (activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at)
+          SELECT ${threadId} || '-unrelated-finality-' || n, ${threadId}, NULL, 'info', ${`${requestType}.${terminal}`}, 'Old finality', json_object('requestId', 'unrelated-' || n), 0, ${now} FROM old
+        `;
+            // Resolved activities keep their existing timestamp-based SQL semantics:
+            // the delayed observation has an older provider timestamp but a newer sequence.
+            yield* append(
+              `${requestType}.requested`,
+              "closed-request",
+              1000,
+              terminal === "expired" ? later : now,
+            );
+            const assertDetails = Effect.fnUntraced(function* (pending: boolean) {
+              const shell = Option.getOrThrow(yield* query.getThreadShellById(threadId));
+              assert.equal(shell.hasPendingApprovals, pending);
+              assert.equal(shell.hasPendingUserInput, pending);
+              const raw = Option.getOrThrow(yield* query.getThreadDetailById(threadId));
+              const full = Option.getOrThrow(yield* query.getThreadDetailSnapshot(threadId)).thread;
+              const window = Option.getOrThrow(
+                yield* query.getThreadDetailSnapshot(threadId, { turnLimit: 2 }),
+              ).thread;
+              for (const detail of [raw, full, window]) {
+                const requests = derivePendingRequests(detail.activities);
+                assert.deepEqual(
+                  requests.approvals.map((request) => request.requestId),
+                  pending ? ["pending-approval"] : [],
+                );
+                assert.deepEqual(
+                  requests.userInputs.map((request) => request.requestId),
+                  pending ? ["pending-input"] : [],
+                );
+                assert.equal(
+                  detail.activities.filter((activity) => activity.kind === "tool.completed").length,
+                  499,
+                );
+                assert.equal(detail.activities.length, pending ? 503 : 501);
+                assert.deepEqual(
+                  detail.activities
+                    .filter((activity) => activity.kind.endsWith(terminal))
+                    .map((activity) => activity.id),
+                  [EventId.make(`${threadId}-1-closed-request`)],
+                );
+                assert.deepEqual(detail.activities[0]?.payload, { requestId: "closed-request" });
+                const keys = detail.activities.map((activity) => activity.sequence ?? -1);
+                assert.deepEqual(
+                  keys,
+                  keys.toSorted((left, right) => left - right),
+                );
+              }
+            });
+            yield* assertDetails(false);
+            // Old unrelated pending requests stay pinned alongside the matching tombstone.
+            yield* append("approval.requested", "pending-approval", 2, now);
+            yield* append("user-input.requested", "pending-input", 3, now);
+            yield* assertDetails(true);
+          }),
+      );
+    }
+  }
 });

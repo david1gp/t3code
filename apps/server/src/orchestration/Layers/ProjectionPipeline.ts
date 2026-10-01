@@ -148,9 +148,11 @@ function shouldRefreshThreadShellSummary(event: OrchestrationEvent): boolean {
   switch (event.payload.activity.kind) {
     case "approval.requested":
     case "approval.resolved":
+    case "approval.expired":
     case "provider.approval.respond.failed":
     case "user-input.requested":
     case "user-input.resolved":
+    case "user-input.expired":
     case "provider.user-input.respond.failed":
       return true;
     default:
@@ -162,6 +164,7 @@ function derivePendingUserInputCountFromActivities(
   activities: ReadonlyArray<ProjectionThreadActivity>,
 ): number {
   const openRequestIds = new Set<string>();
+  const closedRequestIds = new Set<string>();
   const ordered = [...activities].toSorted(
     (left, right) =>
       left.createdAt.localeCompare(right.createdAt) ||
@@ -180,11 +183,16 @@ function derivePendingUserInputCountFromActivities(
     const detail = typeof payload?.detail === "string" ? payload.detail.toLowerCase() : null;
 
     if (activity.kind === "user-input.requested") {
-      openRequestIds.add(requestId);
+      if (!closedRequestIds.has(requestId)) {
+        openRequestIds.add(requestId);
+      }
       continue;
     }
 
-    if (activity.kind === "user-input.resolved") {
+    if (activity.kind === "user-input.resolved" || activity.kind === "user-input.expired") {
+      if (activity.kind === "user-input.expired") {
+        closedRequestIds.add(requestId);
+      }
       openRequestIds.delete(requestId);
       continue;
     }
@@ -1778,7 +1786,9 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         case "thread.activity-appended": {
           const requestId =
             extractActivityRequestId(event.payload.activity.payload) ??
-            event.metadata.requestId ??
+            (event.payload.activity.kind === "approval.expired"
+              ? null
+              : event.metadata.requestId) ??
             null;
           if (requestId === null) {
             return;
@@ -1786,8 +1796,12 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           const existingRow = yield* projectionPendingApprovalRepository.getByRequestId({
             requestId,
           });
-          if (event.payload.activity.kind === "approval.resolved") {
+          if (
+            event.payload.activity.kind === "approval.resolved" ||
+            event.payload.activity.kind === "approval.expired"
+          ) {
             const resolvedDecisionRaw =
+              event.payload.activity.kind === "approval.resolved" &&
               typeof event.payload.activity.payload === "object" &&
               event.payload.activity.payload !== null &&
               "decision" in event.payload.activity.payload
@@ -1858,7 +1872,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               (activity) => activity.kind === "approval.requested",
             );
             const wasResolved = requestActivities.some((activity) => {
-              if (activity.kind === "approval.resolved") {
+              if (activity.kind === "approval.resolved" || activity.kind === "approval.expired") {
                 return true;
               }
               if (activity.kind !== "provider.approval.respond.failed") {

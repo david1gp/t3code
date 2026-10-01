@@ -591,6 +591,30 @@ export function runtimeEventToActivities(
       ];
     }
 
+    case "request.expired": {
+      if (event.payload.requestType === "auth_tokens_refresh") return [];
+      const isUserInput = event.payload.requestType === "tool_user_input";
+      const requestKind = requestKindFromCanonicalRequestType(event.payload.requestType);
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: "info",
+          kind: isUserInput ? "user-input.expired" : "approval.expired",
+          summary: "Request no longer pending after recovery",
+          payload: {
+            requestId: toApprovalRequestId(event.requestId),
+            ...(requestKind ? { requestKind } : {}),
+            requestType: event.payload.requestType,
+            reason: event.payload.reason,
+            detail: event.payload.reason,
+          },
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
     case "runtime.error": {
       return [
         {
@@ -2381,11 +2405,17 @@ const make = Effect.gen(function* () {
       if (isTerminalTurn) {
         const turnId = toTurnId(event.turnId);
         if (turnId) {
-          const userInputActivities =
-            yield* projectionThreadActivityRepository.listUserInputLifecycleByThreadId({
-              threadId: thread.id,
-            });
+          const userInputActivities = yield* projectionThreadActivityRepository.listByThreadId({
+            threadId: thread.id,
+            activityKinds: [
+              "user-input.requested",
+              "user-input.resolved",
+              "user-input.expired",
+              "provider.user-input.respond.failed",
+            ],
+          });
           const pendingRequestIds = new Set<string>();
+          const closedRequestIds = new Set<string>();
           for (const activity of userInputActivities) {
             const payload =
               typeof activity.payload === "object" && activity.payload !== null
@@ -2396,10 +2426,15 @@ const make = Effect.gen(function* () {
             if (
               activity.kind === "user-input.requested" &&
               activity.turnId === turnId &&
-              payload?.responseMode !== "message"
+              payload?.responseMode !== "message" &&
+              !closedRequestIds.has(requestId)
             ) {
               pendingRequestIds.add(requestId);
-            } else if (activity.kind === "user-input.resolved") {
+            } else if (
+              activity.kind === "user-input.resolved" ||
+              activity.kind === "user-input.expired"
+            ) {
+              closedRequestIds.add(requestId);
               pendingRequestIds.delete(requestId);
             }
           }

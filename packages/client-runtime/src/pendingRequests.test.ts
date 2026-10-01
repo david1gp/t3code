@@ -514,3 +514,67 @@ describe.each(["approval", "user-input"])("%s request completion", (requestKind)
     });
   });
 });
+
+describe("explicit request expiry", () => {
+  it.each(["approval", "user-input"] as const)(
+    "permanently closes only the matching %s ID, including expiry before open",
+    (requestType) => {
+      const requested = (kind: "approval" | "user-input", requestId: string) =>
+        makeActivity({
+          kind: `${kind}.requested`,
+          payload: {
+            requestId,
+            ...(kind === "approval"
+              ? { requestKind: "permission" }
+              : {
+                  questions: [
+                    {
+                      id: "choice",
+                      header: "Choice",
+                      question: "Which option?",
+                      options: [{ label: "One", description: "First option" }],
+                    },
+                  ],
+                }),
+          },
+        });
+      const open = requested(requestType, "expired-id");
+      const unrelated = [
+        requested("approval", "other-approval"),
+        requested("user-input", "other-input"),
+      ];
+      const baseline = derivePendingRequests(unrelated);
+      const expired = makeActivity({
+        kind: `${requestType}.expired`,
+        payload: { requestId: "expired-id", reason: "Native pending lists are empty." },
+      });
+      const unknown = makeActivity({
+        kind: `${requestType}.expired`,
+        payload: { requestId: "unknown-id", reason: "Not locally pending." },
+      });
+
+      expect(derivePendingRequests([...unrelated, unknown])).toEqual(baseline);
+      for (const ordered of [
+        [open, expired],
+        [expired, open],
+        [open, expired, open],
+      ]) {
+        expect(derivePendingRequests([...unrelated, ...ordered, unknown])).toEqual(baseline);
+      }
+    },
+  );
+
+  it("does not close requests on ready, session errors, or malformed expiry IDs", () => {
+    const open = makeActivity({
+      kind: "approval.requested",
+      payload: { requestId: "still-pending", requestKind: "permission" },
+    });
+    const unrelated = [
+      makeActivity({ kind: "session.state.changed", payload: { state: "ready" } }),
+      makeActivity({ kind: "session.state.changed", payload: { state: "error" } }),
+      makeActivity({ kind: "approval.expired", payload: { requestId: " " } }),
+      makeActivity({ kind: "approval.expired", payload: {} }),
+    ];
+    expect(derivePendingRequests([open, ...unrelated])).toEqual(derivePendingRequests([open]));
+  });
+});

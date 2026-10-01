@@ -42,6 +42,7 @@ import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQu
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import * as ThreadBackgroundLiveness from "../ThreadBackgroundLiveness.ts";
 import * as ThreadPlanProgress from "../ThreadPlanProgress.ts";
+import { isAutoSettlementCandidate } from "../ThreadSettlementPolicy.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
 import { ServerConfig } from "../../config.ts";
@@ -65,6 +66,253 @@ const BaseTestLayer = makeProjectionPipelinePrefixedTestLayer("t3-projection-pip
 const encodeThreadLinkedPullRequest = Schema.encodeSync(
   Schema.fromJsonString(ThreadLinkedPullRequest),
 );
+
+it.layer(
+  OrchestrationProjectionSnapshotQueryLive.pipe(
+    Layer.provide(ThreadBackgroundLiveness.layer),
+    Layer.provide(ThreadPlanProgress.layer),
+    Layer.provide(RepositoryIdentityResolver.layer),
+    Layer.provideMerge(
+      Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-request-expiry-projection-")),
+    ),
+  ),
+)("request expiration projection", (it) => {
+  it.effect(
+    "clears only expired request badges and settlement blockers without approving or answering",
+    () =>
+      Effect.gen(function* () {
+        const pipeline = yield* OrchestrationProjectionPipeline;
+        const eventStore = yield* OrchestrationEventStore;
+        const query = yield* ProjectionSnapshotQuery;
+        const sql = yield* SqlClient.SqlClient;
+        const threadId = ThreadId.make("thread-request-expiry");
+        const now = "2026-03-01T00:00:00.000Z";
+        const fields = {
+          aggregateKind: "thread" as const,
+          aggregateId: threadId,
+          occurredAt: now,
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+        };
+        const created = yield* eventStore.append({
+          ...fields,
+          eventId: EventId.make("evt-request-expiry-created"),
+          type: "thread.created",
+          payload: {
+            threadId,
+            projectId: ProjectId.make("project-request-expiry"),
+            title: "Request expiry",
+            modelSelection: { instanceId: ProviderInstanceId.make("opencode"), model: "model" },
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+        yield* pipeline.projectEvent(created);
+
+        let sequence = 0;
+        const appendActivity = (
+          kind: string,
+          requestId: string,
+          turnId: TurnId | null = null,
+          createdAt = now,
+        ) => {
+          sequence += 1;
+          return eventStore
+            .append({
+              ...fields,
+              eventId: EventId.make(`evt-request-expiry-${sequence}`),
+              type: "thread.activity-appended",
+              payload: {
+                threadId,
+                activity: {
+                  id: EventId.make(`activity-request-expiry-${sequence}`),
+                  kind,
+                  tone: "info",
+                  summary: kind,
+                  payload: {
+                    requestId,
+                    requestType: kind.startsWith("user-input")
+                      ? "tool_user_input"
+                      : "permission_approval",
+                    ...(kind.endsWith("expired")
+                      ? { reason: "Absent after quiescent recovery" }
+                      : {}),
+                    ...(kind.endsWith("respond.failed")
+                      ? { detail: "Provider temporarily unavailable" }
+                      : {}),
+                  },
+                  turnId,
+                  sequence,
+                  createdAt,
+                },
+              },
+            })
+            .pipe(Effect.flatMap((event) => pipeline.projectEvent(event)));
+        };
+        const assertPending = (approvals: number, userInputs: number) =>
+          Effect.gen(function* () {
+            assert.deepEqual(
+              yield* sql<{ approvals: number; userInputs: number }>`
+          SELECT pending_approval_count AS approvals, pending_user_input_count AS "userInputs"
+          FROM projection_threads WHERE thread_id = ${threadId}
+        `,
+              [{ approvals, userInputs }],
+            );
+            const shell = Option.getOrThrow(yield* query.getThreadShellById(threadId));
+            assert.equal(shell.hasPendingApprovals, approvals > 0);
+            assert.equal(shell.hasPendingUserInput, userInputs > 0);
+            assert.equal(
+              isAutoSettlementCandidate(shell, now),
+              approvals === 0 && userInputs === 0,
+            );
+          });
+
+        const historicalTurnId = TurnId.make("historical-unknown-turn");
+        yield* appendActivity("approval.requested", "approval-expire", historicalTurnId);
+        yield* appendActivity("approval.requested", "approval-unrelated");
+        yield* appendActivity("user-input.requested", "input-expire");
+        yield* appendActivity("user-input.requested", "input-unrelated");
+        yield* assertPending(2, 2);
+        yield* appendActivity("approval.expired", "approval-expire");
+        yield* assertPending(1, 2);
+        yield* appendActivity("user-input.expired", "input-expire", historicalTurnId);
+        yield* assertPending(1, 1);
+        yield* appendActivity("approval.expired", "approval-unrelated");
+        yield* assertPending(0, 1);
+        yield* appendActivity("user-input.expired", "input-unrelated");
+        yield* assertPending(0, 0);
+
+        // Terminal state wins over later timestamps and higher runtime sequences.
+        const later = "2026-03-01T00:00:10.000Z";
+        yield* appendActivity("approval.requested", "approval-expire", null, later);
+        yield* appendActivity("provider.approval.respond.failed", "approval-expire", null, later);
+        yield* appendActivity("user-input.requested", "input-expire", null, later);
+        yield* appendActivity("approval.expired", "approval-expiry-before-open");
+        yield* appendActivity("user-input.expired", "input-expiry-before-open");
+        yield* appendActivity(
+          "approval.requested",
+          "approval-expiry-before-open",
+          historicalTurnId,
+          later,
+        );
+        yield* appendActivity("user-input.requested", "input-expiry-before-open", null, later);
+        yield* assertPending(0, 0);
+        const terminal = Option.getOrThrow(
+          yield* query.getUserInputActivity({
+            threadId,
+            requestId: ApprovalRequestId.make("input-expire"),
+          }),
+        );
+        assert.equal(terminal.kind, "user-input.expired");
+        assert.equal(terminal.turnId, historicalTurnId);
+        assert.deepEqual(terminal.payload, {
+          requestId: "input-expire",
+          requestType: "tool_user_input",
+          reason: "Absent after quiescent recovery",
+        });
+        const beforeOpen = Option.getOrThrow(
+          yield* query.getUserInputActivity({
+            threadId,
+            requestId: ApprovalRequestId.make("input-expiry-before-open"),
+          }),
+        );
+        assert.equal(beforeOpen.kind, "user-input.expired");
+        assert.equal(beforeOpen.turnId, null);
+        assert.deepEqual(
+          yield* sql<{
+            requestId: string;
+            turnId: string | null;
+            decision: string | null;
+            status: string;
+          }>`
+        SELECT request_id AS "requestId", turn_id AS "turnId", decision, status
+        FROM projection_pending_approvals WHERE thread_id = ${threadId} ORDER BY request_id
+      `,
+          [
+            {
+              requestId: "approval-expire",
+              turnId: historicalTurnId,
+              decision: null,
+              status: "resolved",
+            },
+            {
+              requestId: "approval-expiry-before-open",
+              turnId: null,
+              decision: null,
+              status: "resolved",
+            },
+            { requestId: "approval-unrelated", turnId: null, decision: null, status: "resolved" },
+          ],
+        );
+        assert.deepEqual(
+          yield* sql`SELECT * FROM projection_turns WHERE thread_id = ${threadId}`,
+          [],
+        );
+        assert.deepEqual(
+          yield* sql`
+        SELECT * FROM projection_thread_activities WHERE thread_id = ${threadId}
+          AND kind IN ('approval.resolved', 'user-input.resolved', 'user-input.answer-submitted')
+      `,
+          [],
+        );
+
+        // Keep another form pending so pinning runs, then move all lifecycle rows
+        // outside the recent-activity window. A late open must not get pinned.
+        yield* appendActivity("user-input.requested", "input-still-pending");
+        yield* sql`
+        WITH RECURSIVE filler(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM filler WHERE n < 501)
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        ) SELECT 'expiry-filler-' || n, ${threadId}, NULL, 'info', 'tool.completed', 'tool', '{}',
+          1000 + n, ${later} FROM filler
+      `;
+        const detail = Option.getOrThrow(yield* query.getThreadDetailById(threadId));
+        const requestedIds = detail.activities
+          .filter((activity) => activity.kind === "user-input.requested")
+          .map((activity) => (activity.payload as { requestId: string }).requestId);
+        assert.deepEqual(requestedIds, ["input-still-pending"]);
+        yield* assertPending(0, 1);
+
+        const sessionEvent = yield* eventStore.append({
+          ...fields,
+          eventId: EventId.make("evt-request-expiry-running"),
+          type: "thread.session-set",
+          payload: {
+            threadId,
+            session: {
+              threadId,
+              status: "running",
+              providerName: "opencode",
+              providerInstanceId: ProviderInstanceId.make("opencode"),
+              runtimeMode: "approval-required",
+              activeTurnId: TurnId.make("current-running-turn"),
+              lastError: null,
+              updatedAt: later,
+            },
+          },
+        });
+        yield* pipeline.projectEvent(sessionEvent);
+        const readTurns = sql`SELECT * FROM projection_turns WHERE thread_id = ${threadId}`;
+        const turnsBeforeExpiry = yield* readTurns;
+        yield* appendActivity("approval.requested", "approval-old-turn", historicalTurnId);
+        yield* appendActivity("approval.expired", "approval-old-turn", historicalTurnId);
+        yield* appendActivity("user-input.expired", "input-still-pending", historicalTurnId);
+        assert.deepEqual(yield* readTurns, turnsBeforeExpiry);
+        const runningShell = Option.getOrThrow(yield* query.getThreadShellById(threadId));
+        assert.isFalse(runningShell.hasPendingApprovals);
+        assert.isFalse(runningShell.hasPendingUserInput);
+        assert.equal(runningShell.latestTurn?.state, "running");
+        assert.equal(runningShell.latestTurn?.completedAt, null);
+        assert.isFalse(isAutoSettlementCandidate(runningShell, later));
+      }),
+  );
+});
 
 it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-cursor-batch-")))(
   "OrchestrationProjectionPipeline cursor batches",

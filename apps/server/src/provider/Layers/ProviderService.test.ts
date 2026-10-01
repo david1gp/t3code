@@ -5306,3 +5306,48 @@ describe("agent browser access", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
+
+const retainedNativeStop = makeFakeCodexAdapter(ProviderDriverKind.make("opencode"));
+const inactiveOtherStop = makeFakeCodexAdapter();
+const retainedStopNativeInstance = ProviderInstanceId.make("retained-native-stop");
+const retainedStopOtherInstance = ProviderInstanceId.make("inactive-other-stop");
+makeProviderServiceLayer({
+  registry: makeStaticInstanceRegistry([
+    [retainedStopNativeInstance, retainedNativeStop.adapter],
+    [retainedStopOtherInstance, inactiveOtherStop.adapter],
+  ]),
+}).layer("ProviderService retained native stop", (it) => {
+  it.effect(
+    "explicit stop reaches a retained lost native context but not absent native or inactive other-provider sessions",
+    () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const nativeThread = asThreadId("retained-native-lost");
+        const otherThread = asThreadId("inactive-other-provider");
+        for (const [threadId, providerInstanceId] of [
+          [nativeThread, retainedStopNativeInstance],
+          [otherThread, retainedStopOtherInstance],
+        ] as const) {
+          yield* provider.startSession(threadId, {
+            threadId,
+            providerInstanceId,
+            runtimeMode: "full-access",
+            cwd: fixtureCwd("project"),
+          });
+        }
+        retainedNativeStop.updateSession(nativeThread, (session) => ({
+          ...session,
+          status: "error",
+          lastError: "native stream lost",
+        }));
+        retainedNativeStop.hasSession.mockImplementation(() => Effect.succeed(false));
+        inactiveOtherStop.hasSession.mockImplementation(() => Effect.succeed(false));
+        yield* provider.stopSession({ threadId: nativeThread });
+        assert.deepEqual(retainedNativeStop.stopSession.mock.calls, [[nativeThread]]);
+        yield* provider.stopSession({ threadId: nativeThread });
+        assert.equal(retainedNativeStop.stopSession.mock.calls.length, 1);
+        yield* provider.stopSession({ threadId: otherThread });
+        assert.equal(inactiveOtherStop.stopSession.mock.calls.length, 0);
+      }),
+  );
+});

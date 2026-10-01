@@ -17,6 +17,8 @@ import {
   type TurnTokenUsage,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Scope from "effect/Scope";
 import * as Queue from "effect/Queue";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
@@ -175,6 +177,7 @@ type Context = {
   readonly engine: Engine;
   readonly sessionId: string;
   modelSelection: ProviderSessionStartInput["modelSelection"];
+  selectionVerified: boolean;
   readonly fragments: Map<string, string>;
   readonly usage: Map<string, StepAccounting>;
   readonly unresolvedSteps: Set<string>;
@@ -190,9 +193,10 @@ type Context = {
   pending: TurnId | undefined;
   lastSettled: TurnId | undefined;
   lost: boolean;
+  recovery: Fiber.Fiber<void> | undefined;
 };
 
-/** Native v2 adapter. Existing sessions, history and stream recovery remain fail-closed. */
+/** Native v2 adapter. Recovery adopts only the same quiescent native session, without replay. */
 export const makeOpenCodeNativeAdapter = (options: {
   readonly url: string;
   readonly serverPassword?: string;
@@ -203,7 +207,12 @@ export const makeOpenCodeNativeAdapter = (options: {
   Effect.gen(function* () {
     const config = yield* ServerConfig;
     const instanceId = options.instanceId ?? ProviderInstanceId.make("opencode");
+    const scope = yield* Scope.Scope;
+    let disposed = false;
+    let stopGeneration = 0;
     const sessions = new Map<ThreadId, Context>();
+    const starting = new Map<ThreadId, { engine: Engine; cancelled: boolean }>();
+    const losses = yield* Queue.unbounded<Context>();
     const bus = yield* Queue.unbounded<ProviderRuntimeEvent>();
     const now = () => new Date().toISOString();
     const base = (ctx: Context, turnId?: TurnId) => ({
@@ -218,7 +227,7 @@ export const makeOpenCodeNativeAdapter = (options: {
       Queue.offerUnsafe(bus, event);
     };
     const markLost = (ctx: Context, reason: string) => {
-      if (ctx.lost) return;
+      if (disposed || ctx.lost || sessions.get(ctx.session.threadId) !== ctx) return;
       ctx.lost = true;
       ctx.session = { ...ctx.session, status: "error", lastError: reason, updatedAt: now() };
       for (const [childId, child] of ctx.children) {
@@ -234,8 +243,9 @@ export const makeOpenCodeNativeAdapter = (options: {
       emit({
         type: "session.exited",
         ...base(ctx),
-        payload: { reason, recoverable: false, exitKind: "error" },
+        payload: { reason, recoverable: true, exitKind: "error" },
       });
+      Queue.offerUnsafe(losses, ctx);
     };
     const unsupported = (method: string) =>
       Effect.fail(
@@ -284,7 +294,7 @@ export const makeOpenCodeNativeAdapter = (options: {
     };
     const requireSession = (threadId: ThreadId) => {
       const ctx = sessions.get(threadId);
-      return ctx && !ctx.lost
+      return !disposed && ctx && !ctx.lost
         ? Effect.succeed(ctx)
         : Effect.fail(new ProviderAdapterSessionNotFoundError({ provider, threadId }));
     };
@@ -494,10 +504,11 @@ export const makeOpenCodeNativeAdapter = (options: {
           ctx.contextLimit = limit ?? null;
         })
         .finally(() => {
-          if (!ctx.lost) emitUsage();
+          if (!ctx.lost && sessions.get(ctx.session.threadId) === ctx) emitUsage();
         });
     };
     const onEvent = (ctx: Context, event: NativeEvent) => {
+      if (sessions.get(ctx.session.threadId) !== ctx) return;
       if (event.type === "session.ready") return;
       if (event.type === "stream.lost") {
         if (event.sessionID !== ctx.sessionId) return;
@@ -964,6 +975,128 @@ export const makeOpenCodeNativeAdapter = (options: {
       }
     };
 
+    const recover = Effect.fnUntraced(function* (previous: Context) {
+      const threadId = previous.session.threadId;
+      let delay = 250;
+      while (sessions.get(threadId) === previous && previous.lost) {
+        if (disposed) return;
+        yield* Effect.sleep(`${delay} millis`);
+        if (disposed || sessions.get(threadId) !== previous) return;
+        let candidate: Context | undefined;
+        let candidateLost = false;
+        let adopted = false;
+        const engine = (options.engineCreate ?? openCodeNativeSessionEngineCreate)({
+          url: options.url,
+          ...(options.inventory ? { inventory: options.inventory } : {}),
+          ...(options.serverPassword ? { serverPassword: options.serverPassword } : {}),
+          onEvent: (event) => {
+            if (event.type === "stream.lost") candidateLost = true;
+            if (adopted && candidate) onEvent(candidate, event);
+          },
+        });
+        const recovered = yield* Effect.gen(function* () {
+          const parsed = yield* nativeSelection("startSession", previous.modelSelection);
+          const started = yield* Effect.promise(() =>
+            engine.start({
+              directory: previous.session.cwd ?? config.cwd,
+              resumeSessionId: previous.sessionId,
+              ...(parsed?.model ? { model: parsed.model } : {}),
+              ...(parsed?.agent ? { agent: parsed.agent } : {}),
+            }),
+          );
+          if (
+            !started.success ||
+            started.data.id !== previous.sessionId ||
+            candidateLost ||
+            disposed ||
+            sessions.get(threadId) !== previous
+          )
+            return false;
+          // Fresh execution state isolates all late responses from the abandoned engine.
+          candidate = {
+            ...previous,
+            engine,
+            // Resume preserves remote state, including switches whose responses were lost.
+            // Reassert the desired model and agent only before the next new user turn.
+            selectionVerified: false,
+            session: {
+              ...previous.session,
+              status: "ready",
+              activeTurnId: undefined,
+              lastError: undefined,
+              updatedAt: now(),
+            },
+            fragments: new Map(),
+            usage: new Map(),
+            unresolvedSteps: new Set(),
+            lastCostUsd: undefined,
+            settledCosts: new Map(),
+            children: new Map(),
+            permissions: new Map(),
+            forms: new Map(),
+            settledRequests: new Set(),
+            active: undefined,
+            pending: undefined,
+            lastSettled: undefined,
+            lost: false,
+            recovery: undefined,
+          };
+          // No yield between checking the stream, ownership transfer, and readiness.
+          sessions.set(threadId, candidate);
+          adopted = true;
+          const expiredBase = base(previous, previous.active ?? previous.pending);
+          for (const [id, request] of previous.permissions)
+            emit({
+              type: "request.expired",
+              ...expiredBase,
+              eventId: EventId.make(NodeCrypto.randomUUID()),
+              requestId: RuntimeRequestId.make(id),
+              payload: {
+                requestType: requestType(request.action),
+                reason:
+                  "Native observation was lost; quiescent recovery confirmed this request is no longer pending.",
+              },
+            });
+          for (const id of previous.forms.keys())
+            emit({
+              type: "request.expired",
+              ...expiredBase,
+              eventId: EventId.make(NodeCrypto.randomUUID()),
+              requestId: RuntimeRequestId.make(id),
+              payload: {
+                requestType: "tool_user_input",
+                reason:
+                  "Native observation was lost; quiescent recovery confirmed this form is no longer pending.",
+              },
+            });
+          emit({ type: "session.started", ...base(candidate), payload: {} });
+          emit({ type: "session.state.changed", ...base(candidate), payload: { state: "ready" } });
+          yield* Effect.promise(() => previous.engine.stop({ interrupt: false }));
+          return true;
+        }).pipe(
+          Effect.ensuring(
+            Effect.promise(() =>
+              adopted ? Promise.resolve(undefined) : engine.stop({ interrupt: false }),
+            ),
+          ),
+        );
+        if (recovered) return;
+        delay = Math.min(delay * 2, 5_000);
+      }
+    });
+    yield* Effect.gen(function* () {
+      while (true) {
+        const ctx = yield* Queue.take(losses);
+        if (disposed || sessions.get(ctx.session.threadId) !== ctx || !ctx.lost || ctx.recovery)
+          continue;
+        ctx.recovery = yield* recover(ctx).pipe(
+          Effect.ignore,
+          Effect.interruptible,
+          Effect.forkIn(scope),
+        );
+      }
+    }).pipe(Effect.interruptible, Effect.forkIn(scope));
+
     const adapter: ProviderAdapterShape<
       | ProviderAdapterRequestError
       | ProviderAdapterValidationError
@@ -976,6 +1109,8 @@ export const makeOpenCodeNativeAdapter = (options: {
       } as const,
       startSession: (input) =>
         Effect.gen(function* () {
+          const generation = stopGeneration;
+          if (disposed) return yield* unsupported("session.start: adapter disposed");
           if (input.runtimeMode !== "full-access")
             return yield* new ProviderAdapterValidationError({
               provider,
@@ -1001,22 +1136,28 @@ export const makeOpenCodeNativeAdapter = (options: {
           const resumeSessionId = cursor?.sessionId as string | undefined;
           const selection = input.modelSelection;
           const parsed = yield* nativeSelection("startSession", selection);
-          if (sessions.has(input.threadId))
+          if (sessions.has(input.threadId) || starting.has(input.threadId))
             return yield* new ProviderAdapterValidationError({
               provider,
               operation: "startSession",
               issue: "Session already started.",
             });
           const cwd = input.cwd ?? config.cwd;
+          if (disposed || generation !== stopGeneration)
+            return yield* unsupported("session.start: adapter stopped");
           let ctx!: Context;
+          let startLost = false;
           const engine = (options.engineCreate ?? openCodeNativeSessionEngineCreate)({
             url: options.url,
             ...(options.inventory ? { inventory: options.inventory } : {}),
             ...(options.serverPassword ? { serverPassword: options.serverPassword } : {}),
             onEvent: (event) => {
+              if (event.type === "stream.lost") startLost = true;
               if (ctx) onEvent(ctx, event);
             },
           });
+          const ownership = { engine, cancelled: false };
+          starting.set(input.threadId, ownership);
           const started = yield* result(
             "session.start",
             engine.start({
@@ -1026,12 +1167,33 @@ export const makeOpenCodeNativeAdapter = (options: {
               ...(parsed?.model ? { model: parsed.model } : {}),
               ...(parsed?.agent ? { agent: parsed.agent } : {}),
             }),
+          ).pipe(
+            Effect.onExit((exit) =>
+              Effect.gen(function* () {
+                if (starting.get(input.threadId) === ownership) starting.delete(input.threadId);
+                if (
+                  exit._tag === "Failure" ||
+                  ownership.cancelled ||
+                  startLost ||
+                  disposed ||
+                  generation !== stopGeneration
+                )
+                  yield* Effect.promise(() => engine.stop({ interrupt: false }));
+              }),
+            ),
           );
+          if (disposed || generation !== stopGeneration || ownership.cancelled || startLost)
+            return yield* new ProviderAdapterRequestError({
+              provider,
+              method: "session.start",
+              detail: "Native session closed during start.",
+            });
           const timestamp = now();
           ctx = {
             engine,
             sessionId: started.id,
             modelSelection: selection,
+            selectionVerified: !resumeSessionId,
             fragments: new Map(),
             usage: new Map(),
             unresolvedSteps: new Set(),
@@ -1043,6 +1205,7 @@ export const makeOpenCodeNativeAdapter = (options: {
             forms: new Map(),
             settledRequests: new Set(),
             lost: false,
+            recovery: undefined,
             active: undefined,
             pending: undefined,
             lastSettled: undefined,
@@ -1081,9 +1244,18 @@ export const makeOpenCodeNativeAdapter = (options: {
               issue:
                 "Native v2 currently supports plain text turns only (no attachments, plan mode or continuation).",
             });
+          if (disposed || ctx.lost || sessions.get(input.threadId) !== ctx)
+            return yield* unsupported("session.prompt: context replaced");
+          if (!ctx.selectionVerified && (ctx.active || ctx.pending))
+            return yield* new ProviderAdapterRequestError({
+              provider,
+              method: "session.switch",
+              detail: "Wait for native work to settle before reasserting an unverified selection.",
+            });
           const next = input.modelSelection;
-          if (next && !selectionEquals(next, ctx.modelSelection)) {
-            const parsed = yield* nativeSelection("sendTurn", next);
+          const desired = next ?? ctx.modelSelection;
+          if (!ctx.selectionVerified || (next && !selectionEquals(next, ctx.modelSelection))) {
+            const parsed = yield* nativeSelection("sendTurn", desired);
             const prior = ctx.modelSelection;
             const priorVariant = prior?.options?.find((option) => option.id === "variant")?.value;
             const priorAgent = prior?.options?.find((option) => option.id === "agent")?.value;
@@ -1091,11 +1263,16 @@ export const makeOpenCodeNativeAdapter = (options: {
             // turn is interrupted first, so this prompt starts a new turn on the new selection.
             const switchModel =
               parsed?.model &&
-              (next.model !== ctx.session.model || parsed.model.variant !== priorVariant)
+              (!ctx.selectionVerified ||
+                desired?.model !== ctx.session.model ||
+                parsed.model.variant !== priorVariant)
                 ? parsed.model
                 : undefined;
-            const switchAgent =
-              parsed?.agent && parsed.agent !== priorAgent ? parsed.agent : undefined;
+            const switchAgent = !ctx.selectionVerified
+              ? (parsed?.agent ?? "build")
+              : parsed?.agent && parsed.agent !== priorAgent
+                ? parsed.agent
+                : undefined;
             if (switchModel || switchAgent) {
               const switched = yield* Effect.promise(() =>
                 ctx.engine.switchSelection({
@@ -1117,10 +1294,13 @@ export const makeOpenCodeNativeAdapter = (options: {
                 });
               }
             }
-            ctx.modelSelection = next;
-            if (switchModel) {
+            if (disposed || ctx.lost || sessions.get(input.threadId) !== ctx)
+              return yield* unsupported("session.prompt: context replaced");
+            ctx.selectionVerified = true;
+            if (next) ctx.modelSelection = next;
+            if (switchModel && desired) {
               ctx.contextLimit = undefined;
-              ctx.session = { ...ctx.session, model: next.model, updatedAt: now() };
+              ctx.session = { ...ctx.session, model: desired.model, updatedAt: now() };
             }
           }
           const admission = yield* Effect.promise(() => ctx.engine.send(text));
@@ -1134,7 +1314,8 @@ export const makeOpenCodeNativeAdapter = (options: {
             });
           }
           const started = admission.data;
-          if (ctx.lost) return yield* unsupported("session.prompt: stream lost");
+          if (ctx.lost || sessions.get(input.threadId) !== ctx)
+            return yield* unsupported("session.prompt: stream lost");
           const id = TurnId.make(started.turnID);
           if (ctx.active !== id && ctx.lastSettled !== id) ctx.pending = id;
           return { threadId: input.threadId, turnId: id };
@@ -1152,11 +1333,28 @@ export const makeOpenCodeNativeAdapter = (options: {
       stopSession: (threadId) =>
         Effect.gen(function* () {
           const ctx = sessions.get(threadId);
-          if (!ctx) return yield* new ProviderAdapterSessionNotFoundError({ provider, threadId });
-          const stopped = yield* Effect.promise(() => ctx.engine.stop());
+          if (!ctx) {
+            const pending = starting.get(threadId);
+            if (!pending)
+              return yield* new ProviderAdapterSessionNotFoundError({ provider, threadId });
+            pending.cancelled = true;
+            yield* Effect.promise(() => pending.engine.stop({ interrupt: false }));
+            return;
+          }
           sessions.delete(threadId);
+          if (ctx.recovery) yield* Fiber.interrupt(ctx.recovery);
+          const stopped = yield* Effect.promise(() => ctx.engine.stop());
           if (!stopped.success) {
-            markLost(ctx, "Native session stopped locally; remote interrupt outcome is uncertain.");
+            if (!ctx.lost)
+              emit({
+                type: "session.exited",
+                ...base(ctx),
+                payload: {
+                  reason: "Native session stopped locally; remote interrupt outcome is uncertain.",
+                  recoverable: false,
+                  exitKind: "error",
+                },
+              });
             return yield* result("session.stop", Promise.resolve(stopped));
           }
           if (!ctx.active && !ctx.pending) {
@@ -1226,26 +1424,47 @@ export const makeOpenCodeNativeAdapter = (options: {
       rollbackThread: () => unsupported("rollbackThread"),
       stopAll: () =>
         Effect.gen(function* () {
+          stopGeneration++;
           let firstError: ProviderAdapterRequestError | undefined;
-          for (const ctx of sessions.values()) {
+          const pendingStarts = [...starting.values()];
+          const contexts = [...sessions.values()];
+          for (const pending of pendingStarts) pending.cancelled = true;
+          sessions.clear();
+          for (const pending of pendingStarts)
+            yield* Effect.promise(() => pending.engine.stop({ interrupt: false }));
+          for (const ctx of contexts) {
+            if (ctx.recovery) yield* Fiber.interrupt(ctx.recovery);
             const stopped = yield* Effect.result(result("session.stop", ctx.engine.stop()));
             if (Result.isFailure(stopped)) {
-              markLost(
-                ctx,
-                "Native session stopped locally; remote interrupt outcome is uncertain.",
-              );
+              if (!ctx.lost)
+                emit({
+                  type: "session.exited",
+                  ...base(ctx),
+                  payload: {
+                    reason:
+                      "Native session stopped locally; remote interrupt outcome is uncertain.",
+                    recoverable: false,
+                    exitKind: "error",
+                  },
+                });
               firstError ??= stopped.failure;
             } else if (!ctx.lost) {
               emit({ type: "session.exited", ...base(ctx), payload: { exitKind: "graceful" } });
             }
           }
-          sessions.clear();
           if (firstError) return yield* firstError;
         }),
       streamEvents: Stream.fromQueue(bus),
     };
     yield* Effect.addFinalizer(() =>
-      adapter.stopAll().pipe(Effect.ensuring(Queue.shutdown(bus)), Effect.orDie),
+      Effect.gen(function* () {
+        // Permanent scope closure must fence admission before any asynchronous cleanup.
+        disposed = true;
+        yield* adapter.stopAll();
+      }).pipe(
+        Effect.ensuring(Effect.all([Queue.shutdown(bus), Queue.shutdown(losses)])),
+        Effect.orDie,
+      ),
     );
     return adapter;
   });

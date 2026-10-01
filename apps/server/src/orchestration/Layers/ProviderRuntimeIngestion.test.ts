@@ -270,13 +270,16 @@ describe("ProviderRuntimeIngestion", () => {
     serverSettings?: Partial<ServerSettings>;
     threadTitle?: string;
     workspaceSubdirectory?: string;
+    initializeGitRepository?: boolean;
     isGitRepository?: CheckpointStore.CheckpointStore["Service"]["isGitRepository"];
   }) {
     const repositoryRoot = makeTempDir("t3-provider-project-");
-    NodeChildProcess.execFileSync("git", ["init", "--initial-branch=main"], {
-      cwd: repositoryRoot,
-      stdio: "ignore",
-    });
+    if (options?.initializeGitRepository !== false) {
+      NodeChildProcess.execFileSync("git", ["init", "--initial-branch=main"], {
+        cwd: repositoryRoot,
+        stdio: "ignore",
+      });
+    }
     const workspaceRoot = NodePath.join(repositoryRoot, options?.workspaceSubdirectory ?? "");
     NodeFS.mkdirSync(workspaceRoot, { recursive: true });
     const provider = createProviderServiceHarness();
@@ -3903,6 +3906,132 @@ describe("ProviderRuntimeIngestion", () => {
     });
     expect(completionEvents).toHaveLength(1);
   });
+
+  effectIt.effect(
+    "persists honest request expiry without settling a turn or inventing replies",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            initializeGitRepository: false,
+            isGitRepository: () => Effect.succeed(false),
+          }),
+        );
+        const base = {
+          provider: ProviderDriverKind.make("opencode"),
+          threadId: asThreadId("thread-1"),
+          createdAt: "2026-01-01T00:00:01.000Z",
+        };
+        const turnId = asTurnId("uncertain-turn");
+        yield* Effect.promise(() =>
+          harness.emitAndDrain([
+            {
+              ...base,
+              type: "turn.started",
+              eventId: asEventId("uncertain-started"),
+              turnId,
+              payload: {},
+            },
+          ]),
+        );
+        const before = (yield* Effect.promise(harness.readModel)).threads[0]!;
+        const reason = "Native pending lists are empty after quiescent recovery.";
+        const expired = [
+          {
+            ...base,
+            type: "request.expired",
+            eventId: asEventId("approval-expired"),
+            requestId: RuntimeRequestId.make("old-permission"),
+            turnId,
+            payload: { requestType: "permission_approval", reason },
+          },
+          {
+            ...base,
+            type: "request.expired",
+            eventId: asEventId("input-expired"),
+            requestId: RuntimeRequestId.make("old-form"),
+            payload: { requestType: "tool_user_input", reason },
+          },
+        ] satisfies ReadonlyArray<ProviderRuntimeEvent>;
+        // The stream's Deferred enqueue receipt followed by the worker drain
+        // guarantees persistence before reading either events or the projection.
+        yield* Effect.promise(() => harness.emitAndDrain(expired));
+        const thread = (yield* Effect.promise(harness.readModel)).threads[0]!;
+        expect(thread.session).toEqual(before.session);
+        expect(thread.latestTurn).toEqual(before.latestTurn);
+        expect(thread.messages).toEqual(before.messages);
+        const expected = [
+          {
+            id: "approval-expired",
+            kind: "approval.expired",
+            turnId,
+            summary: "Request no longer pending after recovery",
+            payload: {
+              requestId: "old-permission",
+              requestKind: "permission",
+              requestType: "permission_approval",
+              reason,
+              detail: reason,
+            },
+          },
+          {
+            id: "input-expired",
+            kind: "user-input.expired",
+            turnId: null,
+            summary: "Request no longer pending after recovery",
+            payload: {
+              requestId: "old-form",
+              requestType: "tool_user_input",
+              reason,
+              detail: reason,
+            },
+          },
+        ];
+        expect(thread.activities).toMatchObject(expected);
+        const events = yield* Stream.runCollect(harness.engine.readEvents(0));
+        const persisted = events.filter((event) => event.type === "thread.activity-appended");
+        expect(persisted.map((event) => event.payload.activity)).toMatchObject(expected);
+        for (const activity of thread.activities) {
+          expect(activity.payload).not.toHaveProperty("answers");
+          expect(activity.payload).not.toHaveProperty("decision");
+          expect(activity.payload).not.toHaveProperty("resolution");
+        }
+        // A late request-open must not turn expiry into a submitted/dismissed
+        // response when the old turn subsequently ends normally.
+        yield* Effect.promise(() =>
+          harness.emitAndDrain([
+            {
+              ...base,
+              type: "user-input.requested",
+              eventId: asEventId("late-form"),
+              turnId,
+              requestId: RuntimeRequestId.make("old-form"),
+              payload: {
+                questions: [
+                  {
+                    id: "choice",
+                    header: "Choice",
+                    question: "Which?",
+                    options: [{ label: "One", description: "First" }],
+                  },
+                ],
+              },
+            },
+            {
+              ...base,
+              type: "turn.completed",
+              eventId: asEventId("normal-terminal"),
+              turnId,
+              payload: { state: "completed" },
+            },
+          ]),
+        );
+        const after = (yield* Effect.promise(harness.readModel)).threads[0]!;
+        expect(
+          after.activities.filter((activity) => activity.kind === "user-input.resolved"),
+        ).toEqual([]);
+      }),
+  );
 
   it("maps canonical request events into approval activities with requestKind", async () => {
     const harness = await createHarness();

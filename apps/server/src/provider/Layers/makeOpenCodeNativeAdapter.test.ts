@@ -9,11 +9,18 @@ import {
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Queue from "effect/Queue";
+import * as Option from "effect/Option";
+import * as Scope from "effect/Scope";
+import * as Exit from "effect/Exit";
+import * as TestClock from "effect/testing/TestClock";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { ServerConfig } from "../../config.ts";
+import { OpenCodeRuntimeError } from "../opencodeRuntime.ts";
 import type { openCodeNativeSessionEngineCreate } from "../openCodeNativeSessionEngineCreate.ts";
 import { makeOpenCodeNativeAdapter } from "./makeOpenCodeNativeAdapter.ts";
 
@@ -44,6 +51,7 @@ function fakeEngine() {
   let sends = 0;
   const create = ((input: Parameters<typeof openCodeNativeSessionEngineCreate>[0]) => {
     receive = input.onEvent;
+    const receiveEvent = input.onEvent;
     let directory = "";
     return {
       start: async (
@@ -98,8 +106,8 @@ function fakeEngine() {
           };
         const turnID = `msg_user_${++sends}`;
         if (terminalBeforeReceipt && !broken) {
-          receive({ type: "turn.started", turnID });
-          receive({ type: "turn.completed", turnID });
+          receiveEvent({ type: "turn.started", turnID });
+          receiveEvent({ type: "turn.completed", turnID });
         }
         return broken
           ? { success: false as const, error: { detail: "Admission uncertain" } }
@@ -1606,7 +1614,7 @@ it.effect(
       assert.deepStrictEqual(next.starts, [
         { directory: start.cwd, resumeSessionId: "ses_native" },
       ]);
-      assert.deepStrictEqual(next.calls, ["start:/tmp/native-v2"]);
+      assert.deepStrictEqual(next.calls, ["start:/tmp/native-v2", "stop"]);
       assert.deepStrictEqual(yield* resumed.listSessions(), []);
       assert.equal(yield* resumed.hasSession(threadId), false);
     }).pipe(Effect.provide(testLayer)),
@@ -1682,7 +1690,7 @@ it.effect("reports a failed interrupt as session loss without completing the tur
       [
         {
           reason: "Native interrupt outcome is uncertain; do not retry in this session.",
-          recoverable: false,
+          recoverable: true,
           exitKind: "error",
         },
       ],
@@ -1825,7 +1833,7 @@ it.effect.each([undefined, "Transport: fixture event read failed"])(
       assert.equal(lostSession?.lastError, reason);
       assert.deepStrictEqual(
         events.filter((event) => event.type === "session.exited").map((event) => event.payload),
-        [{ reason, recoverable: false, exitKind: "error" }],
+        [{ reason, recoverable: true, exitKind: "error" }],
       );
       assert.equal(yield* adapter.hasSession(threadId), false);
       assert.deepStrictEqual(
@@ -2373,4 +2381,576 @@ it.effect("maps native form fields, validates answers and cancels explicitly", (
     yield* Effect.forEach(events, (event) => decodeRuntimeEvent(event), { discard: true });
     yield* adapter.stopSession(threadId);
   }).pipe(Effect.provide(testLayer)),
+);
+
+const recoveryFixture = Effect.fnUntraced(function* () {
+  type Engine = ReturnType<typeof openCodeNativeSessionEngineCreate>;
+  type StartReceipt = { index: number; options: Parameters<Engine["start"]>[0] };
+  const starts = yield* Queue.unbounded<StartReceipt>();
+  const stops = yield* Queue.unbounded<{ index: number; options: Parameters<Engine["stop"]>[0] }>();
+  const switches = yield* Queue.unbounded<number>();
+  const liveSubscriptions = new Set<number>();
+  const promptSelections: Array<Parameters<Engine["switchSelection"]>[0]> = [];
+  const prompts: Array<[string, object]> = [];
+  let nativeSelection: Parameters<Engine["switchSelection"]>[0] = { agent: "build" };
+  let heldStop:
+    | { index: number; release: ReturnType<typeof Promise.withResolvers<void>> }
+    | undefined;
+  let heldSwitch:
+    | ReturnType<typeof Promise.withResolvers<Awaited<ReturnType<Engine["switchSelection"]>>>>
+    | undefined;
+  const callbacks: Array<Parameters<typeof openCodeNativeSessionEngineCreate>[0]["onEvent"]> = [];
+  const fake = fakeEngine();
+  let refuse = false;
+  let loseDuringStart = false;
+  let hold:
+    | ReturnType<typeof Promise.withResolvers<Awaited<ReturnType<Engine["start"]>>>>
+    | undefined;
+  const create: typeof openCodeNativeSessionEngineCreate = (input) => {
+    const index = callbacks.push(input.onEvent) - 1;
+    const engine = fake.create(input);
+    return {
+      ...engine,
+      start: async (options) => {
+        const started = await engine.start(options);
+        if (started.success) liveSubscriptions.add(index);
+        if (!options.resumeSessionId)
+          nativeSelection = {
+            agent: options.agent ?? "build",
+            ...(options.model ? { model: options.model } : {}),
+          };
+        Queue.offerUnsafe(starts, { index, options });
+        if (index > 0 && refuse)
+          return {
+            success: false,
+            error: new OpenCodeRuntimeError({
+              operation: "session.resume",
+              detail: "Native session still active or awaiting input.",
+            }),
+          };
+        if (index > 0 && loseDuringStart)
+          input.onEvent({
+            type: "stream.lost",
+            sessionID: "ses_native",
+            detail: "candidate disconnected before adoption",
+          });
+        if (index > 0 && hold) {
+          const pending = hold;
+          hold = undefined;
+          const receipt = await pending.promise;
+          if (receipt.success) liveSubscriptions.add(index);
+          return receipt;
+        }
+        return started;
+      },
+      switchSelection: async (selection) => {
+        // Apply native state first; only the HTTP response is held, not the setter.
+        const switched = await engine.switchSelection(selection);
+        if (switched.success) nativeSelection = { ...nativeSelection, ...selection };
+        Queue.offerUnsafe(switches, index);
+        if (heldSwitch) {
+          const pending = heldSwitch;
+          heldSwitch = undefined;
+          return pending.promise;
+        }
+        return switched;
+      },
+      send: async (...args) => {
+        promptSelections.push(nativeSelection);
+        prompts.push([args[0], args[1] ?? {}]);
+        return engine.send(...args);
+      },
+      stop: async (options) => {
+        Queue.offerUnsafe(stops, { index, options });
+        if (heldStop?.index === index) {
+          const pending = heldStop;
+          heldStop = undefined;
+          await pending.release.promise;
+        }
+        liveSubscriptions.delete(index);
+        return options?.interrupt === false ? { success: true, data: undefined } : engine.stop();
+      },
+    };
+  };
+  return {
+    fake,
+    starts,
+    stops,
+    switches,
+    liveSubscriptions,
+    promptSelections,
+    prompts,
+    nativeSelection: () => nativeSelection,
+    holdStop: (index: number) => {
+      const release = Promise.withResolvers<void>();
+      heldStop = { index, release };
+      return release;
+    },
+    holdSwitch: () => {
+      heldSwitch = Promise.withResolvers<Awaited<ReturnType<Engine["switchSelection"]>>>();
+      return heldSwitch;
+    },
+    callbacks,
+    create,
+    refuse: (value: boolean) => {
+      refuse = value;
+    },
+    loseDuringStart: (value: boolean) => {
+      loseDuringStart = value;
+    },
+    hold: () => {
+      hold = Promise.withResolvers<Awaited<ReturnType<Engine["start"]>>>();
+      return hold;
+    },
+    loss: (index: number) =>
+      callbacks[index]!({ type: "stream.lost", sessionID: "ses_native", detail: "transport gap" }),
+  };
+});
+
+it.effect(
+  "recovers idle on the same native ID with a fresh context, one original prompt, and fenced old callbacks",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* recoveryFixture();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: f.create,
+      });
+      const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
+      yield* Stream.runForEach(adapter.streamEvents, (event) => Queue.offer(events, event)).pipe(
+        Effect.forkChild,
+      );
+      yield* adapter.startSession(start);
+      yield* Queue.take(f.starts);
+      const turn = yield* adapter.sendTurn({ threadId, input: "original once" });
+      f.callbacks[0]!({ type: "turn.started", turnID: turn.turnId });
+      f.loss(0);
+      f.loss(0);
+      assert.equal(yield* adapter.hasSession(threadId), false);
+      yield* TestClock.adjust("250 millis");
+      const retry = yield* Queue.take(f.starts);
+      assert.equal(retry.index, 1);
+      assert.equal(retry.options.resumeSessionId, "ses_native");
+      const cleanup = yield* Queue.take(f.stops);
+      assert.deepStrictEqual(cleanup, { index: 0, options: { interrupt: false } });
+      assert.equal(yield* adapter.hasSession(threadId), true);
+      const recovered = (yield* adapter.listSessions())[0]!;
+      assert.equal(recovered.status, "ready");
+      assert.equal(recovered.activeTurnId, undefined);
+      assert.equal(recovered.lastError, undefined);
+      f.callbacks[0]!({ type: "turn.completed", turnID: turn.turnId });
+      f.callbacks[0]!({ type: "turn.started", turnID: "stale-late-response" });
+      f.loss(0);
+      assert.deepStrictEqual((yield* adapter.listSessions())[0], recovered);
+      assert.deepStrictEqual(f.prompts, [["original once", {}]]);
+      // Readiness is an observable receipt that drains earlier queued lifecycle events.
+      const observed: ProviderRuntimeEvent[] = [];
+      let ready = 0;
+      while (ready < 2) {
+        const event = yield* Queue.take(events);
+        observed.push(event);
+        if (event.type === "session.state.changed" && event.payload.state === "ready") ready++;
+      }
+      assert.equal(observed.filter((e) => e.type === "session.exited").length, 1);
+      assert.equal(
+        observed.filter((e) => e.type === "turn.completed" || e.type === "task.completed").length,
+        0,
+      );
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "refuses busy candidates with capped exponential backoff, expires old requests only on quiescent readiness, and repeats recovery",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* recoveryFixture();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: f.create,
+      });
+      const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
+      yield* Stream.runForEach(adapter.streamEvents, (event) => Queue.offer(events, event)).pipe(
+        Effect.forkChild,
+      );
+      yield* adapter.startSession(start);
+      yield* Queue.take(f.starts);
+      const turn = yield* adapter.sendTurn({ threadId, input: "ask once" });
+      f.callbacks[0]!({ type: "turn.started", turnID: turn.turnId });
+      f.callbacks[0]!({
+        type: "permission.asked",
+        turnID: turn.turnId,
+        request: {
+          id: "per_old",
+          sessionID: "ses_native",
+          action: "read",
+          resources: ["/tmp/a"],
+          metadata: {},
+        },
+      });
+      f.callbacks[0]!({
+        type: "form.created",
+        turnID: turn.turnId,
+        form: {
+          id: "form_old",
+          sessionID: "ses_native",
+          title: "Question",
+          fields: [{ type: "string", key: "reply", options: [] }],
+        },
+      });
+      f.refuse(true);
+      f.loss(0);
+      for (const [index, delay] of [250, 500, 1000, 2000, 4000, 5000, 5000].entries()) {
+        yield* TestClock.adjust(`${delay} millis`);
+        assert.equal((yield* Queue.take(f.starts)).index, index + 1);
+        assert.deepStrictEqual(yield* Queue.take(f.stops), {
+          index: index + 1,
+          options: { interrupt: false },
+        });
+        assert.equal(yield* adapter.hasSession(threadId), false);
+        const collected = yield* Queue.takeN(events, yield* Queue.size(events));
+        assert.equal(collected.filter((e) => e.type === "request.expired").length, 0);
+      }
+      f.refuse(false);
+      yield* TestClock.adjust("5000 millis");
+      assert.equal((yield* Queue.take(f.starts)).index, 8);
+      assert.deepStrictEqual(yield* Queue.take(f.stops), {
+        index: 0,
+        options: { interrupt: false },
+      });
+      const expired: ProviderRuntimeEvent[] = [];
+      while (true) {
+        const event = yield* Queue.take(events);
+        expired.push(event);
+        if (event.type === "session.state.changed" && event.payload.state === "ready") break;
+      }
+      assert.deepStrictEqual(
+        expired.filter((e) => e.type === "request.expired").map((e) => e.requestId),
+        ["per_old", "form_old"],
+      );
+      assert.equal(
+        expired.some(
+          (e) =>
+            e.type === "request.resolved" ||
+            e.type === "user-input.resolved" ||
+            e.type === "turn.completed",
+        ),
+        false,
+      );
+      f.loss(8);
+      yield* TestClock.adjust("250 millis");
+      assert.equal((yield* Queue.take(f.starts)).index, 9);
+      assert.deepStrictEqual(yield* Queue.take(f.stops), {
+        index: 8,
+        options: { interrupt: false },
+      });
+      assert.equal(yield* adapter.hasSession(threadId), true);
+      assert.deepStrictEqual(f.prompts, [["ask once", {}]]);
+      assert.equal(
+        f.fake.calls.some(
+          (call) =>
+            call === "interrupt" || call.startsWith("permission:") || call.startsWith("form:"),
+        ),
+        false,
+      );
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "discards a candidate disconnected before adoption without false ready and retries later",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* recoveryFixture();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: f.create,
+      });
+      yield* adapter.startSession(start);
+      yield* Queue.take(f.starts);
+      f.loseDuringStart(true);
+      f.loss(0);
+      yield* TestClock.adjust("250 millis");
+      yield* Queue.take(f.starts);
+      assert.deepStrictEqual(yield* Queue.take(f.stops), {
+        index: 1,
+        options: { interrupt: false },
+      });
+      assert.equal(yield* adapter.hasSession(threadId), false);
+      f.loseDuringStart(false);
+      yield* TestClock.adjust("500 millis");
+      yield* Queue.take(f.starts);
+      yield* Queue.take(f.stops);
+      assert.equal(yield* adapter.hasSession(threadId), true);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "explicit stop cancels an in-flight candidate locally, interrupts only the original engine, and fences replacement",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* recoveryFixture();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: f.create,
+      });
+      yield* adapter.startSession(start);
+      yield* Queue.take(f.starts);
+      f.loss(0);
+      const held = f.hold();
+      yield* TestClock.adjust("250 millis");
+      yield* Queue.take(f.starts);
+      yield* adapter.stopSession(threadId);
+      assert.deepStrictEqual(yield* Queue.take(f.stops), {
+        index: 1,
+        options: { interrupt: false },
+      });
+      assert.deepStrictEqual(yield* Queue.take(f.stops), { index: 0, options: undefined });
+      yield* adapter.startSession(start);
+      yield* Queue.take(f.starts);
+      held.resolve({
+        success: true,
+        data: { id: "ses_native", location: { directory: start.cwd } },
+      });
+      f.loss(1);
+      f.callbacks[0]!({ type: "turn.started", turnID: "obsolete" });
+      yield* TestClock.adjust("30 seconds");
+      assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+      assert.equal(Option.isNone(yield* Queue.poll(f.starts)), true);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("scope/provider replacement cancels delayed retries and disposes retained contexts", () =>
+  Effect.gen(function* () {
+    const f = yield* recoveryFixture();
+    const scope = yield* Scope.make();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: f.create,
+    }).pipe(Effect.provideService(Scope.Scope, scope));
+    yield* adapter.startSession(start);
+    yield* Queue.take(f.starts);
+    f.loss(0);
+    yield* Scope.close(scope, Exit.void);
+    assert.deepStrictEqual(yield* Queue.take(f.stops), { index: 0, options: undefined });
+    yield* TestClock.adjust("30 seconds");
+    assert.equal(Option.isNone(yield* Queue.poll(f.starts)), true);
+    assert.deepStrictEqual(yield* adapter.listSessions(), []);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "uncertain admission automatically recovers readiness but never replays the prompt or fabricates its terminal",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* recoveryFixture();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: f.create,
+      });
+      yield* adapter.startSession(start);
+      yield* Queue.take(f.starts);
+      f.fake.breakAdmission();
+      yield* adapter.sendTurn({ threadId, input: "uncertain once" }).pipe(Effect.flip);
+      assert.equal(yield* adapter.hasSession(threadId), false);
+      yield* TestClock.adjust("250 millis");
+      assert.equal((yield* Queue.take(f.starts)).options.resumeSessionId, "ses_native");
+      assert.deepStrictEqual(yield* Queue.take(f.stops), {
+        index: 0,
+        options: { interrupt: false },
+      });
+      assert.equal(yield* adapter.hasSession(threadId), true);
+      assert.deepStrictEqual(f.prompts, [["uncertain once", {}]]);
+      assert.equal((yield* adapter.listSessions())[0]?.activeTurnId, undefined);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "reasserts unverified native agent and model before new input after an applied switch response is lost",
+  () =>
+    Effect.gen(function* () {
+      for (const explicit of [false, true]) {
+        const f = yield* recoveryFixture();
+        const adapter = yield* makeOpenCodeNativeAdapter({
+          url: "https://native.example",
+          engineCreate: f.create,
+        });
+        const modelSelection = {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "openai/original",
+          options: [{ id: "variant", value: "high" }],
+        };
+        yield* adapter.startSession({ ...start, modelSelection });
+        yield* Queue.take(f.starts);
+        const switched = f.holdSwitch();
+        const send = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "stale waiting prompt",
+            modelSelection: {
+              ...modelSelection,
+              model: "openai/uncertain",
+              options: [
+                { id: "variant", value: "low" },
+                { id: "agent", value: "plan" },
+              ],
+            },
+          })
+          .pipe(Effect.exit, Effect.forkChild);
+        assert.equal(yield* Queue.take(f.switches), 0);
+        assert.deepStrictEqual(f.nativeSelection(), {
+          agent: "plan",
+          model: { providerID: "openai", id: "uncertain", variant: "low" },
+        });
+        f.loss(0);
+        yield* TestClock.adjust("250 millis");
+        yield* Queue.take(f.starts);
+        yield* Queue.take(f.stops);
+        assert.deepStrictEqual(f.prompts, []);
+        assert.equal(yield* Queue.size(f.switches), 0);
+        // Recovery must not change native selection or interrupt/replay work.
+        assert.equal(f.nativeSelection().agent, "plan");
+        assert.equal(f.fake.calls.includes("interrupt"), false);
+        // If new remote work starts after adoption, reconciliation must wait for idle.
+        f.callbacks[1]!({ type: "turn.started", turnID: "remote-work" });
+        const busy = yield* adapter
+          .sendTurn({ threadId, input: "not while busy" })
+          .pipe(Effect.flip);
+        assert.equal(busy._tag, "ProviderAdapterRequestError");
+        assert.equal(yield* Queue.size(f.switches), 0);
+        assert.deepStrictEqual(f.prompts, []);
+        assert.equal(f.nativeSelection().agent, "plan");
+        f.callbacks[1]!({ type: "turn.completed", turnID: "remote-work" });
+        const choice = explicit
+          ? {
+              ...modelSelection,
+              model: "openai/chosen",
+              options: [
+                { id: "variant", value: "medium" },
+                { id: "agent", value: "review" },
+              ],
+            }
+          : undefined;
+        const turn = yield* adapter.sendTurn({
+          threadId,
+          input: "new prompt",
+          interactionMode: "default",
+          ...(choice ? { modelSelection: choice } : {}),
+        });
+        assert.equal(yield* Queue.take(f.switches), 1);
+        assert.deepStrictEqual(f.promptSelections, [
+          {
+            agent: explicit ? "review" : "build",
+            model: {
+              providerID: "openai",
+              id: explicit ? "chosen" : "original",
+              variant: explicit ? "medium" : "high",
+            },
+          },
+        ]);
+        const ready = (yield* adapter.listSessions())[0];
+        switched.resolve({ success: true, data: undefined });
+        assert.equal(Exit.isFailure(yield* Fiber.join(send)), true);
+        f.callbacks[0]!({ type: "turn.started", turnID: "obsolete" });
+        assert.deepStrictEqual((yield* adapter.listSessions())[0], ready);
+        f.callbacks[1]!({ type: "turn.started", turnID: turn.turnId });
+        f.callbacks[1]!({ type: "turn.completed", turnID: turn.turnId });
+        yield* adapter.sendTurn({ threadId, input: "verified prompt", interactionMode: "default" });
+        assert.equal(yield* Queue.size(f.switches), 0);
+        assert.deepStrictEqual(f.prompts, [
+          ["new prompt", {}],
+          ["verified prompt", {}],
+        ]);
+        assert.deepStrictEqual(f.promptSelections[1], f.promptSelections[0]);
+        yield* adapter.stopSession(threadId);
+      }
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "scope closure fences starts during held cleanup and locally closes a late in-flight startup",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* recoveryFixture();
+      const scope = yield* Scope.make();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: f.create,
+      }).pipe(Effect.provideService(Scope.Scope, scope));
+      yield* adapter.startSession(start);
+      yield* Queue.take(f.starts);
+      const startup = f.hold();
+      const inflightId = ThreadId.make("inflight-at-close");
+      const inflight = yield* adapter
+        .startSession({ ...start, threadId: inflightId })
+        .pipe(Effect.exit, Effect.forkChild);
+      assert.equal((yield* Queue.take(f.starts)).index, 1);
+      const stop = f.holdStop(0);
+      const closing = yield* Scope.close(scope, Exit.void).pipe(Effect.forkChild);
+      assert.deepStrictEqual(yield* Queue.take(f.stops), {
+        index: 1,
+        options: { interrupt: false },
+      });
+      assert.deepStrictEqual(yield* Queue.take(f.stops), { index: 0, options: undefined });
+      const other = { ...start, threadId: ThreadId.make("start-during-close") };
+      assert.equal(Exit.isFailure(yield* adapter.startSession(other).pipe(Effect.exit)), true);
+      assert.deepStrictEqual(yield* adapter.listSessions(), []);
+      startup.resolve({
+        success: true,
+        data: { id: "ses_native", location: { directory: start.cwd } },
+      });
+      assert.equal(Exit.isFailure(yield* Fiber.join(inflight)), true);
+      assert.deepStrictEqual(yield* Queue.take(f.stops), {
+        index: 1,
+        options: { interrupt: false },
+      });
+      stop.resolve();
+      yield* Fiber.join(closing);
+      assert.equal(Exit.isFailure(yield* adapter.startSession(other).pipe(Effect.exit)), true);
+      f.loss(0);
+      f.loss(1);
+      yield* TestClock.adjust("30 seconds");
+      assert.equal(yield* Queue.size(f.starts), 0);
+      assert.equal(yield* Queue.size(f.switches), 0);
+      assert.equal(f.callbacks.length, 2);
+      assert.equal(f.liveSubscriptions.size, 0);
+      assert.deepStrictEqual(yield* adapter.listSessions(), []);
+      assert.deepStrictEqual(f.prompts, []);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "public stopAll remains reusable and does not orphan a new session during held cleanup",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* recoveryFixture();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: f.create,
+      });
+      yield* adapter.startSession(start);
+      yield* Queue.take(f.starts);
+      const stop = f.holdStop(0);
+      const stopping = yield* adapter.stopAll().pipe(Effect.forkChild);
+      yield* Queue.take(f.stops);
+      const otherId = ThreadId.make("start-during-public-stop");
+      yield* adapter.startSession({ ...start, threadId: otherId });
+      assert.equal((yield* Queue.take(f.starts)).index, 1);
+      stop.resolve();
+      yield* Fiber.join(stopping);
+      assert.equal(yield* adapter.hasSession(otherId), true);
+      assert.deepStrictEqual([...f.liveSubscriptions], [1]);
+      yield* adapter.stopAll();
+      assert.equal((yield* Queue.take(f.stops)).index, 1);
+      assert.equal(f.liveSubscriptions.size, 0);
+      yield* adapter.startSession(start);
+      assert.equal((yield* Queue.take(f.starts)).index, 2);
+      yield* adapter.stopAll();
+      assert.equal((yield* Queue.take(f.stops)).index, 2);
+      assert.equal(f.liveSubscriptions.size, 0);
+      assert.deepStrictEqual(yield* adapter.listSessions(), []);
+    }).pipe(Effect.provide(testLayer)),
 );

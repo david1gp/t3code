@@ -42,6 +42,7 @@ import * as Arr from "effect/Array";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Predicate from "effect/Predicate";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Struct from "effect/Struct";
@@ -1534,9 +1535,11 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         created_at AS "createdAt"
       FROM projection_thread_activities
       WHERE thread_id = ${threadId}
-        AND kind IN ('user-input.requested', 'user-input.resolved')
+        AND kind IN ('user-input.requested', 'user-input.resolved', 'user-input.expired')
         AND json_extract(payload_json, '$.requestId') = ${requestId}
-      ORDER BY sequence DESC, created_at DESC, activity_id DESC
+      ORDER BY
+        CASE WHEN kind = 'user-input.expired' THEN 0 ELSE 1 END ASC,
+        sequence DESC, created_at DESC, activity_id DESC
       LIMIT 1
     `,
   });
@@ -1934,13 +1937,15 @@ pending_approval_requests AS (
             activity.kind,
             ROW_NUMBER() OVER (
               PARTITION BY json_extract(activity.payload_json, '$.requestId')
-              ORDER BY activity.created_at DESC, activity.activity_id DESC
+              ORDER BY
+                CASE WHEN activity.kind = 'user-input.expired' THEN 0 ELSE 1 END ASC,
+                activity.created_at DESC, activity.activity_id DESC
             ) AS request_order
           FROM pending_user_input_thread AS pending
           CROSS JOIN projection_thread_activities AS activity
           WHERE activity.thread_id = pending.thread_id
             AND (
-              activity.kind IN ('user-input.requested', 'user-input.resolved')
+              activity.kind IN ('user-input.requested', 'user-input.resolved', 'user-input.expired')
               OR (
                 activity.kind = 'provider.user-input.respond.failed'
                 AND (
@@ -2004,6 +2009,106 @@ pending_approval_requests AS (
         SELECT activity_id AS "activityId"
         FROM pinned_activity_ids
       `,
+  });
+
+  // Keep one real terminal event per returned open request, not all historical
+  // closures. Resolutions have the same truncation hazard as recovery expiry.
+  const listThreadRequestFinalityRows = SqlSchema.findAll({
+    Request: Schema.Struct({
+      threadId: ThreadId,
+      approvalRequestIds: Schema.Array(Schema.String),
+      userInputRequestIds: Schema.Array(Schema.String),
+    }),
+    Result: ProjectionThreadActivityDbRowSchema,
+    execute: ({ threadId, approvalRequestIds, userInputRequestIds }) => sql`
+      WITH matching_finality AS (
+        SELECT activity_id, thread_id, turn_id, tone, kind, summary, sequence, created_at,
+          CASE WHEN kind LIKE 'provider.%' THEN
+            json_object('requestId', json_extract(payload_json, '$.requestId'),
+              'detail', json_extract(payload_json, '$.detail'))
+          ELSE json_object('requestId', json_extract(payload_json, '$.requestId')) END AS payload_json,
+          ROW_NUMBER() OVER (
+            PARTITION BY
+              CASE WHEN kind IN ('approval.resolved', 'approval.expired', 'provider.approval.respond.failed') THEN 'approval' ELSE 'user-input' END,
+              json_extract(payload_json, '$.requestId')
+            ORDER BY CASE WHEN kind IN ('approval.expired', 'user-input.expired') THEN 0 ELSE 1 END,
+              sequence DESC, created_at DESC, activity_id DESC
+          ) AS request_order
+        FROM projection_thread_activities
+        WHERE thread_id = ${threadId}
+          AND kind IN ('approval.resolved', 'approval.expired', 'user-input.resolved', 'user-input.expired', 'provider.approval.respond.failed', 'provider.user-input.respond.failed')
+          AND CASE WHEN json_valid(payload_json) THEN
+            json_type(payload_json, '$.requestId') = 'text' AND (
+              (
+                json_extract(payload_json, '$.requestId') IN (SELECT value FROM json_each(${JSON.stringify(approvalRequestIds)}))
+                AND (kind IN ('approval.resolved', 'approval.expired') OR (
+                  kind = 'provider.approval.respond.failed' AND (
+                    lower(COALESCE(json_extract(payload_json, '$.detail'), '')) LIKE '%stale pending approval request%'
+                    OR lower(COALESCE(json_extract(payload_json, '$.detail'), '')) LIKE '%unknown pending approval request%'
+                    OR lower(COALESCE(json_extract(payload_json, '$.detail'), '')) LIKE '%unknown pending permission request%'
+                    OR lower(COALESCE(json_extract(payload_json, '$.detail'), '')) LIKE '%unknown pending codex approval request%'
+                  )
+                ))
+              ) OR (
+                json_extract(payload_json, '$.requestId') IN (SELECT value FROM json_each(${JSON.stringify(userInputRequestIds)}))
+                AND (kind IN ('user-input.resolved', 'user-input.expired') OR (
+                  kind = 'provider.user-input.respond.failed' AND (
+                    lower(COALESCE(json_extract(payload_json, '$.detail'), '')) LIKE '%stale pending user-input request%'
+                    OR lower(COALESCE(json_extract(payload_json, '$.detail'), '')) LIKE '%unknown pending user-input request%'
+                    OR lower(COALESCE(json_extract(payload_json, '$.detail'), '')) LIKE '%unknown pending user input request%'
+                    OR lower(COALESCE(json_extract(payload_json, '$.detail'), '')) LIKE '%unknown pending codex user input request%'
+                  )
+                ))
+              )
+            ) ELSE 0 END
+      )
+      SELECT activity_id AS "activityId", thread_id AS "threadId", turn_id AS "turnId",
+        tone, kind, summary, payload_json AS "payload", sequence, created_at AS "createdAt"
+      FROM matching_finality WHERE request_order = 1
+    `,
+  });
+
+  const withThreadRequestFinality = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    activities: OrchestrationThreadActivity[],
+  ) {
+    const approvalRequestIds = new Set<string>();
+    const userInputRequestIds = new Set<string>();
+    for (const activity of activities) {
+      if (!Predicate.isObject(activity.payload) || typeof activity.payload.requestId !== "string")
+        continue;
+      if (activity.kind === "approval.requested")
+        approvalRequestIds.add(activity.payload.requestId);
+      if (activity.kind === "user-input.requested")
+        userInputRequestIds.add(activity.payload.requestId);
+    }
+    if (approvalRequestIds.size === 0 && userInputRequestIds.size === 0) return activities;
+    const finalityRows = yield* listThreadRequestFinalityRows({
+      threadId,
+      approvalRequestIds: [...approvalRequestIds],
+      userInputRequestIds: [...userInputRequestIds],
+    }).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.getThreadDetailById:listRequestFinality:query",
+          "ProjectionSnapshotQuery.getThreadDetailById:listRequestFinality:decodeRows",
+        ),
+      ),
+    );
+    // Existing recent/pinned payloads win; only out-of-window tombstones are minimal.
+    return [
+      ...new Map(
+        [...finalityRows.map(mapThreadActivityRow), ...activities].map((activity) => [
+          activity.id,
+          activity,
+        ]),
+      ).values(),
+    ].toSorted(
+      (left, right) =>
+        (left.sequence ?? -1) - (right.sequence ?? -1) ||
+        left.createdAt.localeCompare(right.createdAt) ||
+        left.id.localeCompare(right.id),
+    );
   });
 
   const listThreadActivityRowsByThreadWindow = SqlSchema.findAll({
@@ -3483,12 +3588,7 @@ pending_approval_requests AS (
       }
     }
 
-    return activities.toSorted(
-      (left, right) =>
-        (left.sequence ?? -1) - (right.sequence ?? -1) ||
-        left.createdAt.localeCompare(right.createdAt) ||
-        left.id.localeCompare(right.id),
-    );
+    return yield* withThreadRequestFinality(threadId, activities);
   });
 
   const getThreadDetailByIdBounded = (
@@ -3545,6 +3645,11 @@ pending_approval_requests AS (
                       left.activityId.localeCompare(right.activityId),
                   )
                   .map(mapThreadActivityRow),
+              ),
+              Effect.flatMap((activities) =>
+                activityRead.query?.activityKinds === undefined
+                  ? withThreadRequestFinality(threadId, activities)
+                  : Effect.succeed(activities),
               ),
             );
 

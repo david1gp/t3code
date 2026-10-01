@@ -176,6 +176,7 @@ const ItemCompletedType = Schema.Literal("item.completed");
 const ContentDeltaType = Schema.Literal("content.delta");
 const RequestOpenedType = Schema.Literal("request.opened");
 const RequestResolvedType = Schema.Literal("request.resolved");
+const RequestExpiredType = Schema.Literal("request.expired");
 const UserInputRequestedType = Schema.Literal("user-input.requested");
 const UserInputResolvedType = Schema.Literal("user-input.resolved");
 const TaskStartedType = Schema.Literal("task.started");
@@ -485,6 +486,11 @@ const RequestResolvedPayload = Schema.Struct({
   resolution: Schema.optional(Schema.Unknown),
 });
 export type RequestResolvedPayload = typeof RequestResolvedPayload.Type;
+
+const RequestExpiredPayload = Schema.Struct({
+  requestType: CanonicalRequestType,
+  reason: TrimmedNonEmptyStringSchema,
+});
 
 const UserInputQuestionOption = Schema.Struct({
   label: TrimmedNonEmptyStringSchema,
@@ -1031,6 +1037,13 @@ const ProviderRuntimeRequestResolvedEvent = Schema.Struct({
 });
 export type ProviderRuntimeRequestResolvedEvent = typeof ProviderRuntimeRequestResolvedEvent.Type;
 
+const ProviderRuntimeRequestExpiredEvent = Schema.Struct({
+  ...ProviderRuntimeEventBase.fields,
+  type: RequestExpiredType,
+  requestId: RuntimeRequestId,
+  payload: RequestExpiredPayload,
+});
+
 const ProviderRuntimeUserInputRequestedEvent = Schema.Struct({
   ...ProviderRuntimeEventBase.fields,
   type: UserInputRequestedType,
@@ -1225,6 +1238,7 @@ export const ProviderRuntimeEventV2 = Schema.Union([
   ProviderRuntimeContentDeltaEvent,
   ProviderRuntimeRequestOpenedEvent,
   ProviderRuntimeRequestResolvedEvent,
+  ProviderRuntimeRequestExpiredEvent,
   ProviderRuntimeUserInputRequestedEvent,
   ProviderRuntimeUserInputResolvedEvent,
   ProviderRuntimeTaskStartedEvent,

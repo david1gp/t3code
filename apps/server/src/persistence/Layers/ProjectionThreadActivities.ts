@@ -201,6 +201,7 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
           AND kind IN (
             'user-input.requested',
             'user-input.resolved',
+            'user-input.expired',
             'provider.user-input.respond.failed'
           )
         ORDER BY

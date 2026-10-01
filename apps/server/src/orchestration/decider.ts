@@ -84,6 +84,8 @@ function isStaleRequestFailureDetail(payload: Record<string, unknown> | null): b
 // while the agent works, so they must not expire with the activity window.
 function openRequests(thread: Pick<OrchestrationThread, "activities">) {
   const requests = new Map<string, OrchestrationThreadActivity>();
+  // Recovery expiry is final even if a delayed request-open follows it.
+  const expiredRequestIds = new Set<string>();
   for (const activity of thread.activities) {
     const payload =
       typeof activity.payload === "object" && activity.payload !== null
@@ -92,7 +94,10 @@ function openRequests(thread: Pick<OrchestrationThread, "activities">) {
     const requestId = typeof payload?.requestId === "string" ? payload.requestId : null;
     if (requestId === null) continue;
     if (activity.kind === "approval.requested" || activity.kind === "user-input.requested") {
-      requests.set(requestId, activity);
+      if (!expiredRequestIds.has(requestId)) requests.set(requestId, activity);
+    } else if (activity.kind === "approval.expired" || activity.kind === "user-input.expired") {
+      expiredRequestIds.add(requestId);
+      requests.delete(requestId);
     } else if (activity.kind === "approval.resolved" || activity.kind === "user-input.resolved") {
       requests.delete(requestId);
     } else if (

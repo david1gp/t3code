@@ -1060,6 +1060,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
       let detail = "Native session event stream closed.";
       try {
         for await (const frame of client.event.subscribe({ signal: controller.signal })) {
+          if (controller.signal.aborted || abort !== controller) break;
           const message = frame;
           const data = record(message.data);
           const messageSessionID =
@@ -1262,6 +1263,11 @@ export const openCodeNativeSessionEngineCreate = (input: {
           }
         };
       });
+      controller.signal.addEventListener(
+        "abort",
+        () => settle(fail("session.start", "Native session start cancelled locally.")),
+        { once: true },
+      );
       listen(controller, settle);
       // @effect-diagnostics-next-line globalTimers:off -- The standalone client waits for its event stream, outside an Effect runtime.
       const timer = setTimeout(
@@ -1310,7 +1316,13 @@ export const openCodeNativeSessionEngineCreate = (input: {
         } catch {
           adopted = undefined;
         }
-        if (!adopted || !connected || disconnected) {
+        if (
+          !adopted ||
+          !connected ||
+          disconnected ||
+          controller.signal.aborted ||
+          abort !== controller
+        ) {
           controller.abort();
           abort = undefined;
           return fail(
@@ -1353,7 +1365,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
         return fail("session.create", "Invalid native session response or mismatched directory.");
       }
       session = found;
-      if (!connected || disconnected) {
+      if (!connected || disconnected || controller.signal.aborted || abort !== controller) {
         controller.abort();
         abort = undefined;
         session = undefined;
@@ -1856,10 +1868,11 @@ export const openCodeNativeSessionEngineCreate = (input: {
       // Do not fabricate a turn terminal: the execution.interrupted event is authoritative.
       return { success: true, data: interrupted };
     },
-    stop: async (): Promise<Result<void>> => {
+    /** Local disposal is used by recovery; only explicit stops interrupt native work. */
+    stop: async (options?: { readonly interrupt?: boolean }): Promise<Result<void>> => {
       if (!abort) return { success: true, data: undefined };
       let stopFailure: Result<void> | undefined;
-      if (active || admitting || uncertain) {
+      if (options?.interrupt !== false && (active || admitting || uncertain)) {
         try {
           const response = await requestWithDeadline(abort.signal, (signal) =>
             client.session.interrupt({ sessionID: session!.id }, { signal }),

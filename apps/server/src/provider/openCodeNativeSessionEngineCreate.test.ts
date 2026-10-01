@@ -2996,3 +2996,115 @@ describe("native v2.0.18 session slice", () => {
     }
   });
 });
+
+for (const state of ["active", "uncertain-admission"] as const) {
+  it(`local recovery disposal of ${state} work never sends a remote interrupt`, async () => {
+    const test = await sessionFixture(
+      state === "uncertain-admission"
+        ? async (...args) => {
+            const response = await fetch(...args);
+            const url = args[0] instanceof Request ? args[0].url : String(args[0]);
+            return url.endsWith("/prompt") ? new Response("{}", { status: 200 }) : response;
+          }
+        : fetch,
+    );
+    try {
+      const admitted = await test.engine.send("one original prompt");
+      if (state === "active") {
+        expect(admitted.success).toBe(true);
+        test.write("session.execution.started");
+        await test.wait((event) => event.type === "turn.started");
+        test.disconnect();
+        await test.wait((event) => event.type === "stream.lost");
+      } else expect(admitted.success).toBe(false);
+      expect(await test.engine.stop({ interrupt: false })).toEqual({
+        success: true,
+        data: undefined,
+      });
+      expect(test.interrupts()).toBe(0);
+      expect(test.promptCount()).toBe(1);
+      expect((await test.engine.send("do not replay")).success).toBe(false);
+    } finally {
+      await test.close();
+    }
+  });
+}
+
+it("explicit stop still interrupts active native work exactly once", async () => {
+  const test = await sessionFixture();
+  try {
+    await test.admit();
+    test.write("session.execution.started");
+    await test.wait((event) => event.type === "turn.started");
+    expect(await test.engine.stop()).toEqual({ success: true, data: undefined });
+    expect(test.interrupts()).toBe(1);
+  } finally {
+    await test.close();
+  }
+});
+
+it("local disposal cancels a start awaiting SSE readiness without creating or interrupting a native session", async () => {
+  const subscribed = Promise.withResolvers<void>();
+  const requests: string[] = [];
+  const server = await fixture((req, res) => {
+    requests.push(req.url!);
+    if (req.url === "/api/event") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.flushHeaders();
+      subscribed.resolve();
+    } else res.writeHead(500).end();
+  });
+  const engine = openCodeNativeSessionEngineCreate({ url: server.url, onEvent: () => {} });
+  try {
+    const started = engine.start({ directory, resumeSessionId: session.id });
+    await subscribed.promise;
+    expect(await engine.stop({ interrupt: false })).toEqual({ success: true, data: undefined });
+    expect(await started).toMatchObject({ success: false, error: { operation: "session.start" } });
+    expect(requests).toEqual(["/api/event"]);
+  } finally {
+    await engine.stop({ interrupt: false });
+    await server.close();
+  }
+});
+
+for (const blocker of ["inbox", "permission", "form"] as const) {
+  it(`quiescent adoption refuses a native ${blocker} without answering, cancelling, prompting, or interrupting it`, async () => {
+    let pending = true;
+    const writes: string[] = [];
+    const server = await fixture((req, res) => {
+      if (req.method !== "GET") writes.push(req.url!);
+      if (req.url === "/api/event") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        frame(res, "server.connected", {});
+      } else if (req.url === "/api/session/ses_fixture") send(res, { data: session });
+      else if (req.url === "/api/session/active") send(res, { data: {} });
+      else if (req.url === `/api/session/ses_fixture/${blocker}`)
+        send(res, { data: pending ? [{ id: "pending_native" }] : [] });
+      else if (
+        ["inbox", "permission", "form"].some(
+          (path) => req.url === `/api/session/ses_fixture/${path}`,
+        )
+      )
+        send(res, { data: [] });
+      else res.writeHead(404).end();
+    });
+    let engine = openCodeNativeSessionEngineCreate({ url: server.url, onEvent: () => {} });
+    try {
+      expect(await engine.start({ directory, resumeSessionId: session.id })).toMatchObject({
+        success: false,
+        error: { operation: "session.resume" },
+      });
+      await engine.stop({ interrupt: false });
+      pending = false;
+      engine = openCodeNativeSessionEngineCreate({ url: server.url, onEvent: () => {} });
+      expect(await engine.start({ directory, resumeSessionId: session.id })).toEqual({
+        success: true,
+        data: session,
+      });
+      expect(writes).toEqual([]);
+    } finally {
+      await engine.stop({ interrupt: false });
+      await server.close();
+    }
+  });
+}
