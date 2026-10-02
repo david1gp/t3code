@@ -3,9 +3,8 @@
  * Folds parsed transcript records into `(day, hourStart?, provider, model)`
  * buckets.
  *
- * `Intl.DateTimeFormat` is the only reliable way to resolve a wall-clock day in
- * an arbitrary IANA zone, and it takes a `Date`. That is why the raw `Date`
- * construction is allowed here; nothing in this module reads the clock.
+ * Reporting days use the shared IANA-zone formatter. Hour boundaries use
+ * `Date` only for ISO formatting; nothing in this module reads the clock.
  *
  * Pure, so the bucketing and de-duplication rules are testable without touching
  * the filesystem or the network.
@@ -16,33 +15,7 @@ import type { UsageBucket, UsageDay, UsageResolution, UsageTokenTotals } from "@
 
 import { addTotals, EMPTY_TOTALS, type UsageRecord } from "./usageTranscripts.ts";
 import { cacheSavingsUsd, priceUsage, type RateTable } from "./usagePricing.ts";
-
-/**
- * Formats an instant as a `YYYY-MM-DD` day in `timeZone`.
- *
- * `en-CA` yields ISO-ordered parts, which is why it is used here rather than
- * assembling the day from `Date` getters (those are host-local only).
- */
-function makeDayFormatter(timeZone: string): (timestampMs: number) => string {
-  let format: Intl.DateTimeFormat;
-  try {
-    format = new Intl.DateTimeFormat("en-CA", {
-      timeZone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    });
-  } catch {
-    // An unknown zone should degrade to UTC rather than fail the whole scan.
-    format = new Intl.DateTimeFormat("en-CA", {
-      timeZone: "UTC",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    });
-  }
-  return (timestampMs) => format.format(new Date(timestampMs));
-}
+import { usageDayFormatterCreate } from "./usageDayFormatterCreate.ts";
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -93,7 +66,7 @@ export class UsageAggregator {
 
   constructor(options: AggregateOptions) {
     this.#options = options;
-    this.#toDay = makeDayFormatter(options.timeZone);
+    this.#toDay = usageDayFormatterCreate(options.timeZone);
     if (options.resolution === "hour") {
       if (options.sinceTimeMs === undefined || options.untilTimeMs === undefined) {
         throw new Error("Hourly usage aggregation requires exact time bounds");
@@ -161,12 +134,15 @@ export class UsageAggregator {
       this.#buckets.set(key, bucket);
     }
 
+    // Projection-backed costs remain authoritative even when token totals are
+    // unavailable. A matching token-price override must not erase that amount.
+    const reportedCostProvider = record.provider === "opencode" || record.provider === "pi";
     const priced = priceUsage(
       this.#options.rates,
       record.model,
       record.totals,
       record.reportedCostUsd,
-      record.provider === "opencode" ? undefined : this.#options.priceOverrides,
+      reportedCostProvider ? undefined : this.#options.priceOverrides,
     );
 
     bucket.totals = addTotals(bucket.totals, record.totals);

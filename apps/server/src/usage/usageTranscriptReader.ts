@@ -139,11 +139,11 @@ export async function listTranscriptFiles(
 }
 
 /**
- * Filesystem identity of a directory, as `device:inode`.
+ * Filesystem identity of a transcript directory or projection database, as `device:inode`.
  *
  * Used to tell "two servers reading the same transcript directory" apart from
  * "two machines whose hostname and home path happen to match". Returns an empty
- * string when the directory cannot be stat'd.
+ * string when the source cannot be stat'd.
  */
 export async function readDirectoryVolumeId(path: string): Promise<string> {
   try {

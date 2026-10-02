@@ -1,12 +1,13 @@
 /**
  * Usage reporting contract.
  *
- * Each environment scans the provider CLIs' own on-disk session transcripts
+ * Each environment combines provider CLIs' own on-disk session transcripts
  * (`~/.claude/projects/**\/*.jsonl`, `~/.codex/sessions/**\/*.jsonl`,
- * `~/.grok/sessions/**\/updates.jsonl`) rather than relying on T3 Code's own
- * orchestration projections, so transcript sources cover turns that were
- * never driven through T3 Code. OpenCode reported cost is the exception: it is
- * available only for turns recorded by T3 Code and persisted in projections.
+ * `~/.grok/sessions/**\/updates.jsonl`) with T3 Code's orchestration
+ * projections, so transcript sources cover turns that were
+ * never driven through T3 Code. Projection-backed reported costs cover only
+ * turns recorded by T3 Code. Provider support in this contract does not imply
+ * an external transcript scanner; each source describes its actual coverage.
  *
  * Environments return pre-aggregated `(day, hourStart?, provider, model)`
  * buckets. Raw transcript records never cross the wire.
@@ -22,17 +23,18 @@ import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
  * client merges compatible older versions and flags incompatible ones as
  * partial coverage instead of failing the whole page.
  */
-export const USAGE_CONTRACT_VERSION = 6 as const;
+export const USAGE_CONTRACT_VERSION = 7 as const;
 
 /**
  * Oldest {@link UsageSummary} version a current client will still merge.
  *
- * v6 adds OpenCode reported costs and source descriptions; v4+ transcript
- * buckets remain valid, so mixed-version environments keep available totals.
+ * v7 adds Pi provider identity; v6 adds OpenCode reported costs and source
+ * descriptions. v4+ buckets remain valid, so mixed-version environments keep
+ * available totals.
  */
 export const USAGE_MERGE_COMPATIBLE_SINCE = 4 as const;
 
-export const UsageProviderKind = Schema.Literals(["claude", "codex", "grok", "opencode"]);
+export const UsageProviderKind = Schema.Literals(["claude", "codex", "grok", "opencode", "pi"]);
 export type UsageProviderKind = typeof UsageProviderKind.Type;
 
 /**
@@ -84,10 +86,11 @@ export type UsageTokenTotals = typeof UsageTokenTotals.Type;
  * One `(day, hourStart?, provider, model)` cell. `hourStart` is the UTC start
  * instant of a rolling bucket and is present only for hourly requests.
  *
- * `costUsd` is the raw API-equivalent cost of these tokens. It is not money
- * spent: subscription plans bill separately. `unpricedRecords` counts records
- * whose tokens are included in the token totals but which contributed nothing
- * to `costUsd`.
+ * `costUsd` is the raw API-equivalent cost of these records, including reported
+ * amounts with unavailable token counts (represented by zero-filled totals).
+ * It is not money spent: subscription plans bill separately. `unpricedRecords`
+ * counts records whose tokens are included in the token totals but which
+ * contributed nothing to `costUsd`.
  */
 export const UsageBucket = Schema.Struct({
   day: UsageDay,
@@ -103,17 +106,17 @@ export const UsageBucket = Schema.Struct({
    */
   cacheSavingsUsd: Schema.Number,
   costSource: UsageCostSource,
-  /** Distinct assistant responses, after de-duplication. */
+  /** Distinct assistant responses or projected turn-cost records, after de-duplication. */
   records: NonNegativeInt,
   unpricedRecords: NonNegativeInt,
-  /** Distinct transcript sessions that contributed to this cell. */
+  /** Distinct provider sessions (or threads when session identity is absent) in this cell. */
   sessions: NonNegativeInt,
 });
 export type UsageBucket = typeof UsageBucket.Type;
 
 /**
  * Identifies the physical usage source an environment read from. Transcript
- * sources use their directory; projection-backed sources use a stable label.
+ * sources use their directory; projection-backed sources use their database file.
  *
  * Two environments on the same machine (worktree servers, for example) resolve
  * the same provider home and would otherwise double count. The client drops
@@ -124,7 +127,7 @@ export const UsageSourceFingerprint = Schema.Struct({
   provider: UsageProviderKind,
   resolvedHomePath: TrimmedNonEmptyString,
   /**
-   * Filesystem identity of the transcript directory, as `device:inode`.
+   * Filesystem identity of the transcript directory or projection database, as `device:inode`.
    *
    * Hostname and path alone are not enough: every Mac in a fleet resolves
    * `/Users/<user>/.claude`, so two machines that happen to share a hostname
@@ -142,12 +145,14 @@ export type UsageSourceStatus = typeof UsageSourceStatus.Type;
 export const UsageSource = Schema.Struct({
   fingerprint: UsageSourceFingerprint,
   status: UsageSourceStatus,
+  /** Transcript file counts; projection-backed sources use zero and describe record counts. */
   scannedFiles: NonNegativeInt,
   skippedFiles: NonNegativeInt,
   /** Records that parsed but carried no recognisable usage payload. */
   malformedRecords: NonNegativeInt,
   /**
-   * Distinct transcript sessions seen under this directory. Buckets also carry
+   * Distinct contributing provider sessions, or threads when session identity
+   * is absent, in this source. Buckets also carry
    * per-bucket session counts, but a session spans days and models, so summing
    * those overcounts; this is the figure clients should total.
    */

@@ -1,9 +1,10 @@
 /**
- * UsageService - scans provider transcripts and returns priced usage buckets.
+ * UsageService - combines provider transcripts and projected reported costs.
  *
  * The scan reads the provider CLIs' own session files (Claude Code, Codex, and
- * Grok Build) rather than T3 Code's orchestration projections, so usage covers
- * turns driven outside T3 Code too. This is the approach `ccusage` takes.
+ * Grok Build), so those sources cover turns driven outside T3 Code too. Pi
+ * and OpenCode use immutable turn-cost activities in T3 Code's orchestration
+ * projections instead; they have no external transcript scanner here.
  *
  * Transcripts are append-only, so parsed records are memoised per file by
  * `(size, mtime)`. A cold 30-day scan of ~1.4 GB lands around 2-3 seconds; warm
@@ -49,6 +50,7 @@ import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { mergeProviderInstanceEnvironment } from "../provider/ProviderInstanceEnvironment.ts";
 import { ProjectionThreadActivityRepository } from "../persistence/Services/ProjectionThreadActivities.ts";
 import { UsageAggregator } from "./usageAggregation.ts";
+import { usageDayFormatterCreate } from "./usageDayFormatterCreate.ts";
 import { createOverrideRateTable, parseRateTable, type RateTable } from "./usagePricing.ts";
 import {
   listTranscriptFiles,
@@ -550,7 +552,7 @@ export const make = Effect.gen(function* () {
     const activityUntil =
       hourlyWindow?.untilTimeMs ??
       Date.parse(`${input.untilDay}T00:00:00.000Z`) + 24 * 60 * 60 * 1000;
-    const openCodeCosts = yield* threadActivities
+    const reportedCosts = yield* threadActivities
       .listUsageCostActivities({
         since: DateTime.formatIso(DateTime.makeUnsafe(activitySince - MTIME_SLACK_MS)),
         until: DateTime.formatIso(DateTime.makeUnsafe(activityUntil + MTIME_SLACK_MS)),
@@ -560,7 +562,7 @@ export const make = Effect.gen(function* () {
           (cause) =>
             new UsageReadError({
               reason: "scanFailed",
-              detail: "OpenCode reported usage could not be read.",
+              detail: "Projection-backed reported usage could not be read.",
               cause,
             }),
         ),
@@ -642,13 +644,31 @@ export const make = Effect.gen(function* () {
       });
     }
 
-    const openCodeSessions = new Set<string>();
-    for (const activity of openCodeCosts) {
+    const projectionCounts = {
+      opencode: { sessions: new Set<string>(), final: 0, provisional: 0 },
+      pi: { sessions: new Set<string>(), final: 0, provisional: 0 },
+    };
+    const toDay = usageDayFormatterCreate(input.timeZone);
+    let unresolvedRecords = 0;
+    for (const activity of reportedCosts) {
       const timestampMs = Date.parse(activity.createdAt);
       if (!Number.isFinite(timestampMs)) continue;
+      if (activity.providerName === null) {
+        const day = toDay(timestampMs);
+        const inWindow =
+          hourlyWindow === null
+            ? day >= input.sinceDay && day <= input.untilDay
+            : timestampMs >= hourlyWindow.sinceTimeMs && timestampMs < hourlyWindow.untilTimeMs;
+        if (inWindow) unresolvedRecords += 1;
+        // The amount remains in the projection query. No known provider bucket
+        // can honestly include it until its immutable provenance is resolved.
+        continue;
+      }
+      const provider = activity.providerName;
+      if (provider !== "opencode" && provider !== "pi") continue;
       const sessionId = activity.providerSessionId ?? activity.threadId;
       const contributed = aggregator.add({
-        provider: "opencode",
+        provider,
         timestampMs,
         model: activity.model,
         sessionId,
@@ -660,26 +680,46 @@ export const make = Effect.gen(function* () {
           reasoningTokens: 0,
         },
         reportedCostUsd: activity.totalCostUsd,
-        dedupeKey: `opencode:${activity.threadId}:${activity.turnId}`,
+        dedupeKey: `projection-cost:${provider}:${activity.threadId}:${activity.turnId}`,
       });
-      if (contributed && sessionId.length > 0) openCodeSessions.add(sessionId);
+      if (!contributed) continue;
+      projectionCounts[provider][activity.status] += 1;
+      if (sessionId.length > 0) projectionCounts[provider].sessions.add(sessionId);
     }
-    sources.push({
-      fingerprint: {
-        hostId,
-        provider: "opencode",
-        resolvedHomePath: config.dbPath,
-        volumeId: "",
-      },
-      status: "ok",
-      scannedFiles: 0,
-      skippedFiles: 0,
-      malformedRecords: 0,
-      distinctSessions: openCodeSessions.size,
-      message: null,
-      description:
-        "OpenCode costs are reported for T3 Code turns with complete main-agent step data, without token totals. Excludes turns with subagents or incomplete cost data, subscription spend, and turns run outside T3 Code.",
-    });
+    const projectionPath = yield* fileSystem
+      .realPath(config.dbPath)
+      .pipe(Effect.orElseSucceed(() => path.resolve(config.dbPath)));
+    const projectionVolumeId = yield* Effect.promise(() => readDirectoryVolumeId(projectionPath));
+    for (const provider of ["opencode", "pi"] as const) {
+      const counts = projectionCounts[provider];
+      const limitations: string[] = [];
+      if (counts.provisional > 0) {
+        limitations.push(`${counts.provisional} provisional turn-cost records may change.`);
+      }
+      if (unresolvedRecords > 0) {
+        limitations.push(
+          `${unresolvedRecords} projection turn-cost records have unresolved provider provenance and are excluded from known-provider totals.`,
+        );
+      }
+      sources.push({
+        fingerprint: {
+          hostId,
+          provider,
+          resolvedHomePath: projectionPath,
+          volumeId: projectionVolumeId,
+        },
+        status: limitations.length > 0 ? "partial" : "ok",
+        scannedFiles: 0,
+        skippedFiles: 0,
+        malformedRecords: 0,
+        distinctSessions: counts.sessions.size,
+        message: limitations.length > 0 ? limitations.join(" ") : null,
+        description:
+          `${provider === "pi" ? "Pi" : "OpenCode"} provider-reported API-equivalent costs from T3 Code turns in the orchestration projection database, without token totals. ` +
+          `Includes ${counts.final} final and ${counts.provisional} provisional turn-cost records in this window; final describes snapshot status, not guaranteed accounting completeness. ` +
+          "Coverage is limited to recorded costs; excludes unreported costs, subscription charges, and turns run outside T3 Code. No external transcript scanner.",
+      });
+    }
 
     const pruned = pruneScanCache(fileCache, retentionCutoffMs);
     if (pruned > 0) cacheDirty = true;

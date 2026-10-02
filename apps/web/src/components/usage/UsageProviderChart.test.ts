@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import { buildPeriodColumns, niceScale } from "./UsageProviderChart";
-import { providersWithUsage } from "./usageProviders";
+import { PROVIDER_ORDER, PROVIDER_PRESENTATION, providersWithUsage } from "./usageProviders";
 
 describe("niceScale", () => {
   it("never puts the peak above the top of the scale", () => {
@@ -90,6 +90,7 @@ describe("buildPeriodColumns", () => {
       { provider: "claude", value: 20 },
       { provider: "grok", value: 0 },
       { provider: "opencode", value: 0 },
+      { provider: "pi", value: 0 },
     ]);
   });
 
@@ -102,6 +103,15 @@ describe("buildPeriodColumns", () => {
 });
 
 describe("providersWithUsage", () => {
+  it("presents Pi consistently and includes its activity in provider order", () => {
+    expect(PROVIDER_PRESENTATION.pi.label).toBe("Pi");
+    expect(PROVIDER_PRESENTATION.pi.color).toBe("#6b7280");
+    expect(PROVIDER_ORDER.at(-1)).toBe("pi");
+    expect(
+      providersWithUsage([{ provider: "pi", costUsd: 1.25, totalTokens: 0, records: 1 }]),
+    ).toEqual(["pi"]);
+  });
+
   it("omits providers with no records", () => {
     expect(
       providersWithUsage([

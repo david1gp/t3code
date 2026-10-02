@@ -90,17 +90,33 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
               tone = excluded.tone,
               kind = excluded.kind,
               summary = excluded.summary,
-              payload_json = excluded.payload_json,
+              payload_json = CASE
+                WHEN projection_thread_activities.kind = 'usage.cost'
+                  AND json_valid(projection_thread_activities.payload_json)
+                  AND json_type(projection_thread_activities.payload_json, '$.providerName') = 'text'
+                THEN json_set(excluded.payload_json, '$.providerName',
+                  json_extract(projection_thread_activities.payload_json, '$.providerName'))
+                ELSE excluded.payload_json
+              END,
               sequence = excluded.sequence,
               created_at = excluded.created_at
-            WHERE NOT (
+            WHERE NOT COALESCE((
               projection_thread_activities.kind = 'usage.cost'
               AND CASE
                 WHEN json_valid(projection_thread_activities.payload_json)
                 THEN json_extract(projection_thread_activities.payload_json, '$.status')
               END = 'final'
               AND json_extract(excluded.payload_json, '$.status') = 'provisional'
-            )
+            ), 0)
+            AND NOT COALESCE((
+              projection_thread_activities.kind = 'usage.cost'
+              AND CASE WHEN json_valid(projection_thread_activities.payload_json) THEN
+                json_type(projection_thread_activities.payload_json, '$.providerName') = 'text'
+                AND json_type(excluded.payload_json, '$.providerName') = 'text'
+                AND json_extract(projection_thread_activities.payload_json, '$.providerName')
+                  <> json_extract(excluded.payload_json, '$.providerName')
+                ELSE 0 END
+            ), 0)
           `,
   });
 
@@ -139,11 +155,56 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
     Request: ListProjectionUsageCostActivitiesInput,
     Result: ProjectionUsageCostActivity,
     execute: ({ since, until }) => sql`
-      WITH ranked_costs AS (
+      WITH cost_turns AS (
+        SELECT DISTINCT thread_id, turn_id
+        FROM projection_thread_activities
+        WHERE kind = 'usage.cost' AND turn_id IS NOT NULL AND created_at >= ${since}
+      ), runtime_turn_providers AS (
+        -- Only immutable runtime-originated events explicitly binding this turn
+        -- can recover old costs. Current thread/session selection is not evidence.
+        SELECT stream_id AS thread_id,
+          json_extract(event.payload_json, '$.session.activeTurnId') AS turn_id,
+          COUNT(DISTINCT json_extract(event.payload_json, '$.session.providerName')) AS provider_count,
+          CASE WHEN COUNT(DISTINCT json_extract(event.payload_json, '$.session.providerName')) = 1
+            THEN MIN(json_extract(event.payload_json, '$.session.providerName')) END AS provider_name
+        FROM cost_turns
+        JOIN orchestration_events AS event ON stream_id = cost_turns.thread_id
+        WHERE aggregate_kind = 'thread'
+          AND event_type = 'thread.session-set'
+          AND actor_kind = 'provider'
+          AND CASE WHEN json_valid(event.payload_json) THEN
+            json_extract(event.payload_json, '$.session.activeTurnId') = cost_turns.turn_id
+            AND json_type(event.payload_json, '$.session.providerName') = 'text'
+            AND json_extract(event.payload_json, '$.session.providerName') <> ''
+            ELSE 0 END
+        GROUP BY stream_id, json_extract(event.payload_json, '$.session.activeTurnId')
+      ), cost_turn_providers AS (
+        -- Older releases used distinct activity IDs for successive snapshots.
+        -- Supersession can replace amounts, not rewrite the turn's provenance.
+        SELECT activity.thread_id, activity.turn_id,
+          COUNT(DISTINCT json_extract(activity.payload_json, '$.providerName')) AS provider_count,
+          CASE WHEN COUNT(DISTINCT json_extract(activity.payload_json, '$.providerName')) = 1
+            THEN MIN(json_extract(activity.payload_json, '$.providerName')) END AS provider_name
+        FROM cost_turns
+        JOIN projection_thread_activities AS activity
+          ON activity.thread_id = cost_turns.thread_id AND activity.turn_id = cost_turns.turn_id
+        WHERE kind = 'usage.cost'
+          AND CASE WHEN json_valid(activity.payload_json) THEN
+            json_type(activity.payload_json, '$.providerName') = 'text'
+            AND json_extract(activity.payload_json, '$.providerName') <> ''
+            ELSE 0 END
+        GROUP BY activity.thread_id, activity.turn_id
+      ), ranked_costs AS (
         SELECT
           activity.thread_id AS "threadId",
           activity.turn_id AS "turnId",
-          'opencode' AS "providerName",
+          CASE WHEN runtime_turn_providers.provider_count > 1
+              OR (cost_turn_providers.provider_count > 0
+                AND runtime_turn_providers.provider_name <> cost_turn_providers.provider_name)
+            THEN NULL
+            WHEN cost_turn_providers.provider_count > 0
+            THEN cost_turn_providers.provider_name
+            ELSE runtime_turn_providers.provider_name END AS "providerName",
           CASE WHEN json_valid(activity.payload_json) THEN
             CASE WHEN json_type(activity.payload_json, '$.providerSessionId') = 'text'
               THEN json_extract(activity.payload_json, '$.providerSessionId') END END AS "providerSessionId",
@@ -153,11 +214,19 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
           activity.created_at AS "createdAt",
           CASE WHEN json_valid(activity.payload_json)
             THEN json_extract(activity.payload_json, '$.totalCostUsd') END AS "totalCostUsd",
+          CASE WHEN json_extract(activity.payload_json, '$.status') = 'final'
+            THEN 'final' ELSE 'provisional' END AS status,
           ROW_NUMBER() OVER (
             PARTITION BY activity.thread_id, activity.turn_id
             ORDER BY activity.sequence DESC, activity.created_at DESC, activity.activity_id DESC
           ) AS turn_rank
         FROM projection_thread_activities AS activity
+        LEFT JOIN runtime_turn_providers
+          ON runtime_turn_providers.thread_id = activity.thread_id
+          AND runtime_turn_providers.turn_id = activity.turn_id
+        LEFT JOIN cost_turn_providers
+          ON cost_turn_providers.thread_id = activity.thread_id
+          AND cost_turn_providers.turn_id = activity.turn_id
         WHERE activity.kind = 'usage.cost'
           AND activity.turn_id IS NOT NULL
           AND activity.created_at >= ${since}
@@ -174,7 +243,7 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
             ELSE 0 END
       )
       SELECT "threadId", "turnId", "providerName", "providerSessionId", model,
-        "createdAt", "totalCostUsd"
+        "createdAt", "totalCostUsd", status
       FROM ranked_costs
       WHERE turn_rank = 1 AND "createdAt" < ${until} AND model <> ''
       ORDER BY "createdAt", "threadId", "turnId"

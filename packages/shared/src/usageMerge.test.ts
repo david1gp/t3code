@@ -1,5 +1,6 @@
 import {
   USAGE_CONTRACT_VERSION,
+  USAGE_MERGE_COMPATIBLE_SINCE,
   type EnvironmentId,
   type UsageBucket,
   type UsageDay,
@@ -40,6 +41,7 @@ function summary(
     homePath: string;
     volumeId?: string;
     distinctSessions?: number;
+    status?: "ok" | "partial";
   }[],
   contractVersion: number = USAGE_CONTRACT_VERSION,
 ): UsageSummary {
@@ -57,7 +59,7 @@ function summary(
         resolvedHomePath: source.homePath,
         volumeId: source.volumeId ?? `vol-${source.hostId}`,
       },
-      status: "ok" as const,
+      status: source.status ?? "ok",
       scannedFiles: 1,
       skippedFiles: 0,
       malformedRecords: 0,
@@ -74,6 +76,53 @@ function environment(id: string, usageSummary: UsageSummary): EnvironmentUsage {
 }
 
 describe("mergeUsage", () => {
+  it.each(["ok", "partial"] as const)(
+    "keeps Pi reported-cost identity and totals from an %s source",
+    (status) => {
+      const merged = mergeUsage(
+        [
+          environment(
+            "pi-env",
+            summary(
+              [
+                bucket({
+                  provider: "pi",
+                  model: "pi-model",
+                  totals: {
+                    uncachedInputTokens: 0,
+                    cachedInputTokens: 0,
+                    cacheCreationTokens: 0,
+                    outputTokens: 0,
+                    reasoningTokens: 0,
+                  },
+                  costUsd: 1.25,
+                  costSource: "providerReported",
+                  records: 1,
+                  sessions: 1,
+                }),
+              ],
+              [{ provider: "pi", hostId: "host", homePath: "T3 Code recorded turns", status }],
+            ),
+          ),
+        ],
+        USAGE_CONTRACT_VERSION,
+      );
+
+      expect(merged.costUsd).toBe(1.25);
+      expect(merged.totalTokens).toBe(0);
+      expect(merged.records).toBe(1);
+      expect(merged.providers).toMatchObject([
+        { provider: "pi", costUsd: 1.25, totalTokens: 0, records: 1 },
+      ]);
+      expect(merged.models).toMatchObject([
+        { provider: "pi", model: "pi-model", costUsd: 1.25, totalTokens: 0 },
+      ]);
+      expect(merged.daily[0]?.byProvider.get("pi")).toEqual({ costUsd: 1.25, totalTokens: 0 });
+      expect(merged.costQuality.providerReportedShare).toBe(1);
+      expect(merged.contributingEnvironments).toEqual(["pi-env"]);
+    },
+  );
+
   it("sums environments that read different transcript directories", () => {
     const merged = mergeUsage(
       [
@@ -178,7 +227,7 @@ describe("mergeUsage", () => {
           summary(
             [bucket()],
             [{ provider: "claude", hostId: "linux", homePath: "/b" }],
-            USAGE_CONTRACT_VERSION - 2,
+            USAGE_MERGE_COMPATIBLE_SINCE - 1,
           ),
         ),
       ],

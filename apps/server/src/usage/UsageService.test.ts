@@ -10,6 +10,7 @@ import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import { mergeUsage } from "@t3tools/shared/usageMerge";
 import {
   EnvironmentId,
+  EventId,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
@@ -29,6 +30,7 @@ import * as Scheduler from "effect/Scheduler";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -36,6 +38,8 @@ import {
   ProjectionThreadActivityRepository,
   type ProjectionUsageCostActivity,
 } from "../persistence/Services/ProjectionThreadActivities.ts";
+import { ProjectionThreadActivityRepositoryLive } from "../persistence/Layers/ProjectionThreadActivities.ts";
+import { layerConfig as SqlitePersistenceConfig } from "../persistence/Layers/Sqlite.ts";
 import * as UsageService from "./UsageService.ts";
 
 const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -90,8 +94,8 @@ const serviceLayers = (input: {
   readonly ratesDocument?: unknown;
   readonly environment?: NodeJS.ProcessEnv;
   readonly usageCostActivities?: readonly ProjectionUsageCostActivity[];
-}) =>
-  ServerConfig.layerTest(process.cwd(), { prefix: input.prefix }).pipe(
+}) => {
+  const base = ServerConfig.layerTest(process.cwd(), { prefix: input.prefix }).pipe(
     Layer.provideMerge(NodeServices.layer),
     Layer.provideMerge(ServerSettings.layerTest(input.settings)),
     Layer.provideMerge(
@@ -113,19 +117,25 @@ const serviceLayers = (input: {
         ...input.environment,
       }),
     ),
-    Layer.provideMerge(
-      Layer.succeed(
-        ProjectionThreadActivityRepository,
-        ProjectionThreadActivityRepository.of({
-          upsert: () => Effect.void,
-          listByThreadId: () => Effect.succeed([]),
-          listUsageCostActivities: () => Effect.succeed(input.usageCostActivities ?? []),
-          listUserInputLifecycleByThreadId: () => Effect.succeed([]),
-          getLatestTaskActivity: () => Effect.succeed(Option.none()),
-          deleteByThreadId: () => Effect.void,
-        }),
-      ),
-    ),
+  );
+  const activities = Layer.succeed(
+    ProjectionThreadActivityRepository,
+    ProjectionThreadActivityRepository.of({
+      upsert: () => Effect.void,
+      listByThreadId: () => Effect.succeed([]),
+      listUsageCostActivities: () => Effect.succeed(input.usageCostActivities ?? []),
+      listUserInputLifecycleByThreadId: () => Effect.succeed([]),
+      getLatestTaskActivity: () => Effect.succeed(Option.none()),
+      deleteByThreadId: () => Effect.void,
+    }),
+  );
+  return activities.pipe(Layer.provideMerge(base));
+};
+
+const persistedServiceLayers = (input: Parameters<typeof serviceLayers>[0]) =>
+  ProjectionThreadActivityRepositoryLive.pipe(
+    Layer.provideMerge(SqlitePersistenceConfig),
+    Layer.provideMerge(serviceLayers(input)),
   );
 
 function totalOutputTokens(summary: { buckets: readonly { totals: { outputTokens: number } }[] }) {
@@ -134,63 +144,366 @@ function totalOutputTokens(summary: { buckets: readonly { totals: { outputTokens
 
 describe("UsageService", () => {
   it.live(
-    "merges T3-recorded OpenCode reported costs into timezone buckets and source diagnostics",
+    "merges persisted Pi and OpenCode costs across provider switches into timezone buckets with authoritative zero-token amounts",
     () =>
       Effect.gen(function* () {
         const { settings, home } = yield* setup;
-        const service = yield* UsageService.make.pipe(
+        yield* Effect.gen(function* () {
+          const repository = yield* ProjectionThreadActivityRepository;
+          const sql = yield* SqlClient.SqlClient;
+          const config = yield* ServerConfig.ServerConfig;
+          const threadId = ThreadId.make("thread-provider-switch");
+          const createdAt = "2026-08-07T04:05:00.000Z";
+          for (const [provider, turnId, amount] of [
+            ["opencode", "turn-opencode", 0],
+            ["pi", "turn-pi", 1.25],
+            ["pi", "turn-pi-free", 0],
+          ] as const) {
+            yield* repository.upsert({
+              activityId: EventId.make(`usage-cost-${turnId}`),
+              threadId,
+              turnId: TurnId.make(turnId),
+              tone: "info",
+              kind: "usage.cost",
+              summary: "Reported cost",
+              payload: {
+                providerName: provider,
+                providerSessionId: "same-session-string",
+                model: "shared-model",
+                totalCostUsd: amount,
+                status: "final",
+              },
+              createdAt,
+            });
+          }
+          // Mutable selection has already switched to an unrelated provider.
+          yield* sql`
+            INSERT INTO projection_thread_sessions
+              (thread_id, status, provider_name, provider_session_id, runtime_mode, updated_at)
+            VALUES (${threadId}, 'idle', 'claude', 'current-session', 'full-access', ${createdAt})
+          `;
+          const service = yield* UsageService.make;
+          const summary = yield* service.readSummary({
+            ...WINDOW,
+            timeZone: "America/Los_Angeles",
+            sinceDay: UsageDay.make("2026-08-06"),
+            untilDay: UsageDay.make("2026-08-06"),
+          });
+          assert.deepStrictEqual(summary.buckets, [
+            {
+              day: UsageDay.make("2026-08-06"),
+              provider: "opencode",
+              model: "shared-model",
+              totals: {
+                uncachedInputTokens: 0,
+                cachedInputTokens: 0,
+                cacheCreationTokens: 0,
+                outputTokens: 0,
+                reasoningTokens: 0,
+              },
+              costUsd: 0,
+              cacheSavingsUsd: 0,
+              costSource: "providerReported",
+              records: 1,
+              unpricedRecords: 0,
+              sessions: 1,
+            },
+            {
+              day: UsageDay.make("2026-08-06"),
+              provider: "pi",
+              model: "shared-model",
+              totals: {
+                uncachedInputTokens: 0,
+                cachedInputTokens: 0,
+                cacheCreationTokens: 0,
+                outputTokens: 0,
+                reasoningTokens: 0,
+              },
+              costUsd: 1.25,
+              cacheSavingsUsd: 0,
+              costSource: "providerReported",
+              records: 2,
+              unpricedRecords: 0,
+              sessions: 1,
+            },
+          ]);
+          const merged = mergeUsage(
+            [
+              {
+                environmentId: EnvironmentId.make("persisted-provider-switch"),
+                label: "persisted provider usage",
+                summary,
+              },
+            ],
+            summary.contractVersion,
+          );
+          assert.strictEqual(merged.costUsd, 1.25);
+          assert.strictEqual(merged.totalTokens, 0);
+          assert.deepStrictEqual(
+            merged.providers
+              .map(({ provider, costUsd, totalTokens, records }) => ({
+                provider,
+                costUsd,
+                totalTokens,
+                records,
+              }))
+              .sort((left, right) => left.provider.localeCompare(right.provider)),
+            [
+              { provider: "opencode", costUsd: 0, totalTokens: 0, records: 1 },
+              { provider: "pi", costUsd: 1.25, totalTokens: 0, records: 2 },
+            ],
+          );
+          const stat = yield* Effect.promise(() => NodeFSP.stat(config.dbPath));
+          for (const provider of ["opencode", "pi"] as const) {
+            const source = summary.sources.find(
+              (candidate) => candidate.fingerprint.provider === provider,
+            );
+            assert.deepStrictEqual(source?.fingerprint, {
+              hostId: NodeOS.hostname(),
+              provider,
+              resolvedHomePath: yield* Effect.promise(() => NodeFSP.realpath(config.dbPath)),
+              volumeId: `${stat.dev}:${stat.ino}`,
+            });
+            assert.strictEqual(source?.distinctSessions, 1);
+            assert.strictEqual(source?.scannedFiles, 0);
+            assert.strictEqual(source?.status, "ok");
+            assert.strictEqual(source?.message, null);
+            assert.include(
+              source?.description ?? "",
+              `${provider === "pi" ? 2 : 1} final and 0 provisional`,
+            );
+            assert.include(source?.description ?? "", "No external transcript scanner");
+          }
+          yield* sql`
+            UPDATE projection_thread_sessions SET provider_name = 'pi'
+            WHERE thread_id = ${threadId}
+          `;
+          assert.deepStrictEqual(
+            (yield* service.readSummary({
+              ...WINDOW,
+              timeZone: "America/Los_Angeles",
+              sinceDay: UsageDay.make("2026-08-06"),
+              untilDay: UsageDay.make("2026-08-06"),
+            })).buckets,
+            summary.buckets,
+          );
+        }).pipe(
           Effect.provide(
-            serviceLayers({
-              prefix: "usage-service-opencode-test",
+            persistedServiceLayers({
+              prefix: "usage-service-projection-switch-test",
               home,
-              settings,
-              usageCostActivities: [
-                {
-                  threadId: ThreadId.make("thread-usage"),
-                  turnId: TurnId.make("turn-usage"),
-                  providerName: "opencode",
-                  providerSessionId: "session-usage",
-                  model: "open-code-model",
-                  createdAt: "2026-08-07T04:05:00.000Z",
-                  totalCostUsd: 0,
+              settings: {
+                ...settings,
+                usagePriceOverrides: {
+                  "shared-model": { inputCostPerMillionTokens: 2, outputCostPerMillionTokens: 8 },
                 },
-              ],
+              },
             }),
           ),
         );
-        const summary = yield* service.readSummary({
-          ...WINDOW,
-          timeZone: "America/Los_Angeles",
-          sinceDay: UsageDay.make("2026-08-06"),
-          untilDay: UsageDay.make("2026-08-06"),
-        });
+      }).pipe(Effect.scoped),
+  );
 
-        assert.deepStrictEqual(summary.buckets, [
-          {
-            day: UsageDay.make("2026-08-06"),
-            provider: "opencode",
-            model: "open-code-model",
-            totals: {
-              uncachedInputTokens: 0,
-              cachedInputTokens: 0,
-              cacheCreationTokens: 0,
-              outputTokens: 0,
-              reasoningTokens: 0,
+  it.live(
+    "keeps historical unresolved money unattributed and reports provisional projection coverage in the actual timezone window",
+    () =>
+      Effect.gen(function* () {
+        const { settings, home } = yield* setup;
+        yield* Effect.gen(function* () {
+          const repository = yield* ProjectionThreadActivityRepository;
+          const sql = yield* SqlClient.SqlClient;
+          const threadId = ThreadId.make("thread-historical-costs");
+          const createdAt = "2026-08-07T04:05:00.000Z";
+          for (const [turn, amount, status] of [
+            ["historical-pi", 0.21, "final"],
+            ["historical-opencode", 0.32, undefined],
+            ["unresolved", 0.9, "final"],
+          ] as const) {
+            yield* repository.upsert({
+              activityId: EventId.make(`historical-cost-${turn}`),
+              threadId,
+              turnId: TurnId.make(turn),
+              tone: "info",
+              kind: "usage.cost",
+              summary: "Historical cost",
+              payload: { totalCostUsd: amount, model: "historical-model", status },
+              createdAt,
+            });
+          }
+          for (const [index, provider] of ["pi", "opencode"].entries()) {
+            const payload = encodeUnknownJsonString({
+              session: { activeTurnId: `historical-${provider}`, providerName: provider },
+            });
+            yield* sql`
+            INSERT INTO orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+              actor_kind, payload_json, metadata_json
+            ) VALUES (${`historical-${provider}-association`}, 'thread', ${threadId}, ${index + 1},
+              'thread.session-set', ${createdAt}, 'provider', ${payload}, '{}')
+          `;
+          }
+          yield* sql`
+          INSERT INTO projection_thread_sessions
+            (thread_id, status, provider_name, runtime_mode, updated_at)
+          VALUES (${threadId}, 'idle', 'pi', 'full-access', ${createdAt})
+        `;
+          // Query prefilter slack must not count this as partial coverage of the local day.
+          yield* repository.upsert({
+            activityId: EventId.make("outside-window-provisional"),
+            threadId,
+            turnId: TurnId.make("outside-window"),
+            tone: "info",
+            kind: "usage.cost",
+            summary: "Outside window",
+            payload: {
+              providerName: "pi",
+              model: "historical-model",
+              totalCostUsd: 4,
+              status: "provisional",
             },
-            costUsd: 0,
-            cacheSavingsUsd: 0,
-            costSource: "providerReported",
-            records: 1,
-            unpricedRecords: 0,
-            sessions: 1,
-          },
-        ]);
-        const source = summary.sources.find(
-          (candidate) => candidate.fingerprint.provider === "opencode",
+            createdAt: "2026-08-06T04:05:00.000Z",
+          });
+          const queried = yield* repository.listUsageCostActivities({
+            since: "2026-08-06T00:00:00.000Z",
+            until: "2026-08-08T00:00:00.000Z",
+          });
+          const unresolved = queried.find((record) => record.turnId === "unresolved");
+          assert.strictEqual(unresolved?.providerName, null);
+          assert.strictEqual(unresolved?.totalCostUsd, 0.9);
+          assert.strictEqual(unresolved?.status, "final");
+          const service = yield* UsageService.make;
+          const summary = yield* service.readSummary({
+            ...WINDOW,
+            timeZone: "America/Los_Angeles",
+            sinceDay: UsageDay.make("2026-08-06"),
+            untilDay: UsageDay.make("2026-08-06"),
+          });
+          assert.deepStrictEqual(
+            summary.buckets.map(({ provider, costUsd, records, day }) => ({
+              provider,
+              costUsd,
+              records,
+              day,
+            })),
+            [
+              { provider: "opencode", costUsd: 0.32, records: 1, day: "2026-08-06" },
+              { provider: "pi", costUsd: 0.21, records: 1, day: "2026-08-06" },
+            ],
+          );
+          for (const provider of ["pi", "opencode"] as const) {
+            const source = summary.sources.find(
+              (source) => source.fingerprint.provider === provider,
+            );
+            assert.strictEqual(source?.status, "partial");
+            assert.include(
+              source?.message ?? "",
+              "1 projection turn-cost records have unresolved provider provenance",
+            );
+            assert.include(
+              source?.description ?? "",
+              provider === "pi" ? "1 final and 0 provisional" : "0 final and 1 provisional",
+            );
+            assert.strictEqual(source?.distinctSessions, 1);
+          }
+          // No amount is rewritten or dropped from persistence during summary construction.
+          assert.deepStrictEqual(
+            yield* repository.listUsageCostActivities({
+              since: "2026-08-06T00:00:00.000Z",
+              until: "2026-08-08T00:00:00.000Z",
+            }),
+            queried,
+          );
+        }).pipe(
+          Effect.provide(
+            persistedServiceLayers({
+              prefix: "usage-service-historical-projection-test",
+              home,
+              settings,
+            }),
+          ),
         );
-        assert.strictEqual(source?.distinctSessions, 1);
-        assert.match(source?.description ?? "", /T3 Code turns/);
-        assert.strictEqual(source?.status, "ok");
+      }).pipe(Effect.scoped),
+  );
+
+  it.live(
+    "replaces provisional projected costs with final snapshots and bounds source counts to the hourly window",
+    () =>
+      Effect.gen(function* () {
+        const { settings, home } = yield* setup;
+        yield* Effect.gen(function* () {
+          const repository = yield* ProjectionThreadActivityRepository;
+          const row = {
+            activityId: EventId.make("hourly-pi-cost"),
+            threadId: ThreadId.make("hourly-cost-thread"),
+            turnId: TurnId.make("hourly-cost-turn"),
+            tone: "info" as const,
+            kind: "usage.cost",
+            summary: "Hourly cost",
+            createdAt: "2026-08-07T04:05:00.000Z",
+          };
+          yield* repository.upsert({
+            ...row,
+            payload: {
+              providerName: "pi",
+              model: "pi-model",
+              totalCostUsd: 0.12,
+              status: "provisional",
+            },
+          });
+          for (const providerName of ["opencode", null] as const) {
+            yield* repository.upsert({
+              ...row,
+              activityId: EventId.make(`hourly-outside-${providerName}`),
+              turnId: TurnId.make(`hourly-outside-${providerName}`),
+              payload: { providerName, model: "pi-model", totalCostUsd: 5, status: "provisional" },
+              createdAt: "2026-08-07T05:00:00.000Z",
+            });
+          }
+          const input: UsageSummaryInput = {
+            ...WINDOW,
+            resolution: "hour",
+            timeZone: "America/Los_Angeles",
+            sinceTime: "2026-08-07T04:00:00.000Z",
+            untilTime: "2026-08-07T05:00:00.000Z",
+          };
+          const service = yield* UsageService.make;
+          const first = yield* service.readSummary(input);
+          assert.strictEqual(first.buckets.length, 1);
+          assert.strictEqual(first.buckets[0]?.costUsd, 0.12);
+          assert.strictEqual(first.buckets[0]?.day, "2026-08-06");
+          assert.strictEqual(first.buckets[0]?.hourStart, input.sinceTime);
+          const firstPi = first.sources.find((source) => source.fingerprint.provider === "pi");
+          assert.strictEqual(firstPi?.status, "partial");
+          assert.include(firstPi?.description ?? "", "0 final and 1 provisional");
+          assert.include(firstPi?.message ?? "", "may change");
+          assert.notInclude(firstPi?.message ?? "", "unresolved");
+          const openCode = first.sources.find(
+            (source) => source.fingerprint.provider === "opencode",
+          );
+          assert.strictEqual(openCode?.status, "ok");
+          assert.strictEqual(openCode?.distinctSessions, 0);
+          assert.include(openCode?.description ?? "", "0 final and 0 provisional");
+          yield* repository.upsert({
+            ...row,
+            payload: { providerName: "pi", model: "pi-model", totalCostUsd: 0.3, status: "final" },
+          });
+          const final = yield* service.readSummary(input);
+          assert.strictEqual(final.buckets[0]?.costUsd, 0.3);
+          assert.strictEqual(final.buckets[0]?.records, 1);
+          const finalPi = final.sources.find((source) => source.fingerprint.provider === "pi");
+          assert.strictEqual(finalPi?.status, "ok");
+          assert.strictEqual(finalPi?.message, null);
+          assert.include(finalPi?.description ?? "", "1 final and 0 provisional");
+          assert.deepStrictEqual(finalPi?.fingerprint, firstPi?.fingerprint);
+        }).pipe(
+          Effect.provide(
+            persistedServiceLayers({
+              prefix: "usage-service-hourly-projection-test",
+              home,
+              settings,
+            }),
+          ),
+        );
       }).pipe(Effect.scoped),
   );
 
@@ -299,7 +612,7 @@ describe("UsageService", () => {
       assert.deepStrictEqual(removed.buckets, summary.buckets);
 
       const sources = summary.sources.filter((source) => source.status === "ok");
-      assert.strictEqual(sources.length, 5);
+      assert.strictEqual(sources.length, 6);
       assert.strictEqual(
         sources.reduce((sum, source) => sum + source.scannedFiles, 0),
         4,

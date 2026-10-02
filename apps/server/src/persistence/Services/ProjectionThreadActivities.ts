@@ -56,11 +56,12 @@ export type ListProjectionUsageCostActivitiesInput =
 export const ProjectionUsageCostActivity = Schema.Struct({
   threadId: ThreadId,
   turnId: TurnId,
-  providerName: Schema.String,
+  providerName: Schema.NullOr(Schema.String),
   providerSessionId: Schema.NullOr(Schema.String),
   model: Schema.String,
   createdAt: IsoDateTime,
   totalCostUsd: Schema.Finite,
+  status: Schema.Literals(["provisional", "final"]),
 });
 export type ProjectionUsageCostActivity = typeof ProjectionUsageCostActivity.Type;
 export type GetLatestProjectionThreadTaskActivityInput =
@@ -79,7 +80,8 @@ export interface ProjectionThreadActivityRepositoryShape {
   /**
    * Insert or replace a projected thread activity row.
    *
-   * Upserts by `activityId` and JSON-encodes payload.
+   * Upserts by `activityId` and JSON-encodes payload. Cost snapshots retain
+   * their provider identity and reject conflicting-provider replacements.
    */
   readonly upsert: (
     row: ProjectionThreadActivity,
@@ -95,7 +97,7 @@ export interface ProjectionThreadActivityRepositoryShape {
     input: ListProjectionThreadActivitiesInput,
   ) => Effect.Effect<ReadonlyArray<ProjectionThreadActivity>, ProjectionRepositoryError>;
 
-  /** Read the latest valid reported cost per OpenCode turn in an instant window. */
+  /** Read the latest valid reported cost/status per turn; null provider means unresolved provenance. */
   readonly listUsageCostActivities: (
     input: ListProjectionUsageCostActivitiesInput,
   ) => Effect.Effect<ReadonlyArray<ProjectionUsageCostActivity>, ProjectionRepositoryError>;

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "@effect/vitest";
 
 import { UsageAggregator } from "./usageAggregation.ts";
-import type { RateTable } from "./usagePricing.ts";
-import type { UsageRecord } from "./usageTranscripts.ts";
+import { createOverrideRateTable, type RateTable } from "./usagePricing.ts";
+import { EMPTY_TOTALS, type UsageRecord } from "./usageTranscripts.ts";
 
 const rates: RateTable = new Map([
   [
@@ -198,6 +198,112 @@ describe("UsageAggregator", () => {
       sessions: 1,
       unpricedRecords: 0,
     });
+  });
+
+  it.each([0, 1.25])(
+    "keeps Pi cost-only amount %s authoritative with matching custom and public rates",
+    (reportedCostUsd) => {
+      const aggregator = new UsageAggregator({
+        timeZone: "UTC",
+        sinceDay: "2026-08-01",
+        untilDay: "2026-08-31",
+        rates,
+        priceOverrides: createOverrideRateTable({
+          "claude-fable-5": {
+            inputCostPerMillionTokens: 2,
+            outputCostPerMillionTokens: 8,
+          },
+        }),
+      });
+      aggregator.add(record({ provider: "pi", totals: EMPTY_TOTALS, reportedCostUsd }));
+
+      expect(aggregator.finish()).toEqual({
+        buckets: [
+          {
+            day: "2026-08-07",
+            provider: "pi",
+            model: "claude-fable-5",
+            totals: EMPTY_TOTALS,
+            costUsd: reportedCostUsd,
+            cacheSavingsUsd: 0,
+            costSource: "providerReported",
+            records: 1,
+            sessions: 1,
+            unpricedRecords: 0,
+          },
+        ],
+        duplicatesDropped: 0,
+        outOfWindow: 0,
+      });
+    },
+  );
+
+  it("keeps Pi and OpenCode reported totals separate while retaining transcript price overrides", () => {
+    const aggregator = new UsageAggregator({
+      timeZone: "UTC",
+      sinceDay: "2026-08-01",
+      untilDay: "2026-08-31",
+      rates,
+      priceOverrides: createOverrideRateTable({
+        "claude-fable-5": {
+          inputCostPerMillionTokens: 2,
+          outputCostPerMillionTokens: 8,
+          cacheReadCostPerMillionTokens: 0.5,
+          cacheWriteCostPerMillionTokens: 3,
+        },
+      }),
+    });
+    aggregator.add(record({ reportedCostUsd: 99 }));
+    aggregator.add(record({ provider: "opencode", totals: EMPTY_TOTALS, reportedCostUsd: 2 }));
+    aggregator.add(record({ provider: "pi", totals: EMPTY_TOTALS, reportedCostUsd: 1.25 }));
+    aggregator.add(
+      record({
+        provider: "pi",
+        totals: EMPTY_TOTALS,
+        reportedCostUsd: 0.75,
+        sessionId: "session-b",
+      }),
+    );
+
+    const result = aggregator.finish();
+    expect(
+      result.buckets.map(
+        ({ provider, costUsd, costSource, records, sessions, unpricedRecords }) => ({
+          provider,
+          costUsd,
+          costSource,
+          records,
+          sessions,
+          unpricedRecords,
+        }),
+      ),
+    ).toEqual([
+      {
+        provider: "claude",
+        costUsd: 0.00113,
+        costSource: "modelPriced",
+        records: 1,
+        sessions: 1,
+        unpricedRecords: 0,
+      },
+      {
+        provider: "opencode",
+        costUsd: 2,
+        costSource: "providerReported",
+        records: 1,
+        sessions: 1,
+        unpricedRecords: 0,
+      },
+      {
+        provider: "pi",
+        costUsd: 2,
+        costSource: "providerReported",
+        records: 2,
+        sessions: 2,
+        unpricedRecords: 0,
+      },
+    ]);
+    expect(result.buckets.find((bucket) => bucket.provider === "pi")?.totals).toEqual(EMPTY_TOTALS);
   });
 
   it("drops records outside the window", () => {

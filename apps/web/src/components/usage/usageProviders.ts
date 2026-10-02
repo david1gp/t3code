@@ -1,6 +1,6 @@
 import type { UsageProviderKind } from "@t3tools/contracts";
 
-import { ClaudeAI, GrokIcon, type Icon, OpenAI, OpenCodeIcon } from "../Icons";
+import { ClaudeAI, GrokIcon, type Icon, OpenAI, OpenCodeIcon, PiAgentIcon } from "../Icons";
 
 type UsageProviderPresentation = {
   readonly label: string;
@@ -34,6 +34,11 @@ export const PROVIDER_PRESENTATION = {
     label: "OpenCode",
     color: "#716967",
     mark: OpenCodeIcon,
+  },
+  pi: {
+    label: "Pi",
+    color: "#6b7280",
+    mark: PiAgentIcon,
   },
 } satisfies Record<UsageProviderKind, UsageProviderPresentation>;
 
