@@ -397,11 +397,14 @@ export function applyThreadDetailEvent(
         found = true;
         return {
           ...entry,
-          text: message.streaming
-            ? `${entry.text}${message.text}`
-            : message.text.length > 0
+          text:
+            event.payload.textMode === "replace"
               ? message.text
-              : entry.text,
+              : message.streaming
+                ? `${entry.text}${message.text}`
+                : message.text.length > 0
+                  ? message.text
+                  : entry.text,
           streaming: message.streaming,
           ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
           ...(message.streaming ? {} : { updatedAt: message.updatedAt }),

@@ -114,14 +114,18 @@ export function formatContextWindowMeterLabel(
   usage: ContextWindowSnapshot,
   displayMode: "simple" | "detailed",
 ): string {
+  if (usage.usedTokens === null || usage.contextUsageStatus === "unknown") {
+    return "Unknown";
+  }
   const used = formatContextWindowTokens(usage.usedTokens);
+  const prefix = usage.contextUsageStatus === "estimated" ? "Estimated " : "";
   if (displayMode === "simple" || usage.maxTokens == null || usage.usedPercentage === null) {
-    return used;
+    return `${prefix}${used}`;
   }
 
   const percentage =
     usage.usedPercentage < 10
       ? `${usage.usedPercentage.toFixed(1).replace(/\.0$/, "")}%`
       : `${Math.round(usage.usedPercentage)}%`;
-  return `${percentage} · ${used}/${formatContextWindowTokens(usage.maxTokens)}`;
+  return `${prefix}${percentage} · ${used}/${formatContextWindowTokens(usage.maxTokens)}`;
 }

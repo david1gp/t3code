@@ -559,12 +559,11 @@ export function foldSubagentActivities(
         fillMetadata(agent, payload);
         const detail = asString(payload.detail);
         if (detail) agent.progress = bounded(detail);
-        // A task first seen via task.updated (start row aged out) has run at
-        // least once — zero activations would misreport "run 0" and let a
-        // later start row treat it as never-started (review finding).
-        if (agent.activationCount === 0) agent.activationCount = 1;
+        // A non-pending task first seen via task.updated (start row aged out)
+        // has run at least once. Creation/queue rows are the exception.
         const wasTerminal = isTerminalSubagentStatus(agent.status);
         const status = asRuntimeStatus(payload.status);
+        if (agent.activationCount === 0 && status !== "pending") agent.activationCount = 1;
         if (status) applyStatus(agent, status, at);
         const error = asString(payload.error);
         if (error) agent.error = bounded(error);
@@ -596,9 +595,11 @@ export function foldSubagentActivities(
         // dropped both). Fill-if-missing keeps duplicate completions from
         // replacing the first result.
         const summary = asString(payload.summary) ?? asString(payload.detail);
+        const error = asString(payload.error);
+        if (error) agent.error = agent.error ?? bounded(error);
         if (isTerminalSubagentStatus(agent.status)) {
           if (summary) {
-            if (agent.status === "failed") {
+            if (agent.status === "failed" && !error) {
               agent.error = agent.error ?? bounded(summary);
             } else {
               agent.result = agent.result ?? bounded(summary);
@@ -610,7 +611,7 @@ export function foldSubagentActivities(
         const status = TASK_COMPLETED_STATUS.get(asString(payload.status) ?? "") ?? "completed";
         applyStatus(agent, status, at);
         if (summary) {
-          if (status === "failed") {
+          if (status === "failed" && !error) {
             agent.error = agent.error ?? bounded(summary);
           } else {
             agent.result = bounded(summary);

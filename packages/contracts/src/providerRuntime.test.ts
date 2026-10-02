@@ -4,8 +4,78 @@ import * as Schema from "effect/Schema";
 import { classifyTaskAgentKind, ProviderRuntimeEvent } from "./providerRuntime.ts";
 
 const decodeRuntimeEvent = Schema.decodeUnknownSync(ProviderRuntimeEvent);
+const encodeRuntimeEvent = Schema.encodeSync(ProviderRuntimeEvent);
 
 describe("ProviderRuntimeEvent", () => {
+  it("round-trips Pi reasoning availability without fabricating absent reasoning tokens", () => {
+    for (const reasoning of [undefined, 0, 5]) {
+      const event = {
+        type: "turn.completed",
+        eventId: "pi-reasoning",
+        provider: "pi",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        createdAt: "2026-10-01T00:00:00.000Z",
+        payload: {
+          state: "completed",
+          tokenUsage: {
+            usageScope: "main_agent",
+            usageStatus: "complete",
+            hasSubagents: false,
+            inputTokens: 10,
+            outputTokens: 5,
+            reasoningTokensAvailable: reasoning !== undefined,
+            ...(reasoning !== undefined ? { reasoningTokens: reasoning } : {}),
+          },
+        },
+      };
+      expect(encodeRuntimeEvent(decodeRuntimeEvent(event))).toEqual(event);
+    }
+  });
+  it("round-trips Pi interrupted and failed task output separately from terminal errors", () => {
+    for (const status of ["failed", "stopped"]) {
+      const event = {
+        type: "task.completed",
+        eventId: "pi-terminal",
+        provider: "pi",
+        threadId: "thread-1",
+        createdAt: "2026-10-01T00:00:00.000Z",
+        payload: {
+          taskId: "pi:child",
+          status,
+          summary: "partial output",
+          error: "provider detail",
+        },
+      };
+      expect(encodeRuntimeEvent(decodeRuntimeEvent(event))).toEqual(event);
+      expect(() =>
+        decodeRuntimeEvent({ ...event, payload: { ...event.payload, error: null } }),
+      ).toThrow();
+    }
+  });
+  it.each(["assistant_message", "reasoning"])(
+    "preserves authoritative %s finals, including empty and whitespace content",
+    (itemType) => {
+      for (const finalText of ["Final", "Dra", "", " \n"]) {
+        const event = {
+          type: "item.completed",
+          eventId: "final-event",
+          provider: "opencode",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          itemId: "item-1",
+          createdAt: "2026-10-01T00:00:00.000Z",
+          payload: { itemType, finalText },
+        };
+        expect(decodeRuntimeEvent(event)).toEqual(event);
+        expect(encodeRuntimeEvent(decodeRuntimeEvent(event))).toEqual(event);
+        expect(() =>
+          decodeRuntimeEvent({ ...event, payload: { itemType, finalText: null } }),
+        ).toThrow();
+      }
+    },
+  );
+
   it("accepts only finite nonnegative cost updates", () => {
     const costEvent = {
       type: "turn.cost.updated",

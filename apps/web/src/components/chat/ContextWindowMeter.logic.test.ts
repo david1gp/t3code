@@ -32,6 +32,29 @@ const contextWindow = deriveLatestContextWindowSnapshot([
 if (!contextWindow) throw new Error("Expected context window test snapshot.");
 
 describe("formatContextWindowMeterLabel", () => {
+  it.each(["simple", "detailed"] as const)(
+    "never labels unavailable occupancy as zero in %s mode",
+    (mode) => {
+      expect(
+        formatContextWindowMeterLabel(
+          {
+            ...contextWindow,
+            contextUsageStatus: "unknown",
+            usedTokens: null,
+            usedPercentage: null,
+          },
+          mode,
+        ),
+      ).toBe("Unknown");
+    },
+  );
+
+  it("identifies estimated occupancy rather than presenting it as reported", () => {
+    const estimated = { ...contextWindow, contextUsageStatus: "estimated" as const };
+    expect(formatContextWindowMeterLabel(estimated, "simple")).toBe("Estimated 27k");
+    expect(formatContextWindowMeterLabel(estimated, "detailed")).toBe("Estimated 9.9% · 27k/272k");
+  });
+
   it("formats simple token usage", () => {
     expect(formatContextWindowMeterLabel(contextWindow, "simple")).toBe("27k");
   });
@@ -181,6 +204,17 @@ describe("formatContextWindowCompactionMessage", () => {
 
 describe("shouldOfferResumeCompaction", () => {
   const now = "2026-08-24T12:00:00.000Z";
+
+  it("does not recommend compaction from unavailable occupancy", () => {
+    expect(
+      shouldOfferResumeCompaction({
+        provider: "claudeAgent",
+        usedTokens: null,
+        updatedAt: "2026-08-24T09:00:00.000Z",
+        now,
+      }),
+    ).toBe(false);
+  });
 
   it("matches Claude's old-session age and context thresholds", () => {
     expect(

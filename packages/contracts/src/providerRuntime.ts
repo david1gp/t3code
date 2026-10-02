@@ -263,7 +263,10 @@ const ThreadMetadataUpdatedPayload = Schema.Struct({
 export type ThreadMetadataUpdatedPayload = typeof ThreadMetadataUpdatedPayload.Type;
 
 export const ThreadTokenUsageSnapshot = Schema.Struct({
-  usedTokens: NonNegativeInt,
+  // Absence preserves legacy reported occupancy. Unknown explicitly invalidates
+  // earlier occupancy without fabricating a zero; estimates carry a token count.
+  contextUsageStatus: Schema.optional(Schema.Literals(["reported", "estimated", "unknown"])),
+  usedTokens: Schema.optional(NonNegativeInt),
   totalProcessedTokens: Schema.optional(NonNegativeInt),
   maxTokens: Schema.optional(PositiveInt),
   inputTokens: Schema.optional(NonNegativeInt),
@@ -279,7 +282,14 @@ export const ThreadTokenUsageSnapshot = Schema.Struct({
   durationMs: Schema.optional(NonNegativeInt),
   compactsAutomatically: Schema.optional(Schema.Boolean),
   autoCompactThreshold: Schema.optional(PositiveInt),
-});
+}).check(
+  Schema.makeFilter((usage) =>
+    usage.contextUsageStatus === "unknown"
+      ? usage.usedTokens === undefined || "Unknown context occupancy must omit usedTokens."
+      : usage.usedTokens !== undefined ||
+        "Reported or estimated context occupancy needs usedTokens.",
+  ),
+);
 export type ThreadTokenUsageSnapshot = typeof ThreadTokenUsageSnapshot.Type;
 
 const ThreadTokenUsageUpdatedPayload = Schema.Struct({
@@ -329,6 +339,8 @@ const TurnTokenUsageCommonFields = {
   cachedInputTokens: Schema.optional(NonNegativeInt),
   cacheCreationTokens: Schema.optional(NonNegativeInt),
   reasoningTokens: Schema.optional(NonNegativeInt),
+  // Explicit availability distinguishes a reported zero from an unknown subset.
+  reasoningTokensAvailable: Schema.optional(Schema.Boolean),
   hasSubagents: Schema.Boolean,
 };
 export const TurnTokenUsage = Schema.Union([
@@ -449,6 +461,9 @@ export const ItemLifecyclePayload = Schema.Struct({
   status: Schema.optional(RuntimeItemStatus),
   title: Schema.optional(TrimmedNonEmptyStringSchema),
   detail: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** On item.completed, replaces this assistant/reasoning item's content, including empty text.
+   * Omission preserves legacy detail-as-fallback and append-delta behavior. */
+  finalText: Schema.optional(Schema.String),
   toolSurface: Schema.optional(ToolActivitySurface),
   toolIcon: Schema.optional(ToolActivityIcon),
   toolSource: Schema.optional(ToolActivitySource),
@@ -694,6 +709,8 @@ const TaskCompletedPayload = Schema.Struct({
   taskId: RuntimeTaskId,
   status: Schema.Literals(["completed", "failed", "stopped"]),
   summary: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** Failure detail is separate from a child's retained (possibly partial) output. */
+  error: Schema.optional(TrimmedNonEmptyStringSchema),
   usage: Schema.optional(Schema.Unknown),
   typedUsage: Schema.optional(RuntimeTaskUsage),
   ...taskAgentLinkageFields,

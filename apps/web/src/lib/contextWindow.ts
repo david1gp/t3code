@@ -13,12 +13,15 @@ function asBoolean(value: unknown): boolean | null {
 }
 
 type NullableContextWindowUsage = {
-  readonly [Key in keyof ThreadTokenUsageSnapshot]: undefined extends ThreadTokenUsageSnapshot[Key]
+  readonly [
+    Key in keyof ThreadTokenUsageSnapshot
+  ]-?: undefined extends ThreadTokenUsageSnapshot[Key]
     ? Exclude<ThreadTokenUsageSnapshot[Key], undefined> | null
     : ThreadTokenUsageSnapshot[Key];
 };
 
-export type ContextWindowSnapshot = NullableContextWindowUsage & {
+export type ContextWindowSnapshot = Omit<NullableContextWindowUsage, "contextUsageStatus"> & {
+  readonly contextUsageStatus: "reported" | "estimated" | "unknown";
   readonly remainingTokens: number | null;
   readonly usedPercentage: number | null;
   readonly remainingPercentage: number | null;
@@ -35,19 +38,39 @@ export function deriveLatestContextWindowSnapshot(
     }
 
     const payload = asRecord(activity.payload);
-    const usedTokens = asFiniteNumber(payload?.usedTokens);
-    if (usedTokens === null || usedTokens < 0) {
+    const status = payload?.contextUsageStatus;
+    if (
+      status !== undefined &&
+      status !== "reported" &&
+      status !== "estimated" &&
+      status !== "unknown"
+    ) {
+      continue;
+    }
+    const contextUsageStatus = status ?? "reported";
+    const usedTokens =
+      contextUsageStatus === "unknown" ? null : asFiniteNumber(payload?.usedTokens);
+    if (
+      contextUsageStatus === "unknown"
+        ? payload?.usedTokens !== undefined
+        : usedTokens === null || usedTokens < 0
+    ) {
       continue;
     }
 
     const maxTokens = asFiniteNumber(payload?.maxTokens);
     const usedPercentage =
-      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
+      usedTokens !== null && maxTokens !== null && maxTokens > 0
+        ? Math.min(100, (usedTokens / maxTokens) * 100)
+        : null;
     const remainingTokens =
-      maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
+      usedTokens !== null && maxTokens !== null
+        ? Math.max(0, Math.round(maxTokens - usedTokens))
+        : null;
     const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
 
     return {
+      contextUsageStatus,
       usedTokens,
       totalProcessedTokens: asFiniteNumber(payload?.totalProcessedTokens),
       maxTokens,
@@ -65,7 +88,7 @@ export function deriveLatestContextWindowSnapshot(
       lastReasoningOutputTokens: asFiniteNumber(payload?.lastReasoningOutputTokens),
       toolUses: asFiniteNumber(payload?.toolUses),
       durationMs: asFiniteNumber(payload?.durationMs),
-      compactsAutomatically: asBoolean(payload?.compactsAutomatically) ?? false,
+      compactsAutomatically: asBoolean(payload?.compactsAutomatically),
       autoCompactThreshold: asFiniteNumber(payload?.autoCompactThreshold),
       updatedAt: activity.createdAt,
     };
@@ -76,7 +99,7 @@ export function deriveLatestContextWindowSnapshot(
 
 export function formatContextWindowTokens(value: number | null): string {
   if (value === null || !Number.isFinite(value)) {
-    return "0";
+    return "Unknown";
   }
   if (value < 1_000) {
     return `${Math.round(value)}`;

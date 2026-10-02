@@ -46,6 +46,83 @@ describe("contextWindow", () => {
     expect(snapshot).toBeNull();
   });
 
+  it("lets the latest unknown invalidate earlier reported occupancy after compaction", () => {
+    const snapshot = deriveLatestContextWindowSnapshot([
+      makeActivity("known", "context-window.updated", {
+        usedTokens: 81_659,
+        maxTokens: 200_000,
+        compactsAutomatically: true,
+      }),
+      makeActivity("compact", "context-compaction", {}),
+      makeActivity("unknown", "context-window.updated", { contextUsageStatus: "unknown" }),
+    ]);
+    expect(snapshot).toMatchObject({
+      contextUsageStatus: "unknown",
+      usedTokens: null,
+      maxTokens: null,
+      remainingTokens: null,
+      usedPercentage: null,
+      remainingPercentage: null,
+      compactsAutomatically: null,
+    });
+  });
+
+  it("preserves estimates, disabled auto-compaction, and recovery to legacy reported occupancy", () => {
+    const estimate = makeActivity("estimate", "context-window.updated", {
+      contextUsageStatus: "estimated",
+      usedTokens: 4_000,
+      maxTokens: 100_000,
+      compactsAutomatically: false,
+    });
+    expect(deriveLatestContextWindowSnapshot([estimate])).toMatchObject({
+      contextUsageStatus: "estimated",
+      usedTokens: 4_000,
+      usedPercentage: 4,
+      remainingTokens: 96_000,
+      compactsAutomatically: false,
+    });
+    expect(
+      deriveLatestContextWindowSnapshot([
+        estimate,
+        makeActivity("unknown", "context-window.updated", { contextUsageStatus: "unknown" }),
+        makeActivity("reported", "context-window.updated", { usedTokens: 5_000 }),
+      ]),
+    ).toMatchObject({ contextUsageStatus: "reported", usedTokens: 5_000 });
+  });
+
+  it("keeps reported limits and settings independently of unavailable occupancy", () => {
+    expect(
+      deriveLatestContextWindowSnapshot([
+        makeActivity("unknown-with-limit", "context-window.updated", {
+          contextUsageStatus: "unknown",
+          maxTokens: 200_000,
+          compactsAutomatically: false,
+        }),
+      ]),
+    ).toMatchObject({
+      usedTokens: null,
+      maxTokens: 200_000,
+      compactsAutomatically: false,
+      usedPercentage: null,
+      remainingTokens: null,
+      remainingPercentage: null,
+    });
+  });
+
+  it.each([
+    {},
+    { contextUsageStatus: "estimated" },
+    { contextUsageStatus: "unknown", usedTokens: 0 },
+    { contextUsageStatus: "invalid", usedTokens: 0 },
+  ])("does not confuse malformed rows with explicit invalidation: %j", (payload) => {
+    expect(
+      deriveLatestContextWindowSnapshot([
+        makeActivity("known", "context-window.updated", { usedTokens: 12_000 }),
+        makeActivity("malformed", "context-window.updated", payload),
+      ]),
+    ).toMatchObject({ contextUsageStatus: "reported", usedTokens: 12_000 });
+  });
+
   it("keeps valid zero-usage snapshots", () => {
     const snapshot = deriveLatestContextWindowSnapshot([
       makeActivity("activity-1", "context-window.updated", {
@@ -64,6 +141,7 @@ describe("contextWindow", () => {
   });
 
   it("formats compact token counts", () => {
+    expect(formatContextWindowTokens(null)).toBe("Unknown");
     expect(formatContextWindowTokens(999)).toBe("999");
     expect(formatContextWindowTokens(1400)).toBe("1.4k");
     expect(formatContextWindowTokens(14_000)).toBe("14k");

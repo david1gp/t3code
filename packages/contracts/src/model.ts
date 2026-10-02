@@ -122,6 +122,7 @@ function canonicalSelectionsToLegacyObject(
   return out;
 }
 
+/** Selectable picker options, not provider-reported model facts. */
 export const ModelCapabilities = Schema.Struct({
   optionDescriptors: Schema.optional(Schema.Array(ProviderOptionDescriptor)),
 });

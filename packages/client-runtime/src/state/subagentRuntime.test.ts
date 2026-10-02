@@ -62,6 +62,41 @@ function fold(rows: ReadonlyArray<OrchestrationThreadActivity>) {
 }
 
 describe("foldSubagentActivities", () => {
+  it("Pi creation remains pending without counting a run until the child starts", () => {
+    const created = activity("task.updated", {
+      taskId: "pi:queued",
+      taskType: "subagent",
+      status: "pending",
+      detail: "Queued child",
+    });
+    const pending = fold([created])[0]!;
+    expect(pending.status).toBe("pending");
+    expect(pending.activationCount).toBe(0);
+    expect(pending.startedAt).toBeNull();
+    const running = fold([created, activity("task.started", { taskId: "pi:queued" })])[0]!;
+    expect(running.status).toBe("running");
+    expect(running.activationCount).toBe(1);
+  });
+
+  it("Pi terminal output and error stay separate for failed and interrupted children", () => {
+    for (const status of ["failed", "stopped"]) {
+      const terminal = activity("task.completed", {
+        taskId: `pi:${status}`,
+        status,
+        summary: "partial answer",
+        error: "provider detail",
+      });
+      const agent = fold([
+        terminal,
+        terminal,
+        activity("task.started", { taskId: `pi:${status}`, title: "Late metadata" }),
+      ])[0]!;
+      expect(agent.status).toBe(status === "stopped" ? "interrupted" : "failed");
+      expect(agent.result).toBe("partial answer");
+      expect(agent.error).toBe("provider detail");
+    }
+  });
+
   it("shows the batch status limit after its parent turn ends without claiming a result", () => {
     const running = activity("task.progress", {
       taskId: "batch-1",
@@ -192,6 +227,47 @@ describe("foldSubagentActivities", () => {
     expect(agent.result).toBeNull();
     expect(agent.completedAt).toBeNull();
     expect(agent.status).toBe("running");
+  });
+
+  it("Pi explicit running before resumed started opens exactly one activation and retains prior history", () => {
+    const history = [
+      activity("task.updated", { taskId: "pi:reused", status: "pending" }),
+      activity("task.started", { taskId: "pi:reused", title: "Worker" }),
+      activity("task.completed", {
+        taskId: "pi:reused",
+        status: "stopped",
+        summary: "partial first",
+        error: "abort detail",
+      }),
+    ];
+    const prior = fold(history)[0]!;
+    const resumed = [
+      ...history,
+      activity("task.updated", { taskId: "pi:reused", status: "running" }),
+      activity("task.started", { taskId: "pi:reused", title: "Worker resumed" }),
+      activity("task.started", { taskId: "pi:reused", title: "Worker resumed" }),
+    ];
+    const running = fold(resumed)[0]!;
+    expect(running.activationCount).toBe(2);
+    expect(running.status).toBe("running");
+    expect(running.result).toBeNull();
+    expect(running.error).toBeNull();
+    expect(running.completedAt).toBeNull();
+    expect(prior.status).toBe("interrupted");
+    expect(prior.result).toBe("partial first");
+    expect(prior.error).toBe("abort detail");
+    const terminal = fold([
+      ...resumed,
+      activity("task.completed", {
+        taskId: "pi:reused",
+        status: "completed",
+        summary: "new answer",
+      }),
+      activity("task.started", { taskId: "pi:reused", title: "Late metadata" }),
+    ])[0]!;
+    expect(terminal.activationCount).toBe(2);
+    expect(terminal.status).toBe("completed");
+    expect(terminal.result).toBe("new answer");
   });
 
   it("idle is nonterminal: an idle agent resumes without losing identity", () => {

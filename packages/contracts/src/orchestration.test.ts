@@ -49,6 +49,7 @@ const decodeThreadTurnStartCommand = Schema.decodeUnknownEffect(ThreadTurnStartC
 const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
 const decodeOrchestrationMessage = Schema.decodeUnknownEffect(OrchestrationMessage);
 const decodeThreadMessageSentPayload = Schema.decodeUnknownEffect(ThreadMessageSentPayload);
+const encodeThreadMessageSentPayload = Schema.encodeEffect(ThreadMessageSentPayload);
 const decodeThreadTurnStartRequestedPayload = Schema.decodeUnknownEffect(
   ThreadTurnStartRequestedPayload,
 );
@@ -356,6 +357,36 @@ it.effect("tolerates attachment types from newer builds when decoding messages",
     });
     assert.strictEqual(payload.attachments?.[0]!.type, "somethingnew");
   }),
+);
+
+it.effect(
+  "preserves authoritative final replacement semantics alongside legacy completion markers",
+  () =>
+    Effect.gen(function* () {
+      const fields = {
+        threadId: "thread-1",
+        messageId: "message-1",
+        role: "reasoning" as const,
+        text: "",
+        turnId: null,
+        streaming: false,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      };
+      const legacy = yield* decodeThreadMessageSentPayload(fields);
+      assert.strictEqual(legacy.textMode, undefined);
+      for (const text of ["Final", "Dra", "", " \n"]) {
+        const final = yield* decodeThreadMessageSentPayload({
+          ...fields,
+          text,
+          textMode: "replace",
+        });
+        assert.strictEqual(final.text, text);
+        assert.strictEqual(final.textMode, "replace");
+        const encoded = yield* encodeThreadMessageSentPayload(final);
+        assert.deepEqual(encoded, { ...fields, text, textMode: "replace" });
+      }
+    }),
 );
 
 // The tolerant member must not catch malformed known attachments: a file over

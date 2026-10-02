@@ -23,6 +23,8 @@ import {
 } from "./keybindings.ts";
 import { EditorId, FileManagerRevealKind, RemoteOpenTarget } from "./editor.ts";
 import { ModelCapabilities } from "./model.ts";
+import { ModelMetadata } from "./ModelMetadata.ts";
+import { ServerProviderWorkspaceModelOptionOverlay } from "./ServerProviderWorkspaceModelOptionOverlay.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import { ServerProviderUsageLimits, UsageLimitSourceSnapshots } from "./providerUsageLimits.ts";
 import { ServerSettings } from "./settings.ts";
@@ -77,6 +79,7 @@ export const ServerProviderModel = Schema.Struct({
   isDefault: Schema.optional(Schema.Boolean),
   isLegacy: Schema.optional(Schema.Boolean),
   capabilities: Schema.NullOr(ModelCapabilities),
+  metadata: Schema.optional(ModelMetadata),
 });
 export type ServerProviderModel = typeof ServerProviderModel.Type;
 
@@ -120,6 +123,7 @@ export const ServerProviderWorkspaceSnapshot = Schema.Struct({
   checkedAt: IsoDateTime,
   slashCommands: Schema.Array(ServerProviderSlashCommand),
   skills: Schema.Array(ServerProviderSkill),
+  modelOptionOverlays: Schema.optionalKey(Schema.Array(ServerProviderWorkspaceModelOptionOverlay)),
 });
 export type ServerProviderWorkspaceSnapshot = typeof ServerProviderWorkspaceSnapshot.Type;
 

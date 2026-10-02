@@ -77,7 +77,10 @@ export function ContextWindowMeter(props: {
             <div className="font-medium text-muted-foreground text-xs">Context Window</div>
             {usage.maxTokens !== null && usedPercentage ? (
               <div className="text-secondary-label text-[11px] tabular-nums">
-                <span>{usedPercentage}</span>
+                <span>
+                  {usage.contextUsageStatus === "estimated" ? "Estimated " : ""}
+                  {usedPercentage}
+                </span>
                 <span className="mx-1">·</span>
                 <span>
                   {formatContextWindowTokens(usage.usedTokens)}/
@@ -85,12 +88,10 @@ export function ContextWindowMeter(props: {
                 </span>
               </div>
             ) : (
-              <div className="text-secondary-label text-[11px] tabular-nums">
-                {formatContextWindowTokens(usage.usedTokens)}
-              </div>
+              <div className="text-secondary-label text-[11px] tabular-nums">{meterLabel}</div>
             )}
           </div>
-          {usage.maxTokens !== null ? (
+          {usage.maxTokens !== null && usage.usedPercentage !== null ? (
             <div
               className="h-1.5 w-full overflow-hidden rounded-full bg-muted/60"
               role="progressbar"

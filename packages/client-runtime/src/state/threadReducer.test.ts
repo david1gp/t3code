@@ -551,6 +551,47 @@ describe("applyThreadDetailEvent", () => {
   });
 
   describe("thread.message-sent", () => {
+    it.each(["assistant", "reasoning"] as const)(
+      "applies authoritative %s finals including empty text",
+      (role) => {
+        let thread = baseThread;
+        const event = {
+          ...baseEventFields,
+          sequence: 6,
+          occurredAt: baseThread.updatedAt,
+          aggregateKind: "thread" as const,
+          aggregateId: baseThread.id,
+          type: "thread.message-sent" as const,
+          payload: {
+            threadId: baseThread.id,
+            messageId: MessageId.make("final-message"),
+            role,
+            text: "Draft",
+            turnId: null,
+            streaming: true,
+            createdAt: baseThread.createdAt,
+            updatedAt: baseThread.updatedAt,
+          },
+        };
+        const started = applyThreadDetailEvent(thread, event);
+        expect(started.kind).toBe("updated");
+        if (started.kind !== "updated") return;
+        thread = started.thread;
+        for (const [index, finalText] of ["Final", "Dra", "", "Draft extended"].entries()) {
+          const result = applyThreadDetailEvent(thread, {
+            ...event,
+            sequence: index + 7,
+            payload: { ...event.payload, text: finalText, streaming: false, textMode: "replace" },
+          });
+          expect(result.kind).toBe("updated");
+          if (result.kind !== "updated") return;
+          expect(result.thread.messages).toHaveLength(1);
+          expect(result.thread.messages[0]).toMatchObject({ text: finalText, streaming: false });
+          thread = result.thread;
+        }
+      },
+    );
+
     it.each([
       ["first", ["first+", "middle", "last"]],
       ["middle", ["first", "middle+", "last"]],
