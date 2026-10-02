@@ -2,23 +2,30 @@ import * as NodeCrypto from "node:crypto";
 
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
+import { Form, Permission, Session, SessionInbox } from "@opencode/client/effect";
 
-import type {
-  FormInfo,
-  PermissionRequest,
-  SessionPromptInput,
-  SessionLogOutput,
-  V2Event,
+import {
+  isConflictError,
+  isFormInvalidAnswerError,
+  type SessionCompactInput,
+  type SessionPromptInput,
 } from "@opencode/client";
+import { composerSkillMentionsResolve } from "@t3tools/shared/composerInlineTokens";
 
 import { openCodeNativeClientCreate } from "./openCodeNativeClientCreate.ts";
+import { openCodeNativeEventDisposition } from "./openCodeNativeEventDisposition.ts";
+import { openCodeNativeWireSchema } from "./openCodeNativeWireSchema.ts";
 import {
   type OpenCodeNativeInventory,
   openCodeNativeInventorySchema,
 } from "./openCodeNativeInventorySchema.ts";
 import { OpenCodeRuntimeError } from "./opencodeRuntime.ts";
 
-type NativeFrame = V2Event | Exclude<SessionLogOutput, { type: "log.synced" }>;
+type NativeFrame =
+  | typeof openCodeNativeWireSchema.feed.Type
+  | Exclude<typeof openCodeNativeWireSchema.log.Type, { type: "log.synced" }>;
+type PermissionRequest = Extract<NativeFrame, { type: "permission.asked" }>["data"];
+type FormInfo = Extract<NativeFrame, { type: "form.created" }>["data"]["form"];
 
 type Result<T> =
   | { readonly success: true; readonly data: T }
@@ -26,169 +33,19 @@ type Result<T> =
 
 type Session = { readonly id: string; readonly location: { readonly directory: string } };
 const fields = Schema.Record(Schema.String, Schema.Unknown);
-const nativeError = Schema.Struct({
-  type: Schema.String,
-  message: Schema.String,
-  status: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 599 }))),
-});
-const tokens = Schema.Struct({
-  input: Schema.Finite,
-  output: Schema.Finite,
-  reasoning: Schema.Finite,
-  cache: Schema.Struct({ read: Schema.Finite, write: Schema.Finite }),
-});
-const content = Schema.Array(
-  Schema.Union([
-    Schema.Struct({ type: Schema.Literal("text"), text: Schema.String }),
-    Schema.Struct({
-      type: Schema.Literal("file"),
-      uri: Schema.String,
-      mime: Schema.String,
-      name: Schema.optionalKey(Schema.String),
-    }),
-  ]),
-).check(Schema.isMinLength(1));
-const base = { sessionID: Schema.String };
-const assistant = { ...base, assistantMessageID: Schema.String };
-const fragment = { ...assistant, ordinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) };
-const tool = { ...assistant, id: Schema.String };
-const accounting = { cost: Schema.Finite, tokens };
-const finish = Schema.Literals([
-  "stop",
-  "length",
-  "tool-calls",
-  "content-filter",
-  "error",
-  "unknown",
-]);
-const stepEnd = {
-  ...assistant,
-  finish,
-  rawFinish: Schema.optionalKey(Schema.String),
-  providerState: Schema.optionalKey(fields),
-  ...accounting,
-  snapshot: Schema.optionalKey(Schema.String),
-  files: Schema.optionalKey(Schema.Array(Schema.String)),
-};
-const stepFailure = {
-  ...assistant,
-  error: nativeError,
-  finish: Schema.optionalKey(Schema.Literal("content-filter")),
-  rawFinish: Schema.optionalKey(Schema.String),
-  providerState: Schema.optionalKey(fields),
-  cost: Schema.optionalKey(Schema.Finite),
-  tokens: Schema.optionalKey(tokens),
-  snapshot: Schema.optionalKey(Schema.String),
-  files: Schema.optionalKey(Schema.Array(Schema.String)),
-};
-const event = <const T extends string, F extends Schema.Struct.Fields>(type: T, data: F) =>
-  Schema.Struct({
-    id: Schema.String.check(Schema.isStartsWith("evt_")),
-    created: Schema.Finite,
-    type: Schema.Literal(type),
-    data: Schema.Struct(data),
-  });
-
-// Public payloads from v2.0.18 packages/schema/src/session-event.ts, not SDK/v2
-// or dev. Opaque provider state stays opaque; accounting retains native units.
-const nativeEvent = Schema.Union([
-  event("session.created", {
-    ...base,
-    parentID: Schema.optionalKey(Schema.String),
-    location: Schema.Struct({ directory: Schema.String }),
-    projectID: Schema.String,
-    slug: Schema.String,
-    title: Schema.optionalKey(Schema.String),
-    agent: Schema.optionalKey(Schema.String),
-    model: Schema.optionalKey(Schema.Struct({ id: Schema.String, providerID: Schema.String })),
-    version: Schema.String,
-  }),
-  event("session.inbox.enqueued", {
-    ...base,
-    inboxID: Schema.String,
-    item: Schema.Struct({
-      type: Schema.Literal("user"),
-      delivery: Schema.Literals(["steer", "queue"]),
-      payload: Schema.Struct({ text: Schema.String }),
-    }),
-  }),
-  event("session.execution.started", base),
-  event("session.execution.succeeded", base),
-  event("session.execution.failed", { ...base, error: nativeError }),
-  event("session.execution.interrupted", {
-    ...base,
-    reason: Schema.Literals(["user", "shutdown", "superseded", "inactivity"]),
-  }),
-  event("session.step.started", {
-    ...assistant,
-    agent: Schema.String,
-    model: Schema.Struct({
-      id: Schema.String,
-      providerID: Schema.String,
-      variant: Schema.optionalKey(Schema.String),
-    }),
-    started: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-    snapshot: Schema.optionalKey(Schema.String),
-  }),
-  event("session.step.streamed", assistant),
-  event("session.step.ended", stepEnd),
-  event("session.step.failed", stepFailure),
-  event("session.text.started", fragment),
-  event("session.text.delta", { ...fragment, delta: Schema.String }),
-  event("session.text.ended", {
-    ...fragment,
-    text: Schema.String,
-    state: Schema.optionalKey(fields),
-  }),
-  event("session.reasoning.started", { ...fragment, state: Schema.optionalKey(fields) }),
-  event("session.reasoning.delta", { ...fragment, delta: Schema.String }),
-  event("session.reasoning.ended", {
-    ...fragment,
-    text: Schema.String,
-    state: Schema.optionalKey(fields),
-  }),
-  event("session.tool.input.started", { ...tool, name: Schema.String }),
-  event("session.tool.input.delta", { ...tool, delta: Schema.String }),
-  event("session.tool.input.ended", { ...tool, text: Schema.String }),
-  event("session.tool.called", {
-    ...tool,
-    input: fields,
-    executed: Schema.Boolean,
-    state: Schema.optionalKey(fields),
-  }),
-  event("session.tool.progress", { ...tool, metadata: fields }),
-  event("session.tool.success", {
-    ...tool,
-    content,
-    executed: Schema.Boolean,
-    metadata: Schema.optionalKey(fields),
-    resultState: Schema.optionalKey(fields),
-  }),
-  event("session.tool.failed", {
-    ...tool,
-    error: nativeError,
-    executed: Schema.Boolean,
-    content: Schema.optionalKey(content),
-    metadata: Schema.optionalKey(fields),
-    resultState: Schema.optionalKey(fields),
-  }),
-  event("session.usage.updated", { ...base, ...accounting }),
-  event("session.synthetic", {
-    ...base,
-    text: Schema.String,
-    description: Schema.optionalKey(Schema.String),
-    metadata: Schema.optionalKey(fields),
-  }),
-]);
+const nativeError = Schema.toEncoded(Session.Event.Step.Failed.data.fields.error);
+const tokens = Schema.toEncoded(Session.Event.Step.Ended.data.fields.tokens);
+const content = Schema.toEncoded(Session.Event.Tool.Success.data.fields.content);
+const nativeEvent = openCodeNativeWireSchema.session;
 type NativeEvent = typeof nativeEvent.Type;
 type Data<T extends NativeEvent["type"]> = Extract<NativeEvent, { type: T }>["data"];
 const nativeEventFromClient = (message: NativeFrame) =>
-  Schema.decodeUnknownExit(nativeEvent)({
-    id: message.id,
-    created: "created" in message ? message.created : undefined,
-    type: message.type,
-    data: message.data,
-  });
+  Schema.decodeUnknownExit(nativeEvent)(message);
+const feedDecode = Schema.decodeUnknownExit(openCodeNativeWireSchema.feed);
+const logDecode = Schema.decodeUnknownExit(openCodeNativeWireSchema.log);
+const formDecode = Schema.decodeUnknownExit(Schema.toEncoded(Form.Info));
+const permissionDecode = Schema.decodeUnknownExit(Schema.toEncoded(Permission.Request));
+const compactionReceiptDecode = Schema.decodeUnknownExit(Schema.toEncoded(SessionInbox.Compaction));
 const commandInventoryDecode = Schema.decodeExit(openCodeNativeInventorySchema.command);
 const skillInventoryDecode = Schema.decodeExit(openCodeNativeInventorySchema.skill);
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -250,6 +107,11 @@ type FragmentEvent = Scope & {
 type ToolEventBase = Scope & { readonly key: string };
 type Event =
   | { readonly type: "session.ready"; readonly sessionID: string }
+  | {
+      readonly type: "model.selected";
+      readonly sessionID: string;
+      readonly model: Data<"session.model.selected">["model"];
+    }
   | { readonly type: "turn.started"; readonly turnID: string }
   | {
       readonly type: "permission.asked";
@@ -276,6 +138,19 @@ type Event =
   | (Scope & { readonly type: "step.streamed"; readonly step: Data<"session.step.streamed"> })
   | (Scope & { readonly type: "step.completed"; readonly step: Data<"session.step.ended"> })
   | (Scope & { readonly type: "step.failed"; readonly step: Data<"session.step.failed"> })
+  | (Scope & {
+      readonly type: "compaction.started" | "compaction.completed" | "compaction.failed";
+      /** Stable attempt identity, shared by start and terminal; never just the event type. */
+      readonly key: string;
+      readonly eventID: string;
+      readonly durable: Extract<NativeEvent, { type: "session.compaction.started" }>["durable"];
+      readonly metadata?: Readonly<Record<string, unknown>>;
+      readonly compaction:
+        | Data<"session.compaction.started">
+        | Data<"session.compaction.ended">
+        | Data<"session.compaction.failed">;
+      readonly inputID?: string;
+    })
   | (ToolEventBase & {
       readonly type: "tool.started" | "tool.input.completed";
       readonly tool: ToolSnapshot;
@@ -312,13 +187,24 @@ type Event =
       };
     })
   | (Scope & { readonly type: "child.attached" | "child.updated"; readonly info: ChildInfo })
-  | (Scope & { readonly type: "child.started" })
+  | (Scope & {
+      readonly type: "child.started";
+      /** Explicit transition for a reused session; the native launch tool key, not an execution ID. */
+      readonly reactivation?: { readonly key: string };
+    })
   | (Scope & { readonly type: "child.completed"; readonly summary?: string })
   | (Scope & { readonly type: "child.failed"; readonly error: typeof nativeError.Type })
   | (Scope & {
       readonly type: "child.interrupted";
       readonly reason: Data<"session.execution.interrupted">["reason"] | "cancelled";
     })
+  | {
+      readonly type: "usage.recorded";
+      readonly eventID: string;
+      readonly durable: Extract<NativeEvent, { type: "session.usage.recorded" }>["durable"];
+      readonly scope: "session";
+      readonly usage: Data<"session.usage.recorded">;
+    }
   | {
       readonly type: "usage.updated";
       readonly sessionID: string;
@@ -350,25 +236,29 @@ type Block = {
 };
 type Work = {
   scope: Scope;
+  readonly activationID: number;
+  manualInput?: { readonly id: string; delivered: boolean };
   info: ChildInfo;
   started: boolean;
   terminal: boolean;
+  sequenceLatest: number;
+  sequenceFloor: number;
+  reactivationKey?: string;
   readonly blocks: Map<string, Block>;
   readonly tools: Map<
     string,
     { snapshot: ToolSnapshot; inputEnded: boolean; called: boolean; ended: boolean }
   >;
   readonly steps: Map<string, { started: boolean; streamed: boolean; ended: boolean }>;
+  readonly compactions: Map<string, CompactionAttempt>;
 };
-const workCreate = (scope: Scope): Work => ({
-  scope,
-  info: {},
-  started: false,
-  terminal: false,
-  blocks: new Map(),
-  tools: new Map(),
-  steps: new Map(),
-});
+type CompactionAttempt = {
+  activationID: number;
+  reason: "auto" | "manual";
+  inputID?: string;
+  ended: boolean;
+  terminalEventID?: string;
+};
 const boundedAdd = (set: Set<string>, key: string) => {
   set.add(key);
   if (set.size > 4096) {
@@ -406,9 +296,10 @@ const sessionFrom = (body: unknown): Session | undefined => {
  * The experimental session log is not a safe reconnect source in this release: Bus.configured
  * defaults to persist=false (server routes only enable it when configured), and log.synced
  * reports the sequence watermark even when no event rows were retained. There is no complete
- * session-event snapshot API or retention/gap proof. Resume therefore adopts only a quiescent
- * session (not running, empty inbox, no pending permission/form); work that finished offline is
- * already settled, and anything still live is refused rather than silently missed. */
+ * session-event snapshot API, retention/gap proof, or atomic quiescence fence. Resume observes
+ * the target before independent readiness reads and refuses observed concurrent activity.
+ * Readiness is not lossless recovery: unowned work needs a validated synthetic inbox
+ * boundary; otherwise it fails closed without reconstructing a transcript. */
 export const openCodeNativeSessionEngineCreate = (input: {
   readonly url: string;
   readonly serverPassword?: string;
@@ -417,21 +308,107 @@ export const openCodeNativeSessionEngineCreate = (input: {
   readonly onEvent: (event: Event) => void;
 }) => {
   const client = openCodeNativeClientCreate(input);
+  const compactionsBySession = new Map<string, Map<string, CompactionAttempt>>();
+  let nextActivationID = 0;
+  const workCreate = (scope: Scope): Work => {
+    let compactions = compactionsBySession.get(scope.sessionID);
+    if (!compactions) {
+      compactions = new Map();
+      compactionsBySession.set(scope.sessionID, compactions);
+    }
+    return {
+      scope,
+      activationID: ++nextActivationID,
+      info: {},
+      started: false,
+      terminal: false,
+      sequenceLatest: -1,
+      sequenceFloor: 0,
+      blocks: new Map(),
+      tools: new Map(),
+      steps: new Map(),
+      compactions,
+    };
+  };
   let session: Session | undefined;
   let abort: AbortController | undefined;
   let connected = false;
+  // One buffered frame is enough to refuse adoption; no transcript is reconstructed.
+  let provisionalResume: { readonly sessionID: string; observed?: NativeFrame } | undefined;
+  let resumed = false;
   let active: Work | undefined;
+  // A manual control settles before the native busy period. Do not let that
+  // period's delayed terminal close a newly admitted ordinary input.
+  let manualExecution = false;
   let commandWork: Work | undefined;
+  // Admission is not execution: a wake during settlement belongs to a successor,
+  // even when its enqueue precedes the outgoing execution's terminal publication.
+  const admittedInputs = new Map<
+    string,
+    { work?: Work; readonly resolve: (turnID: string) => void }
+  >();
+  const syntheticInputs = new Map<string, Data<"session.inbox.enqueued">>();
+  // A native start has no input identity. Hold it until delivery of an observed synthetic
+  // admission identifies the activation; enqueue (including resume:false) is not a run.
+  let unownedExecution: NativeFrame[] = [];
+  const inputAdmit = (id: string) => {
+    let resolve!: (turnID: string) => void;
+    const turn = new Promise<string>((settle) => {
+      resolve = settle;
+    });
+    const admitted: { work?: Work; readonly resolve: (turnID: string) => void } = { resolve };
+    admittedInputs.set(id, admitted);
+    if (!active && !manualExecution) {
+      // A validated T3 receipt supersedes unowned frames in the pre-admission prefix.
+      // They must not reopen a retired activation after this input has settled.
+      unownedExecution = [];
+      active = workCreate({ turnID: id, sessionID: session!.id });
+      lastTurnID = id;
+      admitted.work = active;
+      resolve(id);
+    }
+    return { admitted, turn };
+  };
+  const inputTurn = async (admission: ReturnType<typeof inputAdmit>): Promise<Result<string>> => {
+    if (admission.admitted.work)
+      return { success: true, data: admission.admitted.work.scope.turnID };
+    const controller = abort;
+    try {
+      const turnID = await requestWithDeadline(
+        controller?.signal,
+        (signal) =>
+          new Promise<string>((resolve, reject) => {
+            const cancelled = () => reject(signal.reason);
+            signal.addEventListener("abort", cancelled, { once: true });
+            if (signal.aborted) cancelled();
+            void admission.turn.then((turnID) => {
+              signal.removeEventListener("abort", cancelled);
+              resolve(turnID);
+            });
+          }),
+      );
+      return { success: true, data: turnID };
+    } catch (cause) {
+      if (abort === controller) uncertain = true;
+      return fail(
+        "session.prompt",
+        `${cause instanceof Error ? cause.message : "Native input execution boundary unavailable."} Outcome uncertain; do not replay the input.`,
+      );
+    }
+  };
   const dispatchedEvents = new Set<string>();
   let lastTurnID: string | undefined;
   const children = new Map<string, Work>();
   const childParents = new Map<string, string>();
+  const childLaunches = new Set<string>();
   const retiredMessages = new Set<string>();
   let admitting = false;
+  let associating = false;
   let switching = false;
   let uncertain = false;
   let disconnected = false;
   let admissionEvents: NativeFrame[] = [];
+  // Actual retained/log or public-feed observations, never synchronization watermarks.
   const admissionSequences = new Set<number>();
   let admissionWake: (() => void) | undefined;
   let nativeSequence = -1;
@@ -512,12 +489,92 @@ export const openCodeNativeSessionEngineCreate = (input: {
   };
   const dispatch = (message: NativeFrame) => {
     if (dispatchedEvents.has(message.id)) return;
+    if ("durable" in message) {
+      const child = children.get(message.durable.aggregateID);
+      if (child && message.durable.seq < child.sequenceFloor) return;
+    }
     if (
       "durable" in message &&
       message.durable.aggregateID === session?.id &&
       message.durable.seq < turnSequenceFloor
     )
       return;
+    const parent = record(message.data)?.sessionID === session?.id;
+    const syntheticEnqueue =
+      message.type === "session.inbox.enqueued" && message.data.item.type === "synthetic";
+    if (
+      parent &&
+      !active &&
+      manualExecution &&
+      message.type === "session.inbox.delivered" &&
+      syntheticInputs.has(message.data.inboxID)
+    ) {
+      active = workCreate({ turnID: message.data.inboxID, sessionID: session!.id });
+      lastTurnID = message.data.inboxID;
+      turnSequenceFloor = message.durable.seq;
+      unownedExecution = [];
+      workStart(active);
+    }
+    if (
+      parent &&
+      !active &&
+      !admittedInputs.size &&
+      (unownedExecution.length > 0 || message.type === "session.execution.started")
+    ) {
+      if (
+        message.type === "session.inbox.delivered" &&
+        syntheticInputs.has(message.data.inboxID) &&
+        unownedExecution.length > 0
+      ) {
+        const id = message.data.inboxID;
+        active = workCreate({ turnID: id, sessionID: session!.id });
+        lastTurnID = id;
+        const frames = unownedExecution;
+        unownedExecution = [];
+        for (const frame of frames) dispatch(frame);
+      } else if (message.type === "session.execution.started") {
+        // Delivery names the actual consumed input; enqueue order alone cannot
+        // distinguish a queued/suspended input from a later steer wake.
+        if (unownedExecution.length === 0) unownedExecution.push(message);
+        return;
+      } else if (
+        !syntheticEnqueue &&
+        message.type !== "session.inbox.cancelled" &&
+        message.type !== "session.inbox.delivery.changed" &&
+        /^session\.(execution|inbox|step|text|reasoning|tool|shell|retry|compaction)\./u.test(
+          message.type,
+        )
+      ) {
+        lost(
+          "Native resumed session activity has no admitted owner; safe adoption is unavailable. No prompt was replayed and no transcript recovery is guaranteed.",
+        );
+        return;
+      }
+    }
+    if (
+      resumed &&
+      !lastTurnID &&
+      !syntheticEnqueue &&
+      !(message.type === "session.inbox.cancelled" && syntheticInputs.has(message.data.inboxID)) &&
+      !(
+        message.type === "session.inbox.delivery.changed" &&
+        syntheticInputs.has(message.data.inboxID)
+      ) &&
+      !(message.type === "session.inbox.delivered" && syntheticInputs.has(message.data.inboxID)) &&
+      (message.type === "form.created"
+        ? message.data.form.sessionID === session?.id
+        : record(message.data)?.sessionID === session?.id) &&
+      (message.type === "permission.asked" ||
+        message.type === "form.created" ||
+        /^session\.(execution|inbox|step|text|reasoning|tool|shell|retry|compaction)\./u.test(
+          message.type,
+        ))
+    ) {
+      lost(
+        "Native resumed session activity has no admitted owner; safe adoption is unavailable. No prompt was replayed and no transcript recovery is guaranteed.",
+      );
+      return;
+    }
     boundedAdd(dispatchedEvents, message.id);
     if (message.type === "permission.replied") {
       requestSettle(
@@ -567,8 +624,18 @@ export const openCodeNativeSessionEngineCreate = (input: {
       ]);
       if (disconnected || session?.id !== id)
         return fail("session.pending", "Native event stream lost during pending reconciliation.");
-      for (const request of pendingPermissions) permissionOpen(request);
-      for (const form of pendingForms) formOpen(form);
+      for (const request of pendingPermissions) {
+        const decoded = permissionDecode(request);
+        if (Exit.isFailure(decoded))
+          return fail("session.pending", "Invalid native permission response.");
+        permissionOpen(decoded.value);
+      }
+      for (const form of pendingForms) {
+        const decoded = formDecode(form);
+        if (Exit.isFailure(decoded))
+          return fail("session.pending", "Invalid native form response.");
+        formOpen(decoded.value);
+      }
       if (closeMissing) {
         const permissionIDs = new Set(pendingPermissions.map((request) => request.id));
         const formIDs = new Set(pendingForms.map((form) => form.id));
@@ -594,7 +661,12 @@ export const openCodeNativeSessionEngineCreate = (input: {
   const workStart = (work: Work) => {
     if (work.started || work.terminal) return;
     work.started = true;
-    if (work.scope.parentSessionID) emit({ type: "child.started", ...work.scope });
+    if (work.scope.parentSessionID)
+      emit({
+        type: "child.started",
+        ...work.scope,
+        ...(work.reactivationKey ? { reactivation: { key: work.reactivationKey } } : {}),
+      });
     else emit({ type: "turn.started", turnID: work.scope.turnID });
   };
   const itemsSettle = (
@@ -654,7 +726,39 @@ export const openCodeNativeSessionEngineCreate = (input: {
       });
     }
   };
-  const childAttach = (work: Work, key: string, snapshot: ToolSnapshot) => {
+  const manualSettle = (
+    work: Work,
+    outcome: {
+      readonly error?: typeof nativeError.Type;
+      readonly interruption?: Data<"session.execution.interrupted">["reason"];
+    },
+  ) => {
+    if (work.terminal) return;
+    workSettle(work, outcome.error);
+    if (active === work) active = undefined;
+    idleNotify();
+    if (outcome.interruption)
+      emit({
+        type: "turn.failed",
+        turnID: work.scope.turnID,
+        reason: "interrupted",
+        interruptionReason: outcome.interruption,
+      });
+    else if (outcome.error)
+      emit({
+        type: "turn.failed",
+        turnID: work.scope.turnID,
+        reason: "failed",
+        error: outcome.error,
+      });
+    else emit({ type: "turn.completed", turnID: work.scope.turnID });
+  };
+  const childAttach = (
+    work: Work,
+    key: string,
+    snapshot: ToolSnapshot,
+    runningProgress = false,
+  ) => {
     // v2.0.18 has no session.child.* events. Subagent progress/result metadata
     // identifies the actual child before prompting it; creation alone cannot
     // disambiguate concurrent tool calls. Background tool success is NOT child completion.
@@ -669,6 +773,8 @@ export const openCodeNativeSessionEngineCreate = (input: {
       (childParents.has(id) && childParents.get(id) !== work.scope.sessionID)
     )
       return;
+    const seenLaunch = childLaunches.has(key);
+    boundedAdd(childLaunches, key);
     let child = children.get(id);
     if (!child) {
       child = workCreate({
@@ -683,8 +789,34 @@ export const openCodeNativeSessionEngineCreate = (input: {
       emit({ type: "child.attached", ...child.scope, info: child.info });
     } else if (child.scope.parentSessionID !== work.scope.sessionID) {
       return;
-    } else if (child.scope.parentToolKey && child.scope.parentToolKey !== key) {
-      return;
+    } else if (
+      (child.scope.parentToolKey && child.scope.parentToolKey !== key) ||
+      (child.terminal && !child.scope.parentToolKey)
+    ) {
+      // A session is durable identity, not an activation. Only the upstream reuse
+      // admission's running progress may replace settled work, never a tool result
+      // or a replay of an older launch. Keep the old Work/scope untouched.
+      if (
+        !child.terminal ||
+        !runningProgress ||
+        snapshot.metadata?.status !== "running" ||
+        snapshot.input.sessionID !== id ||
+        seenLaunch
+      )
+        return;
+      const previous = child;
+      child = workCreate({
+        sessionID: id,
+        turnID: work.scope.turnID,
+        parentToolKey: key,
+        parentSessionID: work.scope.sessionID,
+      });
+      child.info = previous.info;
+      child.sequenceFloor = previous.sequenceLatest + 1;
+      child.sequenceLatest = previous.sequenceLatest;
+      child.reactivationKey = key;
+      children.set(id, child);
+      emit({ type: "child.attached", ...child.scope, info: child.info });
     } else if (!child.scope.parentToolKey) {
       child.scope = { ...child.scope, parentToolKey: key };
     }
@@ -698,8 +830,114 @@ export const openCodeNativeSessionEngineCreate = (input: {
     workSettle(child);
     emit({ type: "child.completed", ...child.scope });
   };
+  const childNotification = (
+    sessionID: string,
+    payload: { readonly text: string; readonly metadata?: Readonly<Record<string, unknown>> },
+  ) => {
+    const metadata = payload.metadata;
+    const target =
+      typeof metadata?.childID === "string" ? children.get(metadata.childID) : undefined;
+    if (
+      metadata?.source !== "subagent" ||
+      !target ||
+      target.terminal ||
+      // Both supported notification shapes have childID but no launch/execution
+      // identity. A delayed old job notification cannot settle reused work; its
+      // own execution terminal (or matching foreground tool result) must do so.
+      target.reactivationKey !== undefined ||
+      target.scope.parentSessionID !== sessionID
+    )
+      return;
+    if (
+      metadata.state !== "completed" &&
+      metadata.state !== "error" &&
+      metadata.state !== "cancelled"
+    )
+      return;
+    const error = { type: "subagent.failed", message: payload.text };
+    workSettle(
+      target,
+      metadata.state === "error"
+        ? error
+        : metadata.state === "cancelled"
+          ? { type: "subagent.cancelled", message: "Subagent cancelled." }
+          : undefined,
+    );
+    if (metadata.state === "completed")
+      emit({ type: "child.completed", ...target.scope, summary: payload.text });
+    if (metadata.state === "error") emit({ type: "child.failed", ...target.scope, error });
+    if (metadata.state === "cancelled")
+      emit({ type: "child.interrupted", ...target.scope, reason: "cancelled" });
+  };
   const translate = (message: NativeEvent) => {
-    if (message.type === "session.inbox.enqueued") return;
+    if (openCodeNativeEventDisposition[message.type] !== "translated") return;
+    if (message.type === "session.inbox.enqueued") {
+      if (message.data.item.type !== "synthetic") return;
+      if (message.data.sessionID === session?.id) {
+        if (syntheticInputs.size >= 4096) {
+          lost("Native synthetic input buffer exceeded its 4096-input capacity.");
+          return;
+        }
+        syntheticInputs.set(message.data.inboxID, message.data);
+      }
+      // SubagentCompletion.deliver admits a synthetic inbox item, not a user message
+      // or necessarily a legacy session.synthetic event. Completion belongs to the
+      // child's spawning turn even when the parent is idle or on a later activation.
+      childNotification(message.data.sessionID, message.data.item.payload);
+      return;
+    }
+    if (message.type === "session.inbox.cancelled") {
+      if (message.data.sessionID === session?.id) syntheticInputs.delete(message.data.inboxID);
+      if (
+        active?.manualInput?.id === message.data.inboxID &&
+        message.data.sessionID === session?.id
+      ) {
+        if (!active.manualInput.delivered) manualExecution = false;
+        manualSettle(active, { interruption: "user" });
+      }
+      return;
+    }
+    if (message.type === "session.inbox.delivered") {
+      if (message.data.sessionID !== session?.id) return;
+      syntheticInputs.delete(message.data.inboxID);
+      if (active?.manualInput?.id === message.data.inboxID) {
+        active.manualInput.delivered = true;
+        return;
+      }
+      const admitted = admittedInputs.get(message.data.inboxID);
+      if (!admitted) return;
+      if (!active && manualExecution) {
+        // Manual control completion is earlier than the busy-period terminal.
+        // An ordinary steer may be consumed in that same native execution.
+        active = workCreate({ turnID: message.data.inboxID, sessionID: session!.id });
+        turnSequenceFloor = message.durable.seq;
+        lastTurnID = message.data.inboxID;
+        workStart(active);
+      }
+      if (!active) return;
+      admitted.work = active;
+      admitted.resolve(active.scope.turnID);
+      admittedInputs.delete(message.data.inboxID);
+      return;
+    }
+    if (
+      message.type === "session.execution.started" &&
+      message.data.sessionID === session?.id &&
+      !active
+    ) {
+      // Admission stays exclusive until association, so there is at most one
+      // unresolved T3 input. A successor may fail before promoting it; start,
+      // not delivery alone, establishes that new activation's ownership.
+      const next = admittedInputs.entries().next().value;
+      if (next) {
+        const [id, admitted] = next;
+        active = workCreate({ turnID: id, sessionID: message.data.sessionID });
+        turnSequenceFloor = message.durable.seq;
+        lastTurnID = id;
+        admitted.work = active;
+        admitted.resolve(id);
+      }
+    }
     if (message.type === "session.created") {
       const data = message.data;
       if (!data.parentID || !/^ses_[\w-]+$/.test(data.sessionID)) return;
@@ -748,53 +986,131 @@ export const openCodeNativeSessionEngineCreate = (input: {
       return;
     }
     const { data } = message;
+    if (
+      data.sessionID === session?.id &&
+      (message.type === "session.execution.succeeded" ||
+        message.type === "session.execution.failed" ||
+        message.type === "session.execution.interrupted")
+    )
+      manualExecution = false;
     const child = children.get(data.sessionID);
     const work = data.sessionID === session?.id ? active : child;
+    if (message.type === "session.model.selected" && data.sessionID === session?.id) {
+      emit({ type: "model.selected", ...message.data });
+      return;
+    }
     if (message.type === "session.usage.updated") {
       // v2.0.18 session/projector.ts emits cumulative totals, including non-turn work. Never add
       // these to step totals or combine child totals with the main agent.
       emit({ type: "usage.updated", ...message.data, scope: "session" });
       return;
     }
+    if (message.type === "session.usage.recorded") {
+      // Title work is session-scoped. Compaction records repeat the public terminal's
+      // charge, without an attempt ID, so neither is additive turn accounting.
+      emit({
+        type: "usage.recorded",
+        eventID: message.id,
+        durable: message.durable,
+        scope: "session",
+        usage: message.data,
+      });
+      return;
+    }
     if (message.type === "session.synthetic") {
-      const metadata = message.data.metadata;
-      const target =
-        typeof metadata?.childID === "string" ? children.get(metadata.childID) : undefined;
-      if (
-        metadata?.source !== "subagent" ||
-        !target ||
-        target.terminal ||
-        target.scope.parentSessionID !== data.sessionID
-      )
-        return;
-      if (
-        metadata.state !== "completed" &&
-        metadata.state !== "error" &&
-        metadata.state !== "cancelled"
-      )
-        return;
-      const error = { type: "subagent.failed", message: message.data.text };
-      workSettle(
-        target,
-        metadata.state === "error"
-          ? error
-          : metadata.state === "cancelled"
-            ? { type: "subagent.cancelled", message: "Subagent cancelled." }
-            : undefined,
-      );
-      if (metadata.state === "completed")
-        emit({ type: "child.completed", ...target.scope, summary: message.data.text });
-      if (metadata.state === "error") emit({ type: "child.failed", ...target.scope, error });
-      if (metadata.state === "cancelled")
-        emit({ type: "child.interrupted", ...target.scope, reason: "cancelled" });
+      childNotification(data.sessionID, message.data);
       return;
     }
     if (!work || work.terminal) return;
+    if (child && "durable" in message) {
+      if (message.durable.seq < child.sequenceFloor) return;
+      // Running progress precedes prompt admission. An outgoing execution's
+      // delayed terminal in that gap must not terminate the pending activation.
+      if (child.reactivationKey && !child.started && message.type !== "session.execution.started")
+        return;
+      if (message.type === "session.execution.started" && !child.started)
+        child.sequenceFloor = message.durable.seq;
+      child.sequenceLatest = Math.max(child.sequenceLatest, message.durable.seq);
+    }
+    if (child?.reactivationKey && !child.started && message.type !== "session.execution.started")
+      return;
     const scope = work.scope;
+    if (
+      message.type === "session.compaction.started" ||
+      message.type === "session.compaction.ended" ||
+      message.type === "session.compaction.failed"
+    ) {
+      const compaction = message.data;
+      const inputID = "inputID" in compaction ? compaction.inputID : undefined;
+      if (message.type !== "session.compaction.started") {
+        const previous = [...work.compactions].find(
+          ([, attempt]) => attempt.terminalEventID === message.id,
+        );
+        if (previous) return;
+      }
+      if (
+        work.manualInput &&
+        (compaction.reason !== "manual" ||
+          (inputID !== undefined && inputID !== work.manualInput.id) ||
+          (message.type === "session.compaction.started" && inputID === undefined))
+      )
+        return;
+      const open = [...work.compactions]
+        .toReversed()
+        .find(
+          ([, attempt]) =>
+            attempt.activationID === work.activationID &&
+            !attempt.ended &&
+            attempt.reason === compaction.reason &&
+            (inputID === undefined || attempt.inputID === inputID),
+        );
+      const key =
+        message.type === "session.compaction.started" ? message.id : (open?.[0] ?? message.id);
+      // Terminals without inputID only belong to this control through its observed
+      // attempt, not merely because another manual request owns the session now.
+      if (work.manualInput && message.type !== "session.compaction.started" && !open && !inputID)
+        return;
+      if (work.manualInput) work.manualInput.delivered = true;
+      const existing = work.compactions.get(key);
+      const attempt = (existing?.activationID === work.activationID ? existing : undefined) ?? {
+        activationID: work.activationID,
+        reason: compaction.reason,
+        ...(inputID ? { inputID } : {}),
+        ended: false,
+      };
+      if (message.type !== "session.compaction.started") {
+        attempt.ended = true;
+        attempt.terminalEventID = message.id;
+      }
+      work.compactions.set(key, attempt);
+      workStart(work);
+      emit({
+        type:
+          message.type === "session.compaction.started"
+            ? "compaction.started"
+            : message.type === "session.compaction.ended"
+              ? "compaction.completed"
+              : "compaction.failed",
+        ...scope,
+        key,
+        eventID: message.id,
+        durable: message.durable,
+        compaction,
+        ...(message.metadata ? { metadata: message.metadata } : {}),
+        ...(attempt.inputID ? { inputID: attempt.inputID } : {}),
+      });
+      if (work.manualInput && message.type !== "session.compaction.started")
+        manualSettle(
+          work,
+          message.type === "session.compaction.failed" ? { error: message.data.error } : {},
+        );
+      return;
+    }
     if ("assistantMessageID" in data) {
       if (retiredMessages.has(`${data.sessionID}:${data.assistantMessageID}`)) return;
     }
     if (message.type === "session.execution.started") {
+      if (!child && !work.started) turnSequenceFloor = message.durable.seq;
       workStart(work);
       return;
     }
@@ -809,6 +1125,17 @@ export const openCodeNativeSessionEngineCreate = (input: {
       const error = message.type === "session.execution.failed" ? message.data.error : undefined;
       const interruption =
         message.type === "session.execution.interrupted" ? message.data.reason : undefined;
+      if (work.manualInput) {
+        // Success of an enclosing execution is not proof that the accepted
+        // compaction ran. Failures/interruptions do settle its admitted work,
+        // without inventing a charged compaction attempt.
+        if (error || interruption)
+          manualSettle(work, {
+            ...(error ? { error } : {}),
+            ...(interruption ? { interruption } : {}),
+          });
+        return;
+      }
       workSettle(
         work,
         error ??
@@ -823,6 +1150,9 @@ export const openCodeNativeSessionEngineCreate = (input: {
         return;
       }
       active = undefined;
+      for (const [id, admitted] of admittedInputs) {
+        if (admitted.work === work) admittedInputs.delete(id);
+      }
       idleNotify();
       if (error) emit({ type: "turn.failed", turnID: scope.turnID, reason: "failed", error });
       else if (interruption)
@@ -1004,7 +1334,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
       const progress = { ...item.snapshot, metadata: message.data.metadata };
       item.snapshot = progress;
       emit({ type: "tool.progress", ...scope, key, tool: progress });
-      childAttach(work, key, progress);
+      childAttach(work, key, progress, true);
       return;
     }
     if (message.type === "session.tool.success" || message.type === "session.tool.failed") {
@@ -1052,6 +1382,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
     idleNotify();
     if (session && abort && !abort.signal.aborted)
       emit({ type: "stream.lost", sessionID: session.id, detail });
+    abort?.abort(new Error(detail));
   };
 
   const listen = (controller: AbortController, ready: (result: Result<void>) => void) => {
@@ -1061,7 +1392,9 @@ export const openCodeNativeSessionEngineCreate = (input: {
       try {
         for await (const frame of client.event.subscribe({ signal: controller.signal })) {
           if (controller.signal.aborted || abort !== controller) break;
-          const message = frame;
+          const decoded = feedDecode(frame);
+          if (Exit.isFailure(decoded)) continue;
+          const message = decoded.value;
           const data = record(message.data);
           const messageSessionID =
             message.type === "form.created" ? record(data?.form)?.sessionID : data?.sessionID;
@@ -1070,6 +1403,10 @@ export const openCodeNativeSessionEngineCreate = (input: {
               connected = true;
               ready({ success: true, data: undefined });
             }
+            continue;
+          }
+          if (provisionalResume && provisionalResume.sessionID === messageSessionID) {
+            provisionalResume.observed ??= message;
             continue;
           }
           if (
@@ -1097,45 +1434,6 @@ export const openCodeNativeSessionEngineCreate = (input: {
           }
           // The global /api/event feed is volatile. Dedup within one subscription only;
           // do not use its event id as a durable replay cursor.
-          // The official union adds durable/location fields that this engine does
-          // not use. Bridge only the shared envelope and let its payload schema validate.
-          const interactive =
-            message.type === "permission.asked" ||
-            message.type === "permission.replied" ||
-            message.type === "form.created" ||
-            message.type === "form.replied" ||
-            message.type === "form.cancelled";
-          if (interactive) {
-            const candidate = message.type === "form.created" ? record(data?.form) : data;
-            if (
-              !candidate ||
-              typeof candidate.sessionID !== "string" ||
-              typeof (message.type === "permission.replied"
-                ? candidate.requestID
-                : candidate.id) !== "string"
-            )
-              continue;
-            if (
-              message.type === "permission.asked" &&
-              (typeof candidate.action !== "string" ||
-                !Array.isArray(candidate.resources) ||
-                !candidate.resources.every((resource) => typeof resource === "string"))
-            )
-              continue;
-            if (
-              message.type === "form.created" &&
-              (typeof candidate.title !== "string" || !Array.isArray(candidate.fields))
-            )
-              continue;
-            if (
-              message.type === "permission.replied" &&
-              candidate.reply !== "once" &&
-              candidate.reply !== "always" &&
-              candidate.reply !== "reject"
-            )
-              continue;
-            if (message.type === "form.replied" && !record(candidate.answer)) continue;
-          } else if (Exit.isFailure(nativeEventFromClient(message))) continue;
           if (seen.has(message.id)) continue;
           boundedAdd(seen, message.id);
           // The server can execute (and finish) before the admission HTTP response.
@@ -1253,6 +1551,11 @@ export const openCodeNativeSessionEngineCreate = (input: {
         return fail("session.start", "Expected an absolute directory.");
       const controller = new AbortController();
       abort = controller;
+      const resumeID = options.resumeSessionId;
+      const resumeObservation: typeof provisionalResume = resumeID
+        ? { sessionID: resumeID }
+        : undefined;
+      provisionalResume = resumeObservation;
       let settle!: (value: Result<void>) => void;
       let settled = false;
       const ready = new Promise<Result<void>>((resolve) => {
@@ -1278,14 +1581,14 @@ export const openCodeNativeSessionEngineCreate = (input: {
       clearTimeout(timer);
       if (!connectedResult.success) {
         controller.abort();
-        abort = undefined;
+        if (abort === controller) abort = undefined;
+        if (provisionalResume === resumeObservation) provisionalResume = undefined;
         return connectedResult;
       }
-      const resumeID = options.resumeSessionId;
       if (resumeID) {
-        // v2.0.18 has no durable replay cursor, so events from T3 downtime are lost.
-        // Adopt only a quiescent session: nothing running, queued or awaiting a reply.
-        // Anything that finished offline is already settled, so no live state is missed.
+        // These independent reads can reject observed busy state, not lock the session idle.
+        // The subscription already observes the provisional target, including work that
+        // starts and finishes between reads. log.synced would not close this race either.
         let adopted: Session | undefined;
         try {
           const [info, running, inbox, pendingPermissions, pendingForms] = await Promise.all([
@@ -1318,19 +1621,26 @@ export const openCodeNativeSessionEngineCreate = (input: {
         }
         if (
           !adopted ||
+          resumeObservation?.observed ||
           !connected ||
           disconnected ||
           controller.signal.aborted ||
           abort !== controller
         ) {
+          const concurrent = resumeObservation?.observed !== undefined;
           controller.abort();
-          abort = undefined;
+          if (abort === controller) abort = undefined;
+          if (provisionalResume === resumeObservation) provisionalResume = undefined;
           return fail(
             "session.resume",
-            "Native OpenCode session is busy, missing or unreachable; refusing to adopt it.",
+            concurrent
+              ? "Native OpenCode target changed during resume observation; safe adoption is unavailable. Refusing concurrent work without replaying prompts or claiming lossless recovery."
+              : "Native OpenCode session is busy, missing or unreachable; safe adoption is unavailable. Refusing to adopt it without replaying prompts or claiming lossless recovery.",
           );
         }
         session = adopted;
+        resumed = true;
+        provisionalResume = undefined;
         emit({ type: "session.ready", sessionID: adopted.id });
         return { success: true, data: adopted };
       }
@@ -1389,7 +1699,9 @@ export const openCodeNativeSessionEngineCreate = (input: {
         return fail("session.switch", "Session event stream is not ready.");
       if (uncertain)
         return fail("session.switch", "Session already has pending or uncertain work.");
-      if (admitting || switching)
+      if (active?.manualInput || manualExecution)
+        return reject("session.switch", "Manual compaction is still pending or settling.");
+      if (admitting || associating || switching || unownedExecution.length > 0)
         return reject(
           "session.switch",
           "A message is still being admitted. Try again in a moment.",
@@ -1401,6 +1713,76 @@ export const openCodeNativeSessionEngineCreate = (input: {
         switching = false;
       }
     },
+    /** Admits a manual inbox control, not a user message. The receipt is admission,
+     * never completion; its actual ID may be an already-pending native control. */
+    compact: async (
+      options: Pick<SessionCompactInput, "id" | "delivery"> = {},
+    ): Promise<Result<{ readonly turnID: string; readonly inputID: string }>> => {
+      const currentSession = session;
+      const controller = abort;
+      if (!currentSession || !connected || disconnected || !controller || controller.signal.aborted)
+        return fail("session.compact", "Session event stream is not ready.");
+      if (uncertain)
+        return fail("session.compact", "Session already has pending or uncertain work.");
+      if (
+        active ||
+        manualExecution ||
+        admitting ||
+        associating ||
+        switching ||
+        unownedExecution.length
+      )
+        return reject("session.compact", "Session already has active or pending work.");
+      admitting = true;
+      admissionSequences.clear();
+      const sequenceFloor = nativeSequence + 1;
+      const id = options.id ?? `msg_${NodeCrypto.randomUUID().replaceAll("-", "")}`;
+      const admissionUncertain = (detail: string): Result<never> => {
+        if (abort === controller) {
+          uncertain = true;
+          admitting = false;
+          admissionEvents = [];
+          admissionSequences.clear();
+        }
+        return fail("session.compact", `${detail} Outcome uncertain; do not replay the input.`);
+      };
+      let receipt: unknown;
+      try {
+        receipt = await requestWithDeadline(controller.signal, (signal) =>
+          client.session.compact({ sessionID: currentSession.id, ...options, id }, { signal }),
+        );
+      } catch (cause) {
+        if (isConflictError(cause) && abort === controller && !controller.signal.aborted) {
+          for (const event of admissionEvents) dispatch(event);
+          admissionEvents = [];
+          admitting = false;
+          return reject("session.compact", cause.message);
+        }
+        return admissionUncertain(
+          cause instanceof Error ? cause.message : "Native compaction request failed.",
+        );
+      }
+      const decoded = compactionReceiptDecode(receipt);
+      if (Exit.isFailure(decoded) || decoded.value.sessionID !== currentSession.id)
+        return admissionUncertain("Invalid native compaction admission receipt.");
+      if (abort !== controller || controller.signal.aborted || !connected || disconnected)
+        return admissionUncertain("Native session closed during compaction admission.");
+      const inputID = decoded.value.id;
+      commandWork = undefined;
+      unownedExecution = [];
+      const work = workCreate({ turnID: inputID, sessionID: currentSession.id });
+      work.manualInput = { id: inputID, delivered: false };
+      active = work;
+      manualExecution = true;
+      turnSequenceFloor = sequenceFloor;
+      lastTurnID = inputID;
+      // Own the canonical work at admission, even when execution is delayed.
+      workStart(work);
+      for (const event of admissionEvents) dispatch(event);
+      admissionEvents = [];
+      admitting = false;
+      return { success: true, data: { turnID: inputID, inputID } };
+    },
     send: async (
       text: string,
       attachments: Pick<SessionPromptInput, "files" | "agents" | "skills" | "delivery"> = {},
@@ -1410,15 +1792,18 @@ export const openCodeNativeSessionEngineCreate = (input: {
       const currentSession = session;
       if (uncertain)
         return fail("session.prompt", "Session already has pending or uncertain work.");
-      if (admitting || switching)
+      if (admitting || associating || switching || unownedExecution.length > 0)
         return rejectSend("A message is still being admitted. Try again in a moment.");
-      if (!text.trim()) return rejectSend("Prompt text is required.");
+      if (active?.manualInput) return rejectSend("Manual compaction is still pending.");
+      if (!text.trim() && !attachments.files?.length)
+        return rejectSend("Prompt text or at least one file is required.");
       admitting = true;
       admissionSequences.clear();
       const controller = abort;
       const slash = /^\s*\/(\S+)(?:\s+|$)/u.exec(text);
       const cached = input.inventory?.(currentSession.location.directory);
       let command: string | undefined;
+      let promptText = text;
       let skills = attachments.skills;
       try {
         if (slash) {
@@ -1439,11 +1824,9 @@ export const openCodeNativeSessionEngineCreate = (input: {
             }));
           if (inventory.some((entry) => entry.name === slash[1])) command = slash[1];
         }
-        const promptText = command ? text.slice(slash![0].length) : text;
-        const references = Array.from(
-          promptText.matchAll(/(?<![\w$\\`'"])\$([\w./-]+)(?=$|[\s,;:!?])/gu),
-        );
-        if (references.length) {
+        // Command mentions refer to its submitted argument text, not the slash prefix.
+        promptText = command ? text.slice(slash![0].length) : text;
+        if (/(?:^|[\s([{])\p{Sc}/u.test(promptText)) {
           const inventory =
             cached?.skill ??
             (await requestWithDeadline(controller.signal, async (signal) => {
@@ -1459,16 +1842,20 @@ export const openCodeNativeSessionEngineCreate = (input: {
                 throw new Error("Invalid native skill inventory or mismatched location.");
               return decoded.value.data;
             }));
-          const resolved = references.flatMap((reference) => {
-            const skill = inventory.find((entry) => entry.name.trim() === reference[1]);
+          const resolved = composerSkillMentionsResolve(
+            promptText,
+            inventory.map((skill) => skill.name),
+          ).flatMap((reference) => {
+            const skill = inventory.find((entry) => entry.name === reference.value);
             if (!skill) return [];
             return [
               {
                 id: skill.id,
+                name: skill.name,
                 mention: {
-                  start: reference.index,
-                  end: reference.index + reference[0].length,
-                  text: reference[0],
+                  start: reference.start,
+                  end: reference.end,
+                  text: reference.source,
                 },
               },
             ];
@@ -1497,25 +1884,45 @@ export const openCodeNativeSessionEngineCreate = (input: {
         // /command has no caller id or prompt receipt. log.synced is only a live admission
         // fence here, not a replay/recovery guarantee: even persist=false retains its watermark.
         let after: number | undefined;
-        try {
-          for await (const event of client.session.log(
-            { sessionID: currentSession.id, after: nativeSequence, follow: false },
-            { signal: controller.signal },
-          )) {
-            if (event.type !== "log.synced" || event.aggregateID !== currentSession.id) continue;
-            after = event.seq ?? -1;
-            break;
+        const commandUncertain = (detail: string): Result<never> => {
+          // Disposal may have already released this admission. Do not poison a replacement.
+          if (abort === controller) {
+            uncertain = true;
+            admitting = false;
+            admissionEvents = [];
+            admissionSequences.clear();
+            admissionWake = undefined;
           }
-          if (after === undefined) throw new Error("Native command admission fence missing.");
+          return fail("session.command", `${detail} Outcome uncertain; do not replay the command.`);
+        };
+        try {
+          await requestWithDeadline(controller.signal, async (signal) => {
+            for await (const frame of client.session.log(
+              {
+                sessionID: currentSession.id,
+                ...(nativeSequence >= 0 ? { after: nativeSequence } : {}),
+                follow: false,
+              },
+              { signal },
+            )) {
+              const decoded = logDecode(frame);
+              if (Exit.isFailure(decoded)) throw new Error("Invalid native session log response.");
+              const event = decoded.value;
+              if (event.type !== "log.synced" || event.aggregateID !== currentSession.id) continue;
+              after = event.seq ?? -1;
+              break;
+            }
+            if (after === undefined) throw new Error("Native command admission fence missing.");
+          });
         } catch (cause) {
-          for (const event of admissionEvents) dispatch(event);
-          admissionEvents = [];
-          admitting = false;
-          return reject(
-            "session.command",
+          return commandUncertain(
             cause instanceof Error ? cause.message : "Native command admission fence failed.",
           );
         }
+        if (after === undefined) return commandUncertain("Native command admission fence missing.");
+        const fenceAfter = after;
+        if (controller.signal.aborted || !connected || disconnected)
+          return commandUncertain("Native session closed during command admission fence.");
         // Frames already buffered before the request belong to prior work.
         for (const event of admissionEvents) dispatch(event);
         admissionEvents = [];
@@ -1526,7 +1933,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
               {
                 sessionID: currentSession.id,
                 name: command,
-                text: text.slice(slash![0].length),
+                text: promptText,
                 ...attachments,
                 ...(skills ? { skills } : {}),
                 ...(active && !attachments.delivery ? { delivery: "steer" as const } : {}),
@@ -1537,11 +1944,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
         } catch (cause) {
           // Nothing is announced before both receipts. Failed expansion/admission must not
           // manufacture a running turn; an uncertain server outcome still fails closed.
-          uncertain = true;
-          admitting = false;
-          admissionEvents = [];
-          return fail(
-            "session.command",
+          return commandUncertain(
             cause instanceof Error ? cause.message : "Native command request failed.",
           );
         }
@@ -1551,38 +1954,47 @@ export const openCodeNativeSessionEngineCreate = (input: {
         let through: number | undefined;
         try {
           await requestWithDeadline(controller.signal, async (signal) => {
-            for await (const event of client.session.log(
-              { sessionID: currentSession.id, after, follow: false },
+            for await (const frame of client.session.log(
+              {
+                sessionID: currentSession.id,
+                ...(fenceAfter >= 0 ? { after: fenceAfter } : {}),
+                follow: false,
+              },
               { signal },
             )) {
+              const decoded = logDecode(frame);
+              if (Exit.isFailure(decoded)) throw new Error("Invalid native session log response.");
+              const event = decoded.value;
               if (event.type === "log.synced") {
                 if (event.aggregateID !== currentSession.id) continue;
                 through = event.seq ?? -1;
                 break;
               }
-              if (event.durable.aggregateID !== currentSession.id || event.durable.seq <= after)
+              if (
+                event.durable.aggregateID !== currentSession.id ||
+                event.durable.seq <= fenceAfter
+              )
                 continue;
               logged.push(event);
             }
-            if (through === undefined || through < after)
+            if (through === undefined || through < fenceAfter)
               throw new Error("Native command completion watermark missing or regressed.");
           });
         } catch (cause) {
-          uncertain = true;
-          admitting = false;
-          admissionEvents = [];
-          return fail(
-            "session.command",
+          return commandUncertain(
             cause instanceof Error ? cause.message : "Native command completion receipt failed.",
           );
         }
-        // With persistence disabled the marker can beat its global SSE prefix. Drain
-        // exactly the committed watermark, woken by frame arrival, stream loss or stop.
+        // A marker can beat its SSE prefix or cover unretained rows. Bus.log also advances
+        // across unknown types, and session.log filters non-session events: integer gaps
+        // are legitimate. Neither a marker nor a later observed sequence proves coverage
+        // of a missing inbox/execution event. Wait only within the deadline, then report
+        // uncertainty rather than infer a no-run command from an incomplete prefix.
         const watermark = through!;
         for (const event of logged) {
           if ("durable" in event) admissionSequences.add(event.durable.seq);
         }
-        let covered = after;
+        let covered = fenceAfter;
         const prefixComplete = () => {
           while (covered < watermark && admissionSequences.has(covered + 1)) covered++;
           return covered === watermark;
@@ -1592,20 +2004,34 @@ export const openCodeNativeSessionEngineCreate = (input: {
           connected &&
           !disconnected &&
           session?.id === currentSession.id;
-        while (!prefixComplete() && streamAvailable()) {
-          await new Promise<void>((wake) => {
-            admissionWake = wake;
+        try {
+          await requestWithDeadline(controller.signal, async (signal) => {
+            while (!prefixComplete() && streamAvailable()) {
+              await new Promise<void>((resolve, reject) => {
+                const cancelled = () => {
+                  signal.removeEventListener("abort", cancelled);
+                  admissionWake = undefined;
+                  reject(signal.reason);
+                };
+                admissionWake = () => {
+                  signal.removeEventListener("abort", cancelled);
+                  admissionWake = undefined;
+                  resolve();
+                };
+                signal.addEventListener("abort", cancelled, { once: true });
+                if (signal.aborted) cancelled();
+              });
+            }
           });
-        }
-        admissionWake = undefined;
-        if (!streamAvailable()) {
-          uncertain = true;
-          admitting = false;
-          admissionEvents = [];
-          return fail(
-            "session.command",
-            "Native session event stream closed during command admission.",
+        } catch (cause) {
+          return commandUncertain(
+            cause instanceof Error ? cause.message : "Native command prefix coverage unavailable.",
           );
+        } finally {
+          admissionWake = undefined;
+        }
+        if (!streamAvailable()) {
+          return commandUncertain("Native session event stream closed during command admission.");
         }
         // Replay the ordered parent prefix first, then the SSE tail/children. dispatch
         // deduplicates IDs across both transports, including SSE arriving after this drain.
@@ -1616,7 +2042,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
             event.data.sessionID === currentSession.id &&
             event.data.item.type === "user" &&
             event.durable.aggregateID === currentSession.id &&
-            event.durable.seq > after &&
+            event.durable.seq > fenceAfter &&
             event.durable.seq <= watermark,
         );
         const prompt =
@@ -1630,7 +2056,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
           commandWork = steering ?? workCreate({ turnID, sessionID: currentSession.id });
           if (!steering) {
             active = commandWork;
-            turnSequenceFloor = after + 1;
+            turnSequenceFloor = fenceAfter + 1;
             lastTurnID = turnID;
             workStart(commandWork);
           }
@@ -1659,11 +2085,9 @@ export const openCodeNativeSessionEngineCreate = (input: {
             event.durable.seq < prompt.seq,
         );
         for (const event of prefix) dispatch(event);
-        const turnID = active?.scope.turnID ?? prompt.id;
-        if (!active) {
-          active = workCreate({ turnID, sessionID: currentSession.id });
+        const admission = inputAdmit(prompt.id);
+        if (active?.scope.turnID === prompt.id) {
           turnSequenceFloor = prompt.seq;
-          lastTurnID = turnID;
         }
         for (const event of admissionEvents) {
           if (
@@ -1675,24 +2099,23 @@ export const openCodeNativeSessionEngineCreate = (input: {
           dispatch(event);
         }
         admissionEvents = [];
+        associating = true;
         admitting = false;
+        const associated = await inputTurn(admission);
+        associating = false;
+        if (!associated.success) return associated;
         const reconciled = await reconcilePending(false);
         if (!reconciled.success) {
           uncertain = true;
           return reconciled;
         }
-        return { success: true, data: { turnID } };
+        return { success: true, data: { turnID: associated.data } };
       }
       commandWork = undefined;
       const id = `msg_${NodeCrypto.randomUUID().replaceAll("-", "")}`;
-      // A send while a turn runs is a steer: OpenCode injects it into the running
-      // execution, and the message continues the same T3 turn.
+      // Delivery defaults to steer, but preparation/settlement can move this input
+      // into a successor. Only delivery or a new execution establishes ownership.
       const steering = active;
-      if (!steering) {
-        active = workCreate({ turnID: id, sessionID: session.id });
-        lastTurnID = id;
-      }
-      const turnID = steering?.scope.turnID ?? id;
       let receipt: unknown;
       try {
         receipt = await requestWithDeadline(controller.signal, (signal) =>
@@ -1700,7 +2123,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
             {
               sessionID: currentSession.id,
               id,
-              text,
+              text: promptText,
               ...attachments,
               ...(skills ? { skills } : {}),
               ...(steering && !attachments.delivery ? { delivery: "steer" as const } : {}),
@@ -1741,9 +2164,14 @@ export const openCodeNativeSessionEngineCreate = (input: {
       }
       // Keep admitting set while draining so even a terminal in the buffered
       // frames cannot permit another send before this receipt has settled.
+      const admission = inputAdmit(id);
       for (const event of admissionEvents) dispatch(event);
       admissionEvents = [];
+      associating = true;
       admitting = false;
+      const associated = await inputTurn(admission);
+      associating = false;
+      if (!associated.success) return associated;
       // The volatile feed may have raced request creation during admission.
       // A failed list does not prove there is no pending request; fail closed.
       const reconciled = await reconcilePending(false);
@@ -1751,7 +2179,7 @@ export const openCodeNativeSessionEngineCreate = (input: {
         uncertain = true;
         return reconciled;
       }
-      return { success: true, data: { turnID } };
+      return { success: true, data: { turnID: associated.data } };
     },
     reconcilePending: () => reconcilePending(),
     replyPermission: async (
@@ -1759,23 +2187,43 @@ export const openCodeNativeSessionEngineCreate = (input: {
       decision: "once" | "always" | "reject",
     ): Promise<Result<void>> => {
       const pending = permissions.get(requestID);
+      const controller = abort;
+      const currentSession = session;
       if (
-        !session ||
+        !currentSession ||
+        !controller ||
+        controller.signal.aborted ||
         !connected ||
         disconnected ||
         !pending ||
-        pending.request.sessionID !== session.id ||
+        pending.request.sessionID !== currentSession.id ||
         pending.replying
       )
         return fail("permission.reply", "No pending permission request in this session.");
       pending.replying = true;
       try {
-        await client.permission.reply({ sessionID: session.id, requestID, decision });
-        requestSettle("permission", requestID, session.id, undefined, decision);
+        await requestWithDeadline(controller.signal, (signal) =>
+          client.permission.reply(
+            { sessionID: currentSession.id, requestID, decision },
+            { signal },
+          ),
+        );
+        if (
+          abort !== controller ||
+          controller.signal.aborted ||
+          (permissions.has(requestID) && permissions.get(requestID) !== pending)
+        )
+          return fail("permission.reply", "Native permission request closed during reply.");
+        requestSettle("permission", requestID, currentSession.id, undefined, decision);
         return { success: true, data: undefined };
       } catch (cause) {
         // An HTTP failure can still have applied the decision; never send it twice.
-        await reconcilePending();
+        if (
+          abort === controller &&
+          !controller.signal.aborted &&
+          permissions.get(requestID) === pending
+        )
+          await reconcilePending();
         return fail(
           "permission.reply",
           cause instanceof Error ? cause.message : "Permission reply outcome uncertain.",
@@ -1789,23 +2237,47 @@ export const openCodeNativeSessionEngineCreate = (input: {
         | undefined,
     ): Promise<Result<void>> => {
       const pending = forms.get(formID);
+      const controller = abort;
+      const currentSession = session;
       if (
-        !session ||
+        !currentSession ||
+        !controller ||
+        controller.signal.aborted ||
         !connected ||
         disconnected ||
         !pending ||
-        pending.form.sessionID !== session.id ||
+        pending.form.sessionID !== currentSession.id ||
         pending.replying
       )
         return fail("session.form.reply", "No pending form in this session.");
       pending.replying = true;
       try {
-        if (answer) await client.session.form.reply({ sessionID: session.id, formID, answer });
-        else await client.session.form.cancel({ sessionID: session.id, formID });
-        requestSettle("form", formID, session.id, answer);
+        await requestWithDeadline(controller.signal, (signal) =>
+          answer
+            ? client.session.form.reply(
+                { sessionID: currentSession.id, formID, answer },
+                { signal },
+              )
+            : client.session.form.cancel({ sessionID: currentSession.id, formID }, { signal }),
+        );
+        if (
+          abort !== controller ||
+          controller.signal.aborted ||
+          (forms.has(formID) && forms.get(formID) !== pending)
+        )
+          return fail("session.form.reply", "Native form closed during reply.");
+        requestSettle("form", formID, currentSession.id, answer);
         return { success: true, data: undefined };
       } catch (cause) {
-        await reconcilePending();
+        // Native validation rejects before settlement. Only that definite, matching
+        // rejection permits correction; transport failures may have applied the answer.
+        if (answer && isFormInvalidAnswerError(cause) && cause.id === formID) {
+          if (abort === controller && !controller.signal.aborted && forms.get(formID) === pending)
+            pending.replying = false;
+          return reject("session.form.reply", cause.message);
+        }
+        if (abort === controller && !controller.signal.aborted && forms.get(formID) === pending)
+          await reconcilePending();
         return fail(
           "session.form.reply",
           cause instanceof Error ? cause.message : "Form reply outcome uncertain.",
@@ -1847,6 +2319,29 @@ export const openCodeNativeSessionEngineCreate = (input: {
       ),
     interrupt: async (): Promise<Result<boolean>> => {
       if (!session) return fail("session.interrupt", "Session has not started.");
+      const manual = active;
+      if (manual?.manualInput && !manual.manualInput.delivered) {
+        const controller = abort;
+        try {
+          await requestWithDeadline(controller?.signal, (signal) =>
+            client.session.inbox.cancel(
+              { sessionID: manual.scope.sessionID, inboxID: manual.manualInput!.id },
+              { signal },
+            ),
+          );
+        } catch (cause) {
+          if (abort === controller) uncertain = true;
+          return fail(
+            "session.interrupt",
+            `${cause instanceof Error ? cause.message : "Native inbox cancellation failed."} Outcome uncertain; do not replay the input.`,
+          );
+        }
+        if (abort !== controller || controller?.signal.aborted)
+          return fail("session.interrupt", "Native session closed during inbox cancellation.");
+        manualExecution = false;
+        manualSettle(manual, { interruption: "user" });
+        return { success: true, data: true };
+      }
       const id = session.id;
       let response: { readonly interrupted: boolean };
       try {
@@ -1871,11 +2366,36 @@ export const openCodeNativeSessionEngineCreate = (input: {
     /** Local disposal is used by recovery; only explicit stops interrupt native work. */
     stop: async (options?: { readonly interrupt?: boolean }): Promise<Result<void>> => {
       if (!abort) return { success: true, data: undefined };
+      // Cancel all local requests before waiting for the remote interrupt receipt.
+      // In particular, a stalled interrupt must not leave a reply mutation running.
+      abort.abort();
       let stopFailure: Result<void> | undefined;
-      if (options?.interrupt !== false && (active || admitting || uncertain)) {
+      let cancelledManual = false;
+      if (options?.interrupt !== false && active?.manualInput && !active.manualInput.delivered) {
         try {
-          const response = await requestWithDeadline(abort.signal, (signal) =>
-            client.session.interrupt({ sessionID: session!.id }, { signal }),
+          await requestWithDeadline(undefined, (signal) =>
+            client.session.inbox.cancel(
+              { sessionID: active!.scope.sessionID, inboxID: active!.manualInput!.id },
+              { signal },
+            ),
+          );
+          cancelledManual = true;
+        } catch (cause) {
+          stopFailure = fail(
+            "session.interrupt",
+            `${cause instanceof Error ? cause.message : "Native inbox cancellation failed."} Outcome uncertain; local engine stopped.`,
+          );
+        }
+      }
+      if (
+        options?.interrupt !== false &&
+        !cancelledManual &&
+        (active || manualExecution || admitting || associating || uncertain)
+      ) {
+        try {
+          const response = await requestWithDeadline(
+            abort.signal.aborted ? undefined : abort.signal,
+            (signal) => client.session.interrupt({ sessionID: session!.id }, { signal }),
           );
           if (typeof response.interrupted !== "boolean" || !response.interrupted)
             stopFailure = fail(
@@ -1895,7 +2415,13 @@ export const openCodeNativeSessionEngineCreate = (input: {
       admissionSequences.clear();
       abort = undefined;
       connected = false;
+      provisionalResume = undefined;
+      resumed = false;
       active = undefined;
+      manualExecution = false;
+      admittedInputs.clear();
+      syntheticInputs.clear();
+      unownedExecution = [];
       commandWork = undefined;
       dispatchedEvents.clear();
       lastTurnID = undefined;
@@ -1905,10 +2431,13 @@ export const openCodeNativeSessionEngineCreate = (input: {
       forms.clear();
       settledRequests.clear();
       children.clear();
+      compactionsBySession.clear();
       childParents.clear();
+      childLaunches.clear();
       retiredMessages.clear();
       uncertain = false;
       admitting = false;
+      associating = false;
       admissionEvents = [];
       disconnected = false;
       session = undefined;

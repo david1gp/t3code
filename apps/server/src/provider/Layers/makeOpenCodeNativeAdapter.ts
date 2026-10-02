@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off globalDate:off - native client runs in Node.
 import * as NodeCrypto from "node:crypto";
+import * as NodeURL from "node:url";
 
 import {
   EventId,
@@ -15,22 +16,28 @@ import {
   type ProviderSession,
   type ProviderSessionStartInput,
   type TurnTokenUsage,
+  type ThreadTokenUsageSnapshot,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
-import * as Scope from "effect/Scope";
 import * as Queue from "effect/Queue";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
+import * as Scope from "effect/Scope";
 
+import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
+import type { openCodeNativeInventoryLoad } from "../openCodeNativeInventoryLoad.ts";
+import { openCodeNativeInventoryDefaultsResolve } from "../openCodeNativeInventoryDefaultsResolve.ts";
 import { openCodeNativeSessionEngineCreate } from "../openCodeNativeSessionEngineCreate.ts";
 import type { OpenCodeNativeInventory } from "../openCodeNativeInventorySchema.ts";
+import { toOpenCodeFileParts } from "../opencodeRuntime.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 
 const provider = ProviderDriverKind.make("opencode");
@@ -38,15 +45,13 @@ type NativeEvent = Parameters<
   Parameters<typeof openCodeNativeSessionEngineCreate>[0]["onEvent"]
 >[0];
 type Engine = ReturnType<typeof openCodeNativeSessionEngineCreate>;
-type Selection = ProviderSessionStartInput["modelSelection"];
-const selectionEquals = (a: NonNullable<Selection>, b: Selection) =>
-  b !== undefined &&
-  a.instanceId === b.instanceId &&
-  a.model === b.model &&
-  (a.options ?? []).length === (b.options ?? []).length &&
-  (a.options ?? []).every((option) =>
-    (b.options ?? []).some((prior) => prior.id === option.id && prior.value === option.value),
-  );
+const emptyInventory: OpenCodeNativeInventory = {
+  provider: [],
+  model: [],
+  agent: [],
+  command: [],
+  skill: [],
+};
 type NativeForm = Extract<NativeEvent, { type: "form.created" }>["form"];
 type NativeField = NativeForm["fields"][number];
 const requestType = (action: string) =>
@@ -71,7 +76,7 @@ const formAnswer = (form: NativeForm, answers: ProviderUserInputAnswers) => {
   if (Object.keys(answers).some((key) => !form.fields.some((field) => field.key === key))) return;
   for (const field of form.fields) {
     const value = answers[field.key];
-    if (value === undefined || value === "") {
+    if (value === undefined || (value === "" && field.type !== "string")) {
       if ("required" in field && field.required) return;
       continue;
     }
@@ -115,13 +120,28 @@ const formAnswer = (form: NativeForm, answers: ProviderUserInputAnswers) => {
     }
     if (
       typeof value !== "string" ||
-      (field.options?.length &&
+      (field.required && value.length === 0) ||
+      (field.options !== undefined &&
         !field.custom &&
         !field.options.some((option) => option.value === value)) ||
       (field.minLength !== undefined && value.length < field.minLength) ||
       (field.maxLength !== undefined && value.length > field.maxLength)
     )
       return;
+    // Match native core/form validation, not JSON Schema's stricter format rules.
+    const pattern = field.pattern;
+    if (pattern !== undefined) {
+      const matches = Result.try(() => new RegExp(pattern).test(value));
+      if (!Result.getOrElse(matches, () => false)) return;
+    }
+    if (field.format === "email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) return;
+    if (field.format === "uri" && !URL.canParse(value)) return;
+    if (field.format === "date") {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return;
+      const date = new Date(`${value}T00:00:00.000Z`);
+      if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value) return;
+    }
+    if (field.format === "date-time" && Number.isNaN(new Date(value).getTime())) return;
     result[field.key] = value;
   }
   return result;
@@ -147,16 +167,18 @@ const formQuestion = (field: NativeField, title: string) => ({
     field.type !== "boolean" &&
     ((field.type !== "string" && field.type !== "multiselect") ||
       field.custom ||
-      !field.options?.length),
+      (field.type === "string" ? field.options === undefined : !field.options?.length)),
   multiSelect: field.type === "multiselect",
 });
 type ChildEvent = Extract<NativeEvent, { type: "child.attached" | "child.updated" }>;
 type StepAccounting = {
-  readonly cost: number;
+  readonly model?: string | undefined;
+  readonly cost?: number;
   readonly tokens?: Extract<NativeEvent, { type: "step.completed" }>["step"]["tokens"];
   readonly completed: boolean;
+  readonly compactionEventID?: string;
 };
-type Child = {
+type ChildActivation = {
   readonly turnId: TurnId;
   readonly parentId: string;
   parentToolKey: string | undefined;
@@ -165,6 +187,13 @@ type Child = {
   readonly steps: Map<string, StepAccounting>;
   readonly unresolvedSteps: Set<string>;
   readonly tools: Set<string>;
+  result?: { readonly assistantMessageID: string; readonly blocks: Map<number, string> };
+};
+type Child = ChildActivation & {
+  // One flat archive retains billing scopes without retaining earlier history arrays.
+  // Task usage is session-lifetime cumulative; do not truncate old activation records.
+  readonly history: Array<ChildActivation>;
+  pendingAttachment?: ChildEvent;
 };
 type CostAccounting = {
   readonly usage: Context["usage"];
@@ -176,22 +205,31 @@ type Context = {
   session: ProviderSession;
   readonly engine: Engine;
   readonly sessionId: string;
+  // Only T3 choices are sticky; resolved native defaults stay refreshable at turn admission.
   modelSelection: ProviderSessionStartInput["modelSelection"];
+  readonly inventory: OpenCodeNativeInventory | undefined;
+  nativeModel: OpenCodeNativeInventory["configuredModel"];
+  readonly defaultAgent: string;
+  activeAgent: string | undefined;
   selectionVerified: boolean;
-  readonly fragments: Map<string, string>;
   readonly usage: Map<string, StepAccounting>;
   readonly unresolvedSteps: Set<string>;
   lastCostUsd: number | undefined;
   readonly settledCosts: Map<TurnId, SettledCostAccounting>;
   readonly children: Map<string, Child>;
-  /** undefined = not looked up yet, null = server reported no limit. */
-  contextLimit: number | null | undefined;
+  modelGeneration: number;
+  readonly stepModels: Map<string, string>;
+  readonly contextLimits: Map<string, Promise<number | undefined>>;
+  contextUsage: ThreadTokenUsageSnapshot | undefined;
   readonly permissions: Map<string, Extract<NativeEvent, { type: "permission.asked" }>["request"]>;
   readonly forms: Map<string, NativeForm>;
   readonly settledRequests: Set<string>;
   active: TurnId | undefined;
   pending: TurnId | undefined;
   lastSettled: TurnId | undefined;
+  manualCompacting?: boolean;
+  manualCompactionAdmitting?: boolean;
+  manualCompactionTurnId?: TurnId | undefined;
   lost: boolean;
   recovery: Fiber.Fiber<void> | undefined;
 };
@@ -203,9 +241,11 @@ export const makeOpenCodeNativeAdapter = (options: {
   readonly instanceId?: ProviderInstanceId;
   readonly engineCreate?: typeof openCodeNativeSessionEngineCreate;
   readonly inventory?: (directory: string) => OpenCodeNativeInventory | undefined;
+  readonly inventoryLoad?: (directory: string) => ReturnType<typeof openCodeNativeInventoryLoad>;
 }) =>
   Effect.gen(function* () {
     const config = yield* ServerConfig;
+    const fileSystem = yield* FileSystem.FileSystem;
     const instanceId = options.instanceId ?? ProviderInstanceId.make("opencode");
     const scope = yield* Scope.Scope;
     let disposed = false;
@@ -257,7 +297,7 @@ export const makeOpenCodeNativeAdapter = (options: {
       );
     /** Splits a T3 selection into the native model ref and agent, rejecting anything else. */
     const nativeSelection = (
-      operation: "startSession" | "sendTurn",
+      operation: "startSession" | "sendTurn" | "compactThread",
       selection: ProviderSessionStartInput["modelSelection"],
     ) => {
       if (!selection) return Effect.succeed(undefined);
@@ -314,14 +354,23 @@ export const makeOpenCodeNativeAdapter = (options: {
                 new ProviderAdapterRequestError({ provider, method, detail: value.error.detail }),
               ),
       );
+    const childActivations = (ctx: Context) =>
+      [...ctx.children.values()].flatMap((child) => [...child.history, child]);
+    const childCostPending = (ctx: Context, turnId: TurnId) =>
+      childActivations(ctx).some(
+        (child) => child.turnId === turnId && child.status === "running",
+      ) || [...ctx.children.values()].some((child) => child.pendingAttachment?.turnID === turnId);
     const tokenUsage = (ctx: Context): TurnTokenUsage | undefined => {
       if (!ctx.usage.size) return undefined;
       const totals = [...ctx.usage.values()].flatMap((step) => (step.tokens ? [step.tokens] : []));
       if (!totals.length) return undefined;
       return {
         usageScope: "main_agent",
-        usageStatus: totals.length === ctx.usage.size ? "complete" : "partial",
-        hasSubagents: [...ctx.children.values()].some((child) => child.turnId === ctx.active),
+        usageStatus:
+          totals.length === ctx.usage.size && ctx.unresolvedSteps.size === 0
+            ? "complete"
+            : "partial",
+        hasSubagents: childActivations(ctx).some((child) => child.turnId === ctx.active),
         inputTokens: totals.reduce(
           (n, step) => n + step.input + step.cache.read + step.cache.write,
           0,
@@ -340,7 +389,8 @@ export const makeOpenCodeNativeAdapter = (options: {
       const id = step.assistantMessageID;
       if (steps.get(id)?.completed) return;
       if (step.cost === undefined || !Number.isFinite(step.cost) || step.cost < 0) {
-        steps.delete(id);
+        const knownTokens = step.tokens ?? steps.get(id)?.tokens;
+        steps.set(id, { ...(knownTokens ? { tokens: knownTokens } : {}), completed: false });
         unresolved.add(id);
         return;
       }
@@ -357,10 +407,11 @@ export const makeOpenCodeNativeAdapter = (options: {
       complete: boolean,
       accounting: CostAccounting,
     ) => {
-      const children = [...ctx.children.values()].filter((child) => child.turnId === turnId);
+      const children = childActivations(ctx).filter((child) => child.turnId === turnId);
       if (
         complete &&
-        (accounting.unresolvedSteps.size > 0 ||
+        (childCostPending(ctx, turnId) ||
+          accounting.unresolvedSteps.size > 0 ||
           children.some(
             (child) =>
               child.status === "running" || child.unresolvedSteps.size > 0 || !child.steps.size,
@@ -371,7 +422,7 @@ export const makeOpenCodeNativeAdapter = (options: {
       let hasPricedStep = false;
       for (const steps of [accounting.usage, ...children.map((child) => child.steps)]) {
         for (const step of steps.values()) {
-          if (!Number.isFinite(step.cost) || step.cost < 0) {
+          if (step.cost === undefined || !Number.isFinite(step.cost) || step.cost < 0) {
             if (complete) return undefined;
             continue;
           }
@@ -388,7 +439,7 @@ export const makeOpenCodeNativeAdapter = (options: {
       const cost = turnCost(ctx, turnId, false, accounting);
       if (cost === undefined || cost === accounting.lastCostUsd) return;
       accounting.lastCostUsd = cost;
-      const model = ctx.active === turnId ? ctx.session.model : ctx.settledCosts.get(turnId)?.model;
+      const model = accountingModel(ctx, turnId, accounting);
       emit({
         type: "turn.cost.updated",
         ...base(ctx, turnId),
@@ -402,14 +453,9 @@ export const makeOpenCodeNativeAdapter = (options: {
     };
     const settledCostFinish = (ctx: Context, turnId: TurnId) => {
       const accounting = ctx.settledCosts.get(turnId);
-      if (
-        !accounting ||
-        [...ctx.children.values()].some(
-          (child) => child.turnId === turnId && child.status === "running",
-        )
-      )
-        return;
+      if (!accounting || childCostPending(ctx, turnId)) return;
       const cost = turnCost(ctx, turnId, true, accounting);
+      const model = accountingModel(ctx, turnId, accounting);
       ctx.settledCosts.delete(turnId);
       if (cost === undefined) return;
       emit({
@@ -420,7 +466,7 @@ export const makeOpenCodeNativeAdapter = (options: {
           totalCostUsd: cost,
           status: "final",
           costSessionId: ctx.sessionId,
-          ...(accounting.model ? { costModel: accounting.model } : {}),
+          ...(model ? { costModel: model } : {}),
         },
       });
     };
@@ -443,8 +489,12 @@ export const makeOpenCodeNativeAdapter = (options: {
       };
     };
     const childUsage = (child: Child) => {
-      if (!child.steps.size && !child.tools.size) return undefined;
-      const steps = [...child.steps.values()];
+      const activations = [...child.history, child];
+      const steps = [
+        ...new Map(activations.flatMap((activation) => [...activation.steps])).values(),
+      ];
+      const tools = new Set(activations.flatMap((activation) => [...activation.tools]));
+      if (!steps.length && !tools.size) return undefined;
       const reported = steps.flatMap((step) => (step.tokens ? [step.tokens] : []));
       const inputTokens = reported.reduce(
         (n, step) => n + step.input + step.cache.read + step.cache.write,
@@ -457,11 +507,69 @@ export const makeOpenCodeNativeAdapter = (options: {
         cachedInputTokens: reported.reduce((n, step) => n + step.cache.read, 0),
         outputTokens,
         reasoningOutputTokens: reported.reduce((n, step) => n + step.reasoning, 0),
-        toolUses: child.tools.size,
-        costUsd: steps.reduce((n, step) => n + step.cost, 0),
+        toolUses: tools.size,
+        ...(steps.some((step) => step.cost !== undefined)
+          ? { costUsd: steps.reduce((n, step) => n + (step.cost ?? 0), 0) }
+          : {}),
       };
     };
-    // The last step's prompt size is the live context size (same rule as the legacy adapter).
+    const accountingModel = (ctx: Context, turnId: TurnId, accounting: CostAccounting = ctx) => {
+      const models = new Set(
+        [
+          ...accounting.usage.values(),
+          ...childActivations(ctx)
+            .filter((child) => child.turnId === turnId)
+            .flatMap((child) => [...child.steps.values()]),
+        ].flatMap((step) => (step.model ? [step.model] : [])),
+      );
+      return models.size > 1
+        ? undefined
+        : (models.values().next().value ??
+            (ctx.active === turnId ? ctx.session.model : ctx.settledCosts.get(turnId)?.model));
+    };
+    const effectiveModelSet = (ctx: Context, model: string) => {
+      if (ctx.session.model === model) return;
+      ctx.modelGeneration++;
+      ctx.contextLimits.clear();
+      ctx.session = { ...ctx.session, model, updatedAt: now() };
+    };
+    const contextSnapshotEmit = (
+      ctx: Context,
+      turnId: TurnId | undefined,
+      usage: ThreadTokenUsageSnapshot,
+    ) => {
+      ctx.contextUsage = usage;
+      const generation = ctx.modelGeneration;
+      const model = ctx.session.model;
+      const publish = (maxTokens?: number) => {
+        if (
+          disposed ||
+          ctx.lost ||
+          sessions.get(ctx.session.threadId) !== ctx ||
+          ctx.modelGeneration !== generation ||
+          ctx.contextUsage !== usage
+        )
+          return;
+        emit({
+          type: "thread.token-usage.updated",
+          ...base(ctx, turnId),
+          payload: {
+            usage: { ...usage, ...(maxTokens ? { maxTokens } : {}) },
+          },
+        });
+      };
+      // Occupancy is available immediately; model metadata is optional and asynchronous.
+      publish();
+      const [providerID, ...rest] = model?.split("/") ?? [];
+      if (!model || !providerID || !rest.length) return;
+      let lookup = ctx.contextLimits.get(model);
+      if (!lookup) {
+        lookup = ctx.engine.contextLimit({ providerID, id: rest.join("/") });
+        ctx.contextLimits.set(model, lookup);
+      }
+      void lookup.then(publish, () => undefined);
+    };
+    // Native counts describe the last request, not a measured current transcript.
     const contextUsageEmit = (
       ctx: Context,
       turnId: TurnId,
@@ -474,38 +582,20 @@ export const makeOpenCodeNativeAdapter = (options: {
     ) => {
       const n = (value: number) => (Number.isFinite(value) && value > 0 ? Math.round(value) : 0);
       const inputTokens = n(tokens.input) + n(tokens.cache.read) + n(tokens.cache.write);
-      const usedTokens = inputTokens + n(tokens.output);
-      if (usedTokens <= 0) return;
-      const emitUsage = () =>
-        emit({
-          type: "thread.token-usage.updated",
-          ...base(ctx, turnId),
-          payload: {
-            usage: {
-              usedTokens,
-              lastUsedTokens: usedTokens,
-              ...(ctx.contextLimit ? { maxTokens: ctx.contextLimit } : {}),
-              inputTokens,
-              cachedInputTokens: n(tokens.cache.read),
-              outputTokens: n(tokens.output),
-              reasoningOutputTokens: n(tokens.reasoning),
-              lastInputTokens: inputTokens,
-              lastCachedInputTokens: n(tokens.cache.read),
-              lastOutputTokens: n(tokens.output),
-              lastReasoningOutputTokens: n(tokens.reasoning),
-            },
-          },
-        });
-      const [providerID, ...rest] = ctx.session.model?.split("/") ?? [];
-      if (ctx.contextLimit !== undefined || !providerID || !rest.length) return emitUsage();
-      void ctx.engine
-        .contextLimit({ providerID, id: rest.join("/") })
-        .then((limit) => {
-          ctx.contextLimit = limit ?? null;
-        })
-        .finally(() => {
-          if (!ctx.lost && sessions.get(ctx.session.threadId) === ctx) emitUsage();
-        });
+      const usedTokens = inputTokens + n(tokens.output) + n(tokens.reasoning);
+      contextSnapshotEmit(ctx, turnId, {
+        contextUsageStatus: "estimated",
+        usedTokens,
+        lastUsedTokens: usedTokens,
+        inputTokens,
+        cachedInputTokens: n(tokens.cache.read),
+        outputTokens: n(tokens.output),
+        reasoningOutputTokens: n(tokens.reasoning),
+        lastInputTokens: inputTokens,
+        lastCachedInputTokens: n(tokens.cache.read),
+        lastOutputTokens: n(tokens.output),
+        lastReasoningOutputTokens: n(tokens.reasoning),
+      });
     };
     const onEvent = (ctx: Context, event: NativeEvent) => {
       if (sessions.get(ctx.session.threadId) !== ctx) return;
@@ -517,6 +607,100 @@ export const makeOpenCodeNativeAdapter = (options: {
         return;
       }
       if (ctx.lost) return;
+      if (event.type === "model.selected") {
+        if (event.sessionID !== ctx.sessionId) return;
+        ctx.nativeModel = event.model;
+        effectiveModelSet(ctx, `${event.model.providerID}/${event.model.id}`);
+        contextSnapshotEmit(ctx, ctx.active, { contextUsageStatus: "unknown" });
+        return;
+      }
+      if (
+        event.type === "compaction.started" ||
+        event.type === "compaction.completed" ||
+        event.type === "compaction.failed"
+      ) {
+        const child =
+          event.sessionID === ctx.sessionId ? undefined : ctx.children.get(event.sessionID);
+        const owner = child
+          ? [...child.history, child].find(
+              (activation) =>
+                activation.turnId === event.turnID &&
+                activation.parentId === event.parentSessionID &&
+                activation.parentToolKey === event.parentToolKey,
+            )
+          : undefined;
+        if (event.sessionID !== ctx.sessionId && !owner) return;
+        // Like step accounting, retired child activations are immutable; delayed
+        // frames cannot charge the reused session's current activation.
+        if (child && (owner !== child || child.status !== "running")) return;
+        const accounting =
+          owner ??
+          (ctx.active === event.turnID ? ctx : ctx.settledCosts.get(TurnId.make(event.turnID)));
+        if (!accounting) return;
+        const steps = "steps" in accounting ? accounting.steps : accounting.usage;
+        const key = `compaction:${event.sessionID}:${event.key}`;
+        // A stable attempt belongs to its original activation, even after session reuse.
+        if (
+          child &&
+          [...child.history, child].some(
+            (activation) =>
+              activation !== owner &&
+              (activation.steps.has(key) ||
+                activation.unresolvedSteps.has(key) ||
+                [...activation.steps.values()].some(
+                  (step) => step.compactionEventID === event.eventID,
+                )),
+          )
+        )
+          return;
+        // The engine's feed-ID cache is bounded. Keep the terminal ID on its
+        // billing record too: replay after cache eviction may use the terminal
+        // ID as its attempt key rather than the already-closed start ID.
+        if (
+          steps.has(key) ||
+          [...steps.values()].some((step) => step.compactionEventID === event.eventID) ||
+          (event.type === "compaction.started" && accounting.unresolvedSteps.has(key))
+        )
+          return;
+        if (!child && ctx.active === event.turnID) {
+          // providerContext is a versioned replacement-message payload, not occupancy
+          // (2.0.18 and 2.0.21). Summary request tokens must never populate the meter.
+          contextSnapshotEmit(ctx, TurnId.make(event.turnID), { contextUsageStatus: "unknown" });
+        }
+        if (event.type === "compaction.started") {
+          accounting.unresolvedSteps.add(key);
+          return;
+        }
+        const cost = "cost" in event.compaction ? event.compaction.cost : undefined;
+        const tokens = "tokens" in event.compaction ? event.compaction.tokens : undefined;
+        const knownCost = cost !== undefined && Number.isFinite(cost) && cost >= 0;
+        steps.set(key, {
+          compactionEventID: event.eventID,
+          ...("model" in event.compaction && event.compaction.model
+            ? { model: `${event.compaction.model.providerID}/${event.compaction.model.id}` }
+            : {}),
+          ...(knownCost ? { cost } : {}),
+          ...(tokens ? { tokens } : {}),
+          completed: true,
+        });
+        accounting.unresolvedSteps.delete(key);
+        if (!knownCost) accounting.unresolvedSteps.add(key);
+        const id = TurnId.make(event.turnID);
+        turnCostEmit(ctx, id);
+        if (owner === child && child?.status === "running")
+          emit({
+            type: "task.progress",
+            ...base(ctx, id),
+            payload: {
+              taskId: RuntimeTaskId.make(event.sessionID),
+              status: child.status,
+              description: child.info.title?.trim() || "OpenCode child session",
+              typedUsage: childUsage(child),
+              ...childLinkage(ctx, event.sessionID, child),
+            },
+          });
+        return;
+      }
       if (event.type === "permission.asked") {
         const { request } = event;
         if (
@@ -647,7 +831,22 @@ export const makeOpenCodeNativeAdapter = (options: {
         if (childEvent.parentSessionID !== ctx.sessionId && !parent) return;
         const child = ctx.children.get(childEvent.sessionID);
         if (childEvent.type === "child.attached") {
-          if (child || (!parent && ctx.active !== childEvent.turnID)) return;
+          if (child) {
+            // Attachment/info precedes execution start. It is not itself permission
+            // to reopen a settled task or change its previously emitted scope.
+            if (
+              child.status !== "running" &&
+              child.parentId === childEvent.parentSessionID &&
+              childEvent.parentToolKey &&
+              ![...child.history, child].some(
+                (activation) => activation.parentToolKey === childEvent.parentToolKey,
+              ) &&
+              (parent ? parent.turnId === childEvent.turnID : ctx.active === childEvent.turnID)
+            )
+              child.pendingAttachment = childEvent;
+            return;
+          }
+          if (!parent && ctx.active !== childEvent.turnID) return;
           const info = childEvent.info;
           const next: Child = {
             turnId: parent?.turnId ?? TurnId.make(childEvent.turnID),
@@ -658,6 +857,7 @@ export const makeOpenCodeNativeAdapter = (options: {
             steps: new Map(),
             unresolvedSteps: new Set(),
             tools: new Set(),
+            history: [],
           };
           if (childEvent.turnID !== next.turnId) return;
           ctx.children.set(childEvent.sessionID, next);
@@ -672,11 +872,67 @@ export const makeOpenCodeNativeAdapter = (options: {
           });
           return;
         }
+        if (child && childEvent.type === "child.started" && childEvent.reactivation) {
+          const attached = child.pendingAttachment;
+          if (
+            child.status === "running" ||
+            !attached ||
+            attached.turnID !== childEvent.turnID ||
+            attached.parentSessionID !== childEvent.parentSessionID ||
+            attached.parentToolKey !== childEvent.parentToolKey ||
+            childEvent.reactivation.key !== attached.parentToolKey
+          )
+            return;
+          delete child.pendingAttachment;
+          const { history, ...activation } = child;
+          history.push(activation);
+          const next: Child = {
+            turnId: TurnId.make(childEvent.turnID),
+            parentId: childEvent.parentSessionID,
+            parentToolKey: attached.parentToolKey,
+            info: attached.info,
+            status: "running",
+            steps: new Map(),
+            unresolvedSteps: new Set(),
+            tools: new Set(),
+            history,
+          };
+          ctx.children.set(childEvent.sessionID, next);
+          emit({
+            type: "task.updated",
+            ...base(ctx, next.turnId),
+            payload: {
+              taskId: RuntimeTaskId.make(childEvent.sessionID),
+              status: "running",
+              description: next.info.title?.trim() || "OpenCode child session",
+              ...childLinkage(ctx, childEvent.sessionID, next),
+            },
+          });
+          return;
+        }
+        if (
+          child?.pendingAttachment &&
+          childEvent.type === "child.updated" &&
+          child.pendingAttachment.turnID === childEvent.turnID &&
+          child.pendingAttachment.parentSessionID === childEvent.parentSessionID &&
+          child.pendingAttachment.parentToolKey === childEvent.parentToolKey
+        ) {
+          child.pendingAttachment = {
+            ...child.pendingAttachment,
+            info: { ...child.pendingAttachment.info, ...childEvent.info },
+          };
+          return;
+        }
         if (
           !child ||
           child.parentId !== childEvent.parentSessionID ||
           child.turnId !== childEvent.turnID ||
-          child.status !== "running"
+          child.status !== "running" ||
+          (child.history.length > 0
+            ? child.parentToolKey !== childEvent.parentToolKey
+            : childEvent.parentToolKey !== undefined &&
+              child.parentToolKey !== undefined &&
+              child.parentToolKey !== childEvent.parentToolKey)
         )
           return;
         child.parentToolKey ??= childEvent.parentToolKey;
@@ -702,15 +958,23 @@ export const makeOpenCodeNativeAdapter = (options: {
               ? "failed"
               : "stopped";
         const typedUsage = childUsage(child);
+        const summary =
+          childEvent.type === "child.completed"
+            ? (childEvent.summary ??
+              (child.result
+                ? [...child.result.blocks]
+                    .sort(([a], [b]) => a - b)
+                    .map(([, text]) => text)
+                    .join("\n")
+                : undefined))
+            : undefined;
         emit({
           type: "task.completed",
           ...base(ctx, child.turnId),
           payload: {
             taskId: RuntimeTaskId.make(childEvent.sessionID),
             status: child.status,
-            ...(childEvent.type === "child.completed" && childEvent.summary?.trim()
-              ? { summary: childEvent.summary }
-              : {}),
+            ...(summary?.trim() ? { summary } : {}),
             ...(childEvent.type === "child.failed" ? { summary: childEvent.error.message } : {}),
             ...(childEvent.type === "child.interrupted"
               ? { summary: `Execution interrupted: ${childEvent.reason}.` }
@@ -724,22 +988,75 @@ export const makeOpenCodeNativeAdapter = (options: {
       }
       if ("sessionID" in event && "turnID" in event && event.sessionID !== ctx.sessionId) {
         const child = ctx.children.get(event.sessionID);
-        if (!child || child.status !== "running" || event.turnID !== child.turnId) return;
+        if (
+          !child ||
+          child.status !== "running" ||
+          event.turnID !== child.turnId ||
+          (child.history.length > 0
+            ? event.parentToolKey !== child.parentToolKey ||
+              event.parentSessionID !== child.parentId
+            : event.parentToolKey !== undefined &&
+              child.parentToolKey !== undefined &&
+              event.parentToolKey !== child.parentToolKey) ||
+          ("step" in event &&
+            child.history.some(
+              (activation) =>
+                activation.steps.has(event.step.assistantMessageID) ||
+                activation.unresolvedSteps.has(event.step.assistantMessageID),
+            ))
+        )
+          return;
+        const messageId =
+          "assistantMessageID" in event
+            ? event.assistantMessageID
+            : "tool" in event
+              ? event.tool.assistantMessageID
+              : undefined;
+        if (
+          messageId &&
+          child.history.some(
+            (activation) =>
+              activation.steps.has(messageId) ||
+              activation.unresolvedSteps.has(messageId) ||
+              activation.result?.assistantMessageID === messageId,
+          )
+        )
+          return;
+        if (event.type === "text.completed") {
+          if (child.result?.assistantMessageID !== event.assistantMessageID)
+            child.result = { assistantMessageID: event.assistantMessageID, blocks: new Map() };
+          child.result.blocks.set(event.ordinal, event.text);
+          return;
+        }
         if (event.type === "step.started" || event.type === "step.streamed") {
+          if (event.type === "step.started") {
+            ctx.stepModels.set(
+              event.step.assistantMessageID,
+              `${event.step.model.providerID}/${event.step.model.id}`,
+            );
+            child.info = { ...child.info, model: event.step.model };
+          }
           if (!child.steps.has(event.step.assistantMessageID))
             child.unresolvedSteps.add(event.step.assistantMessageID);
           return;
         }
         if (event.type === "step.failed") {
           failedStepRecord(child.steps, child.unresolvedSteps, event.step);
+          const accounting = child.steps.get(event.step.assistantMessageID);
+          const model = ctx.stepModels.get(event.step.assistantMessageID);
+          if (accounting && model)
+            child.steps.set(event.step.assistantMessageID, { ...accounting, model });
+          ctx.stepModels.delete(event.step.assistantMessageID);
           turnCostEmit(ctx, child.turnId);
         } else if (event.type === "step.completed") {
           child.unresolvedSteps.delete(event.step.assistantMessageID);
           child.steps.set(event.step.assistantMessageID, {
+            model: ctx.stepModels.get(event.step.assistantMessageID),
             tokens: event.step.tokens,
             cost: event.step.cost,
             completed: true,
           });
+          ctx.stepModels.delete(event.step.assistantMessageID);
           turnCostEmit(ctx, child.turnId);
         } else if (event.type === "tool.called") {
           child.tools.add(event.key);
@@ -763,6 +1080,7 @@ export const makeOpenCodeNativeAdapter = (options: {
       const turnId = ctx.active;
       if (event.type === "turn.started") {
         const id = TurnId.make(event.turnID);
+        if (ctx.manualCompactionAdmitting && ctx.manualCompacting) ctx.manualCompactionTurnId = id;
         ctx.usage.clear();
         ctx.unresolvedSteps.clear();
         ctx.lastCostUsd = undefined;
@@ -779,28 +1097,35 @@ export const makeOpenCodeNativeAdapter = (options: {
         ctx.pending = undefined;
         const usage = tokenUsage(ctx);
         const cost = turnCost(ctx, id, true, ctx);
-        if (
-          cost === undefined &&
-          [...ctx.children.values()].some(
-            (child) => child.turnId === id && child.status === "running",
-          )
-        )
+        const costModel = accountingModel(ctx, id);
+        if (cost === undefined && childCostPending(ctx, id))
           ctx.settledCosts.set(id, {
             usage: new Map(ctx.usage),
             unresolvedSteps: new Set(ctx.unresolvedSteps),
             lastCostUsd: ctx.lastCostUsd,
-            model: ctx.session.model,
+            model: costModel,
           });
         ctx.active = undefined;
         ctx.usage.clear();
         ctx.unresolvedSteps.clear();
-        ctx.fragments.clear();
         ctx.session = {
           ...ctx.session,
           status: "ready",
           activeTurnId: undefined,
           updatedAt: now(),
         };
+        const manual = ctx.manualCompactionTurnId === id;
+        const compacted = manual && event.type === "turn.completed";
+        if (manual) {
+          ctx.manualCompacting = false;
+          ctx.manualCompactionTurnId = undefined;
+        }
+        if (compacted)
+          emit({
+            type: "thread.state.changed",
+            ...base(ctx, id),
+            payload: { state: "compacted" },
+          });
         emit({
           type: "turn.completed",
           ...base(ctx, id),
@@ -813,7 +1138,7 @@ export const makeOpenCodeNativeAdapter = (options: {
                     ? {
                         totalCostUsd: cost,
                         costSessionId: ctx.sessionId,
-                        ...(ctx.session.model ? { costModel: ctx.session.model } : {}),
+                        ...(costModel ? { costModel } : {}),
                       }
                     : {}),
                 }
@@ -828,7 +1153,7 @@ export const makeOpenCodeNativeAdapter = (options: {
                     ? {
                         totalCostUsd: cost,
                         costSessionId: ctx.sessionId,
-                        ...(ctx.session.model ? { costModel: ctx.session.model } : {}),
+                        ...(costModel ? { costModel } : {}),
                       }
                     : {}),
                 },
@@ -836,6 +1161,18 @@ export const makeOpenCodeNativeAdapter = (options: {
         return;
       }
       if (event.type === "step.started" || event.type === "step.streamed") {
+        if (
+          event.type === "step.started" &&
+          turnId &&
+          event.turnID === turnId &&
+          event.sessionID === ctx.sessionId
+        ) {
+          const model = `${event.step.model.providerID}/${event.step.model.id}`;
+          ctx.stepModels.set(event.step.assistantMessageID, model);
+          const changed = ctx.session.model !== model;
+          effectiveModelSet(ctx, model);
+          if (changed) contextSnapshotEmit(ctx, turnId, { contextUsageStatus: "unknown" });
+        }
         if (
           turnId &&
           event.turnID === turnId &&
@@ -848,18 +1185,30 @@ export const makeOpenCodeNativeAdapter = (options: {
       if (event.type === "step.failed") {
         if (turnId && event.turnID === turnId && event.sessionID === ctx.sessionId) {
           failedStepRecord(ctx.usage, ctx.unresolvedSteps, event.step);
+          const model = ctx.stepModels.get(event.step.assistantMessageID);
+          if (model) effectiveModelSet(ctx, model);
+          const accounting = ctx.usage.get(event.step.assistantMessageID);
+          if (model && accounting)
+            ctx.usage.set(event.step.assistantMessageID, { ...accounting, model });
+          ctx.stepModels.delete(event.step.assistantMessageID);
           turnCostEmit(ctx, turnId);
+          if (event.step.tokens) contextUsageEmit(ctx, turnId, event.step.tokens);
+          else contextSnapshotEmit(ctx, turnId, { contextUsageStatus: "unknown" });
         }
         return;
       }
       if (event.type === "step.completed") {
         if (turnId && event.turnID === turnId && event.sessionID === ctx.sessionId) {
+          const model = ctx.stepModels.get(event.step.assistantMessageID);
+          if (model) effectiveModelSet(ctx, model);
           ctx.unresolvedSteps.delete(event.step.assistantMessageID);
           ctx.usage.set(event.step.assistantMessageID, {
+            model,
             tokens: event.step.tokens,
             cost: event.step.cost,
             completed: true,
           });
+          ctx.stepModels.delete(event.step.assistantMessageID);
           turnCostEmit(ctx, turnId);
           contextUsageEmit(ctx, turnId, event.step.tokens);
         }
@@ -875,7 +1224,6 @@ export const makeOpenCodeNativeAdapter = (options: {
         return;
       const itemId = RuntimeItemId.make(`opencode:${event.key}`);
       if (event.type === "text.started" || event.type === "reasoning.started") {
-        ctx.fragments.set(event.key, "");
         emit({
           type: "item.started",
           ...base(ctx, turnId),
@@ -888,7 +1236,6 @@ export const makeOpenCodeNativeAdapter = (options: {
         return;
       }
       if (event.type === "text.delta" || event.type === "reasoning.delta") {
-        ctx.fragments.set(event.key, (ctx.fragments.get(event.key) ?? "") + event.delta);
         emit({
           type: "content.delta",
           ...base(ctx, turnId),
@@ -901,18 +1248,6 @@ export const makeOpenCodeNativeAdapter = (options: {
         return;
       }
       if (event.type === "text.completed" || event.type === "reasoning.completed") {
-        const prior = ctx.fragments.get(event.key) ?? "";
-        if (event.text.startsWith(prior) && event.text.length > prior.length)
-          emit({
-            type: "content.delta",
-            ...base(ctx, turnId),
-            itemId,
-            payload: {
-              streamKind: event.type === "text.completed" ? "assistant_text" : "reasoning_text",
-              delta: event.text.slice(prior.length),
-            },
-          });
-        ctx.fragments.delete(event.key);
         emit({
           type: "item.completed",
           ...base(ctx, turnId),
@@ -920,7 +1255,7 @@ export const makeOpenCodeNativeAdapter = (options: {
           payload: {
             itemType: event.type === "text.completed" ? "assistant_message" : "reasoning",
             status: "completed",
-            detail: event.text || undefined,
+            finalText: event.text,
           },
         });
         return;
@@ -968,7 +1303,12 @@ export const makeOpenCodeNativeAdapter = (options: {
                 ? { content: event.tool.content }
                 : {}),
               ...(event.type === "tool.failed" ? { error: event.tool.error } : {}),
-              ...(event.type === "tool.progress" ? { metadata: event.tool.metadata } : {}),
+              ...((event.type === "tool.progress" ||
+                event.type === "tool.completed" ||
+                event.type === "tool.failed") &&
+              event.tool.metadata !== undefined
+                ? { metadata: event.tool.metadata }
+                : {}),
             },
           },
         });
@@ -1001,7 +1341,7 @@ export const makeOpenCodeNativeAdapter = (options: {
               directory: previous.session.cwd ?? config.cwd,
               resumeSessionId: previous.sessionId,
               ...(parsed?.model ? { model: parsed.model } : {}),
-              ...(parsed?.agent ? { agent: parsed.agent } : {}),
+              ...(previous.activeAgent ? { agent: previous.activeAgent } : {}),
             }),
           );
           if (
@@ -1018,6 +1358,7 @@ export const makeOpenCodeNativeAdapter = (options: {
             engine,
             // Resume preserves remote state, including switches whose responses were lost.
             // Reassert the desired model and agent only before the next new user turn.
+            activeAgent: undefined,
             selectionVerified: false,
             session: {
               ...previous.session,
@@ -1026,12 +1367,15 @@ export const makeOpenCodeNativeAdapter = (options: {
               lastError: undefined,
               updatedAt: now(),
             },
-            fragments: new Map(),
             usage: new Map(),
             unresolvedSteps: new Set(),
             lastCostUsd: undefined,
             settledCosts: new Map(),
             children: new Map(),
+            modelGeneration: 0,
+            stepModels: new Map(),
+            contextLimits: new Map(),
+            contextUsage: undefined,
             permissions: new Map(),
             forms: new Map(),
             settledRequests: new Set(),
@@ -1097,6 +1441,64 @@ export const makeOpenCodeNativeAdapter = (options: {
       }
     }).pipe(Effect.interruptible, Effect.forkIn(scope));
 
+    const selectionApply = Effect.fnUntraced(function* (
+      ctx: Context,
+      next: ProviderSessionStartInput["modelSelection"],
+      operation: "sendTurn" | "compactThread",
+      interactionMode?: "default" | "plan",
+    ) {
+      if (!ctx.selectionVerified && (ctx.active || ctx.pending))
+        return yield* new ProviderAdapterRequestError({
+          provider,
+          method: "session.switch",
+          detail: "Wait for native work to settle before reasserting an unverified selection.",
+        });
+      const parsed = yield* nativeSelection(operation, next ?? ctx.modelSelection);
+      const inventory = options.inventory?.(ctx.session.cwd ?? config.cwd) ?? ctx.inventory;
+      const resolved = openCodeNativeInventoryDefaultsResolve(inventory ?? emptyInventory, {
+        ...(parsed ? (next ? { explicit: parsed } : { saved: parsed }) : {}),
+        ...(interactionMode === "plan" ? { agent: "plan" } : {}),
+      });
+      // Explicit/saved choices win over refreshed native configuration.
+      const agent = resolved.agent ?? ctx.defaultAgent;
+      const switchModel =
+        resolved.model &&
+        (!ctx.selectionVerified ||
+          resolved.model.providerID !== ctx.nativeModel?.providerID ||
+          resolved.model.id !== ctx.nativeModel?.id ||
+          resolved.model.variant !== ctx.nativeModel?.variant)
+          ? resolved.model
+          : undefined;
+      const switchAgent = agent !== ctx.activeAgent ? agent : undefined;
+      if (switchModel || switchAgent) {
+        const switched = yield* Effect.promise(() =>
+          ctx.engine.switchSelection({
+            ...(switchModel ? { model: switchModel } : {}),
+            ...(switchAgent ? { agent: switchAgent } : {}),
+          }),
+        );
+        if (!switched.success) {
+          if (!switched.rejected)
+            markLost(ctx, "Native interrupt outcome is uncertain; do not retry in this session.");
+          return yield* new ProviderAdapterRequestError({
+            provider,
+            method: "session.switch",
+            detail: switched.error.detail,
+          });
+        }
+      }
+      if (disposed || ctx.lost || sessions.get(ctx.session.threadId) !== ctx)
+        return yield* unsupported("session.switch: context replaced");
+      ctx.activeAgent = agent;
+      ctx.selectionVerified = true;
+      if (next) ctx.modelSelection = next;
+      if (switchModel) {
+        ctx.nativeModel = switchModel;
+        effectiveModelSet(ctx, `${switchModel.providerID}/${switchModel.id}`);
+        contextSnapshotEmit(ctx, ctx.active, { contextUsageStatus: "unknown" });
+      }
+    });
+
     const adapter: ProviderAdapterShape<
       | ProviderAdapterRequestError
       | ProviderAdapterValidationError
@@ -1107,6 +1509,49 @@ export const makeOpenCodeNativeAdapter = (options: {
         sessionModelSwitch: "in-session",
         supportsConversationRollback: false,
       } as const,
+      compaction: {
+        type: "native",
+        start: (threadId, modelSelection) =>
+          Effect.gen(function* () {
+            const ctx = yield* requireSession(threadId);
+            // A sticky native switch interrupts work; compact must never use it to
+            // bypass admission or manufacture safe completion of an existing turn.
+            if (ctx.active || ctx.pending || ctx.manualCompacting)
+              return yield* new ProviderAdapterRequestError({
+                provider,
+                method: "session.compact",
+                detail: "Session already has active or pending work.",
+              });
+            ctx.manualCompacting = true;
+            yield* selectionApply(ctx, modelSelection, "compactThread").pipe(
+              Effect.onError(() =>
+                Effect.sync(() => {
+                  ctx.manualCompacting = false;
+                }),
+              ),
+            );
+            ctx.manualCompactionAdmitting = true;
+            const admission = yield* Effect.promise(() => ctx.engine.compact());
+            ctx.manualCompactionAdmitting = false;
+            if (!admission.success) {
+              ctx.manualCompacting = false;
+              if (!admission.rejected)
+                markLost(
+                  ctx,
+                  "Native compaction admission uncertain; do not retry in this session.",
+                );
+              return yield* new ProviderAdapterRequestError({
+                provider,
+                method: "session.compact",
+                detail: admission.error.detail,
+              });
+            }
+            if (ctx.lost || sessions.get(threadId) !== ctx)
+              return yield* unsupported("session.compact: stream lost");
+            const id = TurnId.make(admission.data.turnID);
+            if (ctx.active !== id && ctx.lastSettled !== id) ctx.pending = id;
+          }),
+      },
       startSession: (input) =>
         Effect.gen(function* () {
           const generation = stopGeneration;
@@ -1143,8 +1588,34 @@ export const makeOpenCodeNativeAdapter = (options: {
               issue: "Session already started.",
             });
           const cwd = input.cwd ?? config.cwd;
+          const inventory =
+            options.inventory?.(cwd) ??
+            (options.inventoryLoad
+              ? yield* options.inventoryLoad(cwd).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProviderAdapterRequestError({
+                        provider,
+                        method: cause.operation,
+                        detail: cause.detail,
+                        cause,
+                      }),
+                  ),
+                )
+              : undefined);
+          const resolved = openCodeNativeInventoryDefaultsResolve(
+            inventory ?? emptyInventory,
+            parsed ? { explicit: parsed } : {},
+          );
+          const defaultAgent = resolved.defaultAgent ?? "build";
           if (disposed || generation !== stopGeneration)
-            return yield* unsupported("session.start: adapter stopped");
+            return yield* unsupported("session.start: adapter stopped during inventory load");
+          if (sessions.has(input.threadId) || starting.has(input.threadId))
+            return yield* new ProviderAdapterValidationError({
+              provider,
+              operation: "startSession",
+              issue: "Session already started.",
+            });
           let ctx!: Context;
           let startLost = false;
           const engine = (options.engineCreate ?? openCodeNativeSessionEngineCreate)({
@@ -1164,8 +1635,14 @@ export const makeOpenCodeNativeAdapter = (options: {
               directory: cwd,
               ...(resumeSessionId ? { resumeSessionId } : {}),
               ...(input.title ? { title: input.title } : {}),
-              ...(parsed?.model ? { model: parsed.model } : {}),
-              ...(parsed?.agent ? { agent: parsed.agent } : {}),
+              ...(resolved.model ? { model: resolved.model } : {}),
+              ...(resumeSessionId
+                ? parsed?.agent
+                  ? { agent: parsed.agent }
+                  : {}
+                : resolved.agent
+                  ? { agent: resolved.agent }
+                  : {}),
             }),
           ).pipe(
             Effect.onExit((exit) =>
@@ -1193,14 +1670,22 @@ export const makeOpenCodeNativeAdapter = (options: {
             engine,
             sessionId: started.id,
             modelSelection: selection,
+            inventory,
+            nativeModel: resolved.model,
+            defaultAgent,
+            // Adoption preserves native state; start options do not reveal its stored agent.
+            // Reconcile an unknown agent before admitting the resumed session's first input.
+            activeAgent: resumeSessionId ? undefined : (resolved.agent ?? defaultAgent),
             selectionVerified: !resumeSessionId,
-            fragments: new Map(),
             usage: new Map(),
             unresolvedSteps: new Set(),
             lastCostUsd: undefined,
             settledCosts: new Map(),
             children: new Map(),
-            contextLimit: undefined,
+            modelGeneration: 0,
+            stepModels: new Map(),
+            contextLimits: new Map(),
+            contextUsage: undefined,
             permissions: new Map(),
             forms: new Map(),
             settledRequests: new Set(),
@@ -1214,7 +1699,9 @@ export const makeOpenCodeNativeAdapter = (options: {
               providerInstanceId: instanceId,
               threadId: input.threadId,
               cwd,
-              ...(selection ? { model: selection.model } : {}),
+              ...(resolved.model
+                ? { model: `${resolved.model.providerID}/${resolved.model.id}` }
+                : {}),
               runtimeMode: input.runtimeMode,
               resumeCursor: { schemaVersion: 1, sessionId: started.id },
               status: "ready",
@@ -1231,79 +1718,50 @@ export const makeOpenCodeNativeAdapter = (options: {
       sendTurn: (input) =>
         Effect.gen(function* () {
           const ctx = yield* requireSession(input.threadId);
+          if (ctx.manualCompacting)
+            return yield* new ProviderAdapterRequestError({
+              provider,
+              method: "session.prompt",
+              detail: "Manual compaction is still pending or settling.",
+            });
           const text = input.input ?? "";
-          if (
-            !text.trim() ||
-            input.attachments?.length ||
-            input.continuation ||
-            input.interactionMode === "plan"
-          )
+          const fileParts = toOpenCodeFileParts({
+            attachments: input.attachments,
+            resolveAttachmentPath: (attachment) =>
+              resolveAttachmentPath({ attachmentsDir: config.attachmentsDir, attachment }),
+          });
+          if (!text.trim() && fileParts.length === 0)
             return yield* new ProviderAdapterValidationError({
               provider,
               operation: "sendTurn",
-              issue:
-                "Native v2 currently supports plain text turns only (no attachments, plan mode or continuation).",
+              issue: "OpenCode turns require text input or at least one attachment.",
             });
+          // Inline supported files so a remote OpenCode server does not need access to T3's
+          // attachment directory. Pasted text and unsupported/oversized files keep their
+          // existing ProviderService prompt-path fallback instead of native file parts.
+          const files = yield* Effect.forEach(fileParts, (part) =>
+            fileSystem.readFile(NodeURL.fileURLToPath(part.url)).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapterRequestError({
+                    provider,
+                    method: "session.prompt",
+                    detail: cause.message,
+                    cause,
+                  }),
+              ),
+              Effect.map((bytes) => ({
+                uri: `data:${part.mime.trim().toLowerCase()};base64,${Buffer.from(bytes).toString("base64")}`,
+                ...(part.filename !== undefined ? { name: part.filename } : {}),
+              })),
+            ),
+          );
           if (disposed || ctx.lost || sessions.get(input.threadId) !== ctx)
             return yield* unsupported("session.prompt: context replaced");
-          if (!ctx.selectionVerified && (ctx.active || ctx.pending))
-            return yield* new ProviderAdapterRequestError({
-              provider,
-              method: "session.switch",
-              detail: "Wait for native work to settle before reasserting an unverified selection.",
-            });
-          const next = input.modelSelection;
-          const desired = next ?? ctx.modelSelection;
-          if (!ctx.selectionVerified || (next && !selectionEquals(next, ctx.modelSelection))) {
-            const parsed = yield* nativeSelection("sendTurn", desired);
-            const prior = ctx.modelSelection;
-            const priorVariant = prior?.options?.find((option) => option.id === "variant")?.value;
-            const priorAgent = prior?.options?.find((option) => option.id === "agent")?.value;
-            // OpenCode switches are sticky setters: only send the parts that changed. A running
-            // turn is interrupted first, so this prompt starts a new turn on the new selection.
-            const switchModel =
-              parsed?.model &&
-              (!ctx.selectionVerified ||
-                desired?.model !== ctx.session.model ||
-                parsed.model.variant !== priorVariant)
-                ? parsed.model
-                : undefined;
-            const switchAgent = !ctx.selectionVerified
-              ? (parsed?.agent ?? "build")
-              : parsed?.agent && parsed.agent !== priorAgent
-                ? parsed.agent
-                : undefined;
-            if (switchModel || switchAgent) {
-              const switched = yield* Effect.promise(() =>
-                ctx.engine.switchSelection({
-                  ...(switchModel ? { model: switchModel } : {}),
-                  ...(switchAgent ? { agent: switchAgent } : {}),
-                }),
-              );
-              if (!switched.success) {
-                // An unconfirmed interrupt may leave the old turn running; fail closed.
-                if (!switched.rejected)
-                  markLost(
-                    ctx,
-                    "Native interrupt outcome is uncertain; do not retry in this session.",
-                  );
-                return yield* new ProviderAdapterRequestError({
-                  provider,
-                  method: "session.switch",
-                  detail: switched.error.detail,
-                });
-              }
-            }
-            if (disposed || ctx.lost || sessions.get(input.threadId) !== ctx)
-              return yield* unsupported("session.prompt: context replaced");
-            ctx.selectionVerified = true;
-            if (next) ctx.modelSelection = next;
-            if (switchModel && desired) {
-              ctx.contextLimit = undefined;
-              ctx.session = { ...ctx.session, model: desired.model, updatedAt: now() };
-            }
-          }
-          const admission = yield* Effect.promise(() => ctx.engine.send(text));
+          yield* selectionApply(ctx, input.modelSelection, "sendTurn", input.interactionMode);
+          const admission = yield* Effect.promise(() =>
+            ctx.engine.send(text, files.length ? { files } : {}),
+          );
           if (!admission.success) {
             if (!admission.rejected)
               markLost(ctx, "Native prompt admission uncertain; do not retry in this session.");

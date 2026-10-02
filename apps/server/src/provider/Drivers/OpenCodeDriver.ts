@@ -159,12 +159,25 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
           )
         : { protocol: "legacy" as const };
       const nativeInventories = new Map<string, OpenCodeNativeInventory>();
+      const loadNativeWorkspaceInventory = Effect.fnUntraced(function* (directory: string) {
+        const inventory = yield* openCodeNativeInventoryLoad({
+          url: effectiveConfig.serverUrl,
+          directory,
+          workspaceOnly: true,
+          ...(effectiveConfig.serverPassword
+            ? { serverPassword: effectiveConfig.serverPassword }
+            : {}),
+        });
+        nativeInventories.set(directory, inventory);
+        return inventory;
+      });
       const adapter =
         protocol.protocol === "native"
           ? yield* makeOpenCodeNativeAdapter({
               url: effectiveConfig.serverUrl,
               instanceId,
               inventory: (directory) => nativeInventories.get(directory),
+              inventoryLoad: loadNativeWorkspaceInventory,
               ...(effectiveConfig.serverPassword
                 ? { serverPassword: effectiveConfig.serverPassword }
                 : {}),
@@ -265,15 +278,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
               Effect.flatMap((probe) =>
                 Effect.gen(function* () {
                   if (probe.protocol === "native") {
-                    const inventory = yield* openCodeNativeInventoryLoad({
-                      url: effectiveConfig.serverUrl,
-                      directory: cwd,
-                      workspaceOnly: true,
-                      ...(effectiveConfig.serverPassword
-                        ? { serverPassword: effectiveConfig.serverPassword }
-                        : {}),
-                    });
-                    nativeInventories.set(cwd, inventory);
+                    const inventory = yield* loadNativeWorkspaceInventory(cwd);
                     return { protocol: "native" as const, inventory };
                   }
                   const inventory = yield* Effect.scoped(
@@ -365,17 +370,27 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
                 snapshot.getSnapshot,
                 loadWorkspaceForCwd(cwd).pipe(Effect.timeout("20 seconds")),
               ]).pipe(
-                Effect.map(([machineSnapshot, workspace]) => ({
-                  ...machineSnapshot,
-                  skills:
-                    workspace.protocol === "native"
-                      ? openCodeNativeInventoryMap(workspace.inventory).skills
-                      : openCodeSkillsToServerProviderSkills(workspace.inventory.skills),
-                  slashCommands:
-                    workspace.protocol === "native"
-                      ? openCodeNativeInventoryMap(workspace.inventory).slashCommands
-                      : openCodeCommandsToServerProviderSlashCommands(workspace.inventory.commands),
-                })),
+                Effect.map(([machineSnapshot, workspace]) => {
+                  if (workspace.protocol === "native") {
+                    const mapped = openCodeNativeInventoryMap(
+                      workspace.inventory,
+                      machineSnapshot.models,
+                    );
+                    return {
+                      ...machineSnapshot,
+                      models: mapped.models,
+                      skills: mapped.skills,
+                      slashCommands: mapped.slashCommands,
+                    };
+                  }
+                  return {
+                    ...machineSnapshot,
+                    skills: openCodeSkillsToServerProviderSkills(workspace.inventory.skills),
+                    slashCommands: openCodeCommandsToServerProviderSlashCommands(
+                      workspace.inventory.commands,
+                    ),
+                  };
+                }),
                 Effect.mapError(
                   (cause) =>
                     new ProviderDriverError({

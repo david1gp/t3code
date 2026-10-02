@@ -21,6 +21,7 @@ import {
   ProjectId,
   ProviderItemId,
   RuntimeRequestId,
+  RuntimeItemId,
   type ServerSettings,
   ThreadId,
   TurnId,
@@ -2197,6 +2198,94 @@ describe("ProviderRuntimeIngestion", () => {
     expect(data?.kind).toBe("read");
     expect(rawOutput?.content).toBe('import * as Effect from "effect/Effect"\n');
   });
+
+  for (const outcome of ["completed", "failed"] as const) {
+    it(`preserves native ${outcome} terminal tool metadata exactly through canonical ingestion`, async () => {
+      const harness = await createHarness();
+      const metadata =
+        outcome === "completed"
+          ? {
+              files: [
+                {
+                  file: "app.ts",
+                  patch: "@@ -1 +1 @@\n-Draft\n+Final\n",
+                  status: "modified",
+                  additions: 1,
+                  deletions: 1,
+                },
+              ],
+            }
+          : { shellID: "shell_terminal", exit: 1, status: "completed", truncated: false };
+      for (const scenario of ["terminal-only", "replacement", "empty", "absent"] as const) {
+        const terminalMetadata =
+          scenario === "absent" ? undefined : scenario === "empty" ? {} : metadata;
+        const eventId = asEventId(`evt-native-${outcome}-${scenario}`);
+        const itemId = RuntimeItemId.make(`opencode:ses_native:msg_a:tool:${outcome}-${scenario}`);
+        const common = {
+          provider: ProviderDriverKind.make("opencode"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          threadId: asThreadId("thread-1"),
+          turnId: asTurnId("turn-native-tool"),
+          itemId,
+        };
+        const data = {
+          tool: outcome === "completed" ? "edit" : "bash",
+          input: outcome === "completed" ? { path: "app.ts" } : { command: "false" },
+          content: [
+            { type: "text", text: outcome === "completed" ? "Edited app.ts" : "partial output" },
+          ],
+          ...(outcome === "failed"
+            ? { error: { type: "ToolError", message: "Command failed" } }
+            : {}),
+          ...(terminalMetadata !== undefined ? { metadata: terminalMetadata } : {}),
+        };
+        const terminal = {
+          ...common,
+          type: "item.completed",
+          eventId,
+          payload: {
+            itemType: outcome === "completed" ? "file_change" : "command_execution",
+            status: outcome,
+            title: data.tool,
+            data,
+          },
+        } satisfies ProviderRuntimeEvent;
+        await harness.emitAndDrain([
+          ...(scenario === "terminal-only"
+            ? []
+            : [
+                {
+                  ...common,
+                  type: "item.updated",
+                  eventId: asEventId(`${eventId}-progress`),
+                  payload: {
+                    ...terminal.payload,
+                    status: "inProgress",
+                    data: {
+                      tool: data.tool,
+                      input: data.input,
+                      metadata: { stale: "progress only", shellID: "shell_progress" },
+                    },
+                  },
+                } satisfies ProviderRuntimeEvent,
+              ]),
+          terminal,
+        ]);
+        const snapshot = await harness.readModel();
+        const activity = snapshot.threads
+          .find((thread) => thread.id === common.threadId)
+          ?.activities.find((entry) => entry.id === eventId);
+        expect(activity?.kind).toBe("tool.completed");
+        expect(activity?.turnId).toBe(common.turnId);
+        expect(activity?.payload).toMatchObject({
+          itemType: terminal.payload.itemType,
+          toolCallId: itemId,
+          status: outcome,
+        });
+        expect(activity?.payload).toHaveProperty("data", data);
+      }
+    });
+  }
 
   it("normalizes command execution activities to ran-command summaries", async () => {
     const harness = await createHarness();

@@ -126,6 +126,7 @@ describe("runtimeEventToActivities reported turn cost", () => {
       turnId: "turn-1",
       payload: {
         totalCostUsd: 0,
+        providerName: "opencode",
         status: "final",
         model: "provider/model-at-turn",
         providerSessionId: "session-at-turn",
@@ -191,6 +192,48 @@ describe("runtimeEventToActivities reported turn cost", () => {
       runtimeEventToActivities({ ...completed(1), provider: ProviderDriverKind.make("claude") }),
     ).toEqual([]);
   });
+
+  it.each(["pi", "opencode"])(
+    "persists %s provenance from the canonical envelope for provisional and final costs",
+    (provider) => {
+      const envelope = ProviderDriverKind.make(provider);
+      const observations = [
+        { ...provisional(0.12, "evt-provenance"), provider: envelope },
+        {
+          ...provisional(0.24, "evt-final-provenance"),
+          provider: envelope,
+          payload: {
+            ...provisional(0.24, "evt-final-provenance").payload,
+            status: "final" as const,
+          },
+        },
+        { ...completed(0.3), provider: envelope },
+      ];
+      expect(observations.map((event) => runtimeEventToActivities(event)[0]?.payload)).toEqual([
+        {
+          providerName: provider,
+          totalCostUsd: 0.12,
+          status: "provisional",
+          model: "provider/model-at-turn",
+          providerSessionId: "session-at-turn",
+        },
+        {
+          providerName: provider,
+          totalCostUsd: 0.24,
+          status: "final",
+          model: "provider/model-at-turn",
+          providerSessionId: "session-at-turn",
+        },
+        {
+          providerName: provider,
+          totalCostUsd: 0.3,
+          status: "final",
+          model: "provider/model-at-turn",
+          providerSessionId: "session-at-turn",
+        },
+      ]);
+    },
+  );
 });
 
 describe("runtimeEventToActivities tool streaming persistence", () => {

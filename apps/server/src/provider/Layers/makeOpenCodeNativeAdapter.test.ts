@@ -1,7 +1,9 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import { Form } from "@opencode/client/effect";
 import {
   ApprovalRequestId,
+  type ChatAttachment,
   ProviderInstanceId,
   ProviderRuntimeEvent,
   RuntimeTaskId,
@@ -9,6 +11,7 @@ import {
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Option from "effect/Option";
@@ -19,22 +22,88 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
+import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
-import { OpenCodeRuntimeError } from "../opencodeRuntime.ts";
+import type { OpenCodeNativeInventory } from "../openCodeNativeInventorySchema.ts";
+import { openCodeNativeInventorySchema } from "../openCodeNativeInventorySchema.ts";
+import { openCodeNativeInventoryLoad } from "../openCodeNativeInventoryLoad.ts";
 import type { openCodeNativeSessionEngineCreate } from "../openCodeNativeSessionEngineCreate.ts";
+import { openCodeNativeWireSchema } from "../openCodeNativeWireSchema.ts";
+import { OpenCodeRuntimeError } from "../opencodeRuntime.ts";
 import { makeOpenCodeNativeAdapter } from "./makeOpenCodeNativeAdapter.ts";
 
 const threadId = ThreadId.make("native-v2-adapter-thread");
 const decodeRuntimeEvent = Schema.decodeUnknownEffect(ProviderRuntimeEvent);
+const decodeNativeFeed = Schema.decodeEffect(openCodeNativeWireSchema.feed);
+const decodeUnknownNativeFeed = Schema.decodeUnknownEffect(openCodeNativeWireSchema.feed);
+const decodeUnknownNativeLog = Schema.decodeUnknownEffect(openCodeNativeWireSchema.log);
+const decodeNativeForm = Schema.decodeUnknownEffect(Schema.toEncoded(Form.Info));
+const encodeNativeFormAnswer = Schema.encodeEffect(Schema.fromJsonString(Form.Answer));
 const start = { threadId, cwd: "/tmp/native-v2", runtimeMode: "full-access" as const };
 const testLayer = ServerConfig.layerTest(process.cwd(), { prefix: "native-adapter-test-" }).pipe(
   Layer.provideMerge(NodeServices.layer),
 );
 
-function fakeEngine() {
+const reviewDefaultInventory: OpenCodeNativeInventory = {
+  provider: [],
+  model: [],
+  agent: [
+    { id: "review", name: "Review", mode: "primary", hidden: false },
+    { id: "build", name: "Build", mode: "primary", hidden: false },
+    { id: "plan", name: "Plan", mode: "primary", hidden: false },
+  ],
+  command: [],
+  skill: [],
+};
+
+const defaultsInventoryLoad = (
+  model: string,
+  agentModels: Readonly<
+    Record<string, NonNullable<OpenCodeNativeInventory["configuredModel"]>>
+  > = {},
+) => {
+  const fixtures = {
+    config: [{ type: "document", path: "/tmp/native-v2/opencode.json", info: { model } }],
+    agent: {
+      location: { directory: start.cwd },
+      data: reviewDefaultInventory.agent.map((agent) => ({
+        id: agent.id,
+        name: agent.name,
+        mode: agent.mode,
+        hidden: agent.hidden,
+        request: { settings: {}, headers: {}, body: {} },
+        permissions: [],
+        ...(agentModels[agent.id] ? { model: agentModels[agent.id] } : {}),
+      })),
+    },
+    command: { location: { directory: start.cwd }, data: [] },
+    skill: { location: { directory: start.cwd }, data: [] },
+  } satisfies {
+    [K in "config" | "agent" | "command" | "skill"]: Schema.Codec.Encoded<
+      (typeof openCodeNativeInventorySchema)[K]
+    >;
+  };
+  return openCodeNativeInventoryLoad({
+    url: "https://native.example",
+    directory: start.cwd,
+    workspaceOnly: true,
+    fetch: async (request) => {
+      const url = new URL(String(request));
+      assert.equal(url.searchParams.get("location[directory]"), start.cwd);
+      const key = url.pathname.slice("/api/".length) as keyof typeof fixtures;
+      assert.property(fixtures, key);
+      return Response.json(fixtures[key]);
+    },
+  });
+};
+
+function fakeEngine(initialAgent = "build") {
   let receive!: Parameters<typeof openCodeNativeSessionEngineCreate>[0]["onEvent"];
   const calls: string[] = [];
   const stoppedDirectories: string[] = [];
+  const promptAgents: string[] = [];
+  const prompts: Array<Parameters<ReturnType<typeof openCodeNativeSessionEngineCreate>["send"]>> =
+    [];
   const starts: Array<
     Parameters<ReturnType<typeof openCodeNativeSessionEngineCreate>["start"]>[0]
   > = [];
@@ -53,6 +122,7 @@ function fakeEngine() {
     receive = input.onEvent;
     const receiveEvent = input.onEvent;
     let directory = "";
+    let agent = initialAgent;
     return {
       start: async (
         options: Parameters<ReturnType<typeof openCodeNativeSessionEngineCreate>["start"]>[0],
@@ -62,6 +132,8 @@ function fakeEngine() {
         calls.push(`start:${options.directory}`);
         if (rejectResume && options.resumeSessionId)
           return { success: false as const, error: { detail: "No verified durable boundary." } };
+        // Adoption preserves the native session's stored agent, ignoring creation options.
+        if (!options.resumeSessionId && options.agent) agent = options.agent;
         return {
           success: true as const,
           data: { id: "ses_native", location: { directory: options.directory } },
@@ -94,9 +166,15 @@ function fakeEngine() {
             reason: "interrupted",
             interruptionReason: "user",
           });
+        if (selection.agent) agent = selection.agent;
         return { success: true as const, data: undefined };
       },
-      send: async (text: string) => {
+      send: async (
+        ...input: Parameters<ReturnType<typeof openCodeNativeSessionEngineCreate>["send"]>
+      ) => {
+        const [text] = input;
+        prompts.push(input);
+        promptAgents.push(agent);
         calls.push(`send:${text}`);
         if (rejected)
           return {
@@ -146,6 +224,8 @@ function fakeEngine() {
     create,
     calls,
     stoppedDirectories,
+    prompts,
+    promptAgents,
     starts,
     emit: (event: Parameters<typeof receive>[0]) => receive(event),
     completeBeforeReceipt: () => {
@@ -183,6 +263,576 @@ function fakeEngine() {
     },
   };
 }
+
+it.effect(
+  "inlines supported native attachments and preserves the prompt path fallback for other files",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://remote-native.example",
+        engineCreate: fake.create,
+      });
+      const config = yield* ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      const supported: ChatAttachment[] = [
+        {
+          type: "image",
+          id: "native-image",
+          name: "image.png",
+          mimeType: "image/png",
+          sizeBytes: 5,
+        },
+        {
+          type: "file",
+          id: "native-text",
+          name: "context.txt",
+          mimeType: "text/plain",
+          sizeBytes: 7,
+        },
+        {
+          type: "file",
+          id: "native-pdf",
+          name: "report.pdf",
+          mimeType: "application/pdf",
+          sizeBytes: 4,
+        },
+      ];
+      const contents = ["pixel", "context", "%PDF"];
+      yield* Effect.forEach(supported, (attachment, index) =>
+        fs.writeFileString(
+          resolveAttachmentPath({ attachmentsDir: config.attachmentsDir, attachment })!,
+          contents[index]!,
+        ),
+      );
+      const fallback: ChatAttachment[] = [
+        {
+          type: "file",
+          id: "native-pasted",
+          name: "paste.txt",
+          mimeType: "text/plain",
+          sizeBytes: 5,
+          source: { _tag: "pasted-text" },
+        },
+        {
+          type: "file",
+          id: "native-zip",
+          name: "archive.zip",
+          mimeType: "application/zip",
+          sizeBytes: 5,
+        },
+        {
+          type: "image",
+          id: "native-svg",
+          name: "image.svg",
+          mimeType: "image/svg+xml",
+          sizeBytes: 5,
+        },
+        {
+          type: "file",
+          id: "native-large",
+          name: "large.pdf",
+          mimeType: "application/pdf",
+          sizeBytes: 20 * 1024 * 1024 + 1,
+        },
+      ];
+      const text =
+        "Read the attached context. [Pasted text saved at: /tmp/paste.txt] [Attached file: /tmp/archive.zip] [Attached file: /tmp/image.svg] [Attached file: /tmp/large.pdf]";
+      yield* adapter.startSession(start);
+      yield* adapter.sendTurn({ threadId, input: text, attachments: [...supported, ...fallback] });
+      assert.deepStrictEqual(fake.prompts, [
+        [
+          text,
+          {
+            files: [
+              { uri: "data:image/png;base64,cGl4ZWw=", name: "image.png" },
+              { uri: "data:text/plain;base64,Y29udGV4dA==", name: "context.txt" },
+              { uri: "data:application/pdf;base64,JVBERg==", name: "report.pdf" },
+            ],
+          },
+        ],
+      ]);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("admits a file-only turn even when marked as continuation", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const config = yield* ServerConfig;
+    const fs = yield* FileSystem.FileSystem;
+    const attachment = {
+      type: "file" as const,
+      id: "native-only-file",
+      name: "context.txt",
+      mimeType: "text/plain",
+      sizeBytes: 7,
+    };
+    yield* fs.writeFileString(
+      resolveAttachmentPath({ attachmentsDir: config.attachmentsDir, attachment })!,
+      "context",
+    );
+    yield* adapter.startSession(start);
+    const turn = yield* adapter.sendTurn({
+      threadId,
+      attachments: [attachment],
+      continuation: true,
+    });
+    assert.equal(turn.turnId, "msg_user_1");
+    assert.deepStrictEqual(fake.prompts, [
+      ["", { files: [{ uri: "data:text/plain;base64,Y29udGV4dA==", name: "context.txt" }] }],
+    ]);
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "accepts explicit continuation input but rejects empty turns without advertising promptless continuation",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+      });
+      yield* adapter.startSession(start);
+      assert.notEqual(adapter.capabilities.promptlessTurnContinuation, true);
+      for (const continuation of [true, false]) {
+        const error = yield* adapter
+          .sendTurn({ threadId, input: "  ", continuation })
+          .pipe(Effect.flip);
+        assert.equal(error._tag, "ProviderAdapterValidationError");
+      }
+      assert.deepStrictEqual(fake.prompts, []);
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Continue where you left off",
+        continuation: true,
+      });
+      assert.deepStrictEqual(fake.prompts, [["Continue where you left off", {}]]);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+for (const sendSelection of ["same", "omitted"] as const) {
+  it.effect(
+    `switches plan mode back to the default agent with ${sendSelection} model selection`,
+    () =>
+      Effect.gen(function* () {
+        const fake = fakeEngine();
+        const adapter = yield* makeOpenCodeNativeAdapter({
+          url: "https://native.example",
+          engineCreate: fake.create,
+        });
+        const selection = {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "openai/gpt-5",
+        };
+        yield* adapter.startSession({ ...start, modelSelection: selection });
+        const modelSelection = sendSelection === "same" ? { modelSelection: selection } : {};
+        const plan = yield* adapter.sendTurn({
+          threadId,
+          input: "make a plan",
+          interactionMode: "plan",
+          ...modelSelection,
+        });
+        fake.emit({ type: "turn.started", turnID: plan.turnId });
+        fake.emit({ type: "turn.completed", turnID: plan.turnId });
+        yield* adapter.sendTurn({
+          threadId,
+          input: "implement it",
+          interactionMode: "default",
+          ...modelSelection,
+        });
+        assert.deepStrictEqual(fake.calls, [
+          "start:/tmp/native-v2",
+          "switch::plan",
+          "send:make a plan",
+          "switch::build",
+          "send:implement it",
+        ]);
+        assert.equal((yield* adapter.listSessions())[0]?.model, selection.model);
+        yield* adapter.stopSession(threadId);
+      }).pipe(Effect.provide(testLayer)),
+  );
+}
+
+it.effect("honors native configured model and variant without saving a no-preference default", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    let inventory = yield* defaultsInventoryLoad("native/family/model#high");
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+      inventory: () => inventory,
+      inventoryLoad: () => Effect.die("Cached workspace inventory must not be reloaded"),
+    });
+    const session = yield* adapter.startSession(start);
+    assert.equal(session.model, "native/family/model");
+    assert.deepStrictEqual(fake.starts, [
+      {
+        directory: start.cwd,
+        model: { providerID: "native", id: "family/model", variant: "high" },
+        agent: "review",
+      },
+    ]);
+    const first = yield* adapter.sendTurn({ threadId, input: "use native config" });
+    fake.emit({ type: "turn.started", turnID: first.turnId });
+    fake.emit({ type: "turn.completed", turnID: first.turnId });
+    inventory = yield* defaultsInventoryLoad("native/family/model#low");
+    const second = yield* adapter.sendTurn({ threadId, input: "use changed native variant" });
+    fake.emit({ type: "turn.started", turnID: second.turnId });
+    fake.emit({ type: "turn.completed", turnID: second.turnId });
+    inventory = yield* defaultsInventoryLoad("native/fresh/model");
+    yield* adapter.sendTurn({ threadId, input: "use changed native model" });
+    assert.deepStrictEqual(fake.calls, [
+      "start:/tmp/native-v2",
+      "send:use native config",
+      "switch:native/family/model@low:",
+      "send:use changed native variant",
+      "switch:native/fresh/model@:",
+      "send:use changed native model",
+    ]);
+    assert.equal((yield* adapter.listSessions())[0]?.model, "native/fresh/model");
+    assert.deepStrictEqual(fake.promptAgents, ["review", "review", "review"]);
+    assert.deepStrictEqual(inventory.provider, []);
+    assert.deepStrictEqual(inventory.model, []);
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "loads fresh native defaults and reasserts the model before resumed no-preference input",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine("plan");
+      const loaded: string[] = [];
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+        inventoryLoad: (directory) => {
+          loaded.push(directory);
+          return defaultsInventoryLoad("native/fresh#high");
+        },
+      });
+      const session = yield* adapter.startSession({
+        ...start,
+        resumeCursor: { schemaVersion: 1, sessionId: "ses_native" },
+      });
+      assert.equal(session.model, "native/fresh");
+      assert.deepStrictEqual(fake.starts, [
+        {
+          directory: start.cwd,
+          resumeSessionId: "ses_native",
+          model: { providerID: "native", id: "fresh", variant: "high" },
+        },
+      ]);
+      yield* adapter.sendTurn({ threadId, input: "use current defaults" });
+      assert.deepStrictEqual(loaded, [start.cwd]);
+      assert.deepStrictEqual(fake.calls, [
+        "start:/tmp/native-v2",
+        "switch:native/fresh@high:review",
+        "send:use current defaults",
+      ]);
+      assert.deepStrictEqual(fake.promptAgents, ["review"]);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "uses selected native agent models ahead of config and restores defaults after plan mode",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const inventory = yield* defaultsInventoryLoad("native/config#low", {
+        review: { providerID: "native", id: "review", variant: "high" },
+        plan: { providerID: "native", id: "plan", variant: "medium" },
+      });
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+        inventory: () => inventory,
+      });
+      const session = yield* adapter.startSession(start);
+      assert.equal(session.model, "native/review");
+      assert.deepStrictEqual(fake.starts[0]?.model, inventory.agent[0]?.model);
+      const plan = yield* adapter.sendTurn({ threadId, input: "plan", interactionMode: "plan" });
+      fake.emit({ type: "turn.started", turnID: plan.turnId });
+      fake.emit({ type: "turn.completed", turnID: plan.turnId });
+      yield* adapter.sendTurn({ threadId, input: "review", interactionMode: "default" });
+      assert.deepStrictEqual(fake.calls, [
+        "start:/tmp/native-v2",
+        "switch:native/plan@medium:plan",
+        "send:plan",
+        "switch:native/review@high:review",
+        "send:review",
+      ]);
+      assert.equal((yield* adapter.listSessions())[0]?.model, "native/review");
+      assert.deepStrictEqual(fake.promptAgents, ["plan", "review"]);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "keeps explicit and saved T3 model variants and agents ahead of changed native defaults",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      let inventory = yield* defaultsInventoryLoad("native/config#low", {
+        review: { providerID: "native", id: "review", variant: "medium" },
+      });
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+        inventory: () => inventory,
+      });
+      const selection = {
+        instanceId: ProviderInstanceId.make("opencode"),
+        model: "t3/chosen",
+        options: [
+          { id: "variant", value: "high" },
+          { id: "agent", value: "build" },
+        ],
+      };
+      yield* adapter.startSession({ ...start, modelSelection: selection });
+      assert.deepStrictEqual(fake.starts[0], {
+        directory: start.cwd,
+        model: { providerID: "t3", id: "chosen", variant: "high" },
+        agent: "build",
+      });
+      inventory = yield* defaultsInventoryLoad("native/changed#low");
+      const first = yield* adapter.sendTurn({
+        threadId,
+        input: "saved choice",
+        interactionMode: "plan",
+      });
+      fake.emit({ type: "turn.started", turnID: first.turnId });
+      fake.emit({ type: "turn.completed", turnID: first.turnId });
+      const second = yield* adapter.sendTurn({
+        threadId,
+        input: "new explicit choice",
+        interactionMode: "plan",
+        modelSelection: {
+          ...selection,
+          model: "t3/next",
+          options: [{ id: "variant", value: "low" }],
+        },
+      });
+      fake.emit({ type: "turn.started", turnID: second.turnId });
+      fake.emit({ type: "turn.completed", turnID: second.turnId });
+      yield* adapter.sendTurn({ threadId, input: "saved new choice", interactionMode: "default" });
+      assert.deepStrictEqual(fake.calls, [
+        "start:/tmp/native-v2",
+        "send:saved choice",
+        "switch:t3/next@low:plan",
+        "send:new explicit choice",
+        "switch::review",
+        "send:saved new choice",
+      ]);
+      assert.equal((yield* adapter.listSessions())[0]?.model, "t3/next");
+      assert.deepStrictEqual(fake.promptAgents, ["build", "plan", "review"]);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("returns from plan mode to the configured default even when build is available", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine("review");
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+      inventory: () => reviewDefaultInventory,
+    });
+    yield* adapter.startSession(start);
+    const plan = yield* adapter.sendTurn({
+      threadId,
+      input: "make a plan",
+      interactionMode: "plan",
+    });
+    fake.emit({ type: "turn.started", turnID: plan.turnId });
+    fake.emit({ type: "turn.completed", turnID: plan.turnId });
+    yield* adapter.sendTurn({
+      threadId,
+      input: "review it",
+      interactionMode: "default",
+    });
+    assert.deepStrictEqual(fake.calls, [
+      "start:/tmp/native-v2",
+      "switch::plan",
+      "send:make a plan",
+      "switch::review",
+      "send:review it",
+    ]);
+    assert.deepStrictEqual(fake.promptAgents, ["plan", "review"]);
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("uses the authoritative cached default for each session cwd without reloading", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine("review");
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+      inventory: (cwd) =>
+        cwd === start.cwd
+          ? reviewDefaultInventory
+          : {
+              ...reviewDefaultInventory,
+              agent: [
+                reviewDefaultInventory.agent[1]!,
+                reviewDefaultInventory.agent[0]!,
+                reviewDefaultInventory.agent[2]!,
+              ],
+            },
+      inventoryLoad: () => Effect.die("Cached cwd inventory must not be reloaded"),
+    });
+    for (const cwd of [start.cwd, "/tmp/build-project"]) {
+      yield* adapter.startSession({ ...start, cwd });
+      const plan = yield* adapter.sendTurn({
+        threadId,
+        input: "make a plan",
+        interactionMode: "plan",
+      });
+      fake.emit({ type: "turn.started", turnID: plan.turnId });
+      fake.emit({ type: "turn.completed", turnID: plan.turnId });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "use the workspace default",
+        interactionMode: "default",
+      });
+      yield* adapter.stopSession(threadId);
+    }
+    assert.deepStrictEqual(fake.promptAgents, ["plan", "review", "plan", "build"]);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("does not create a session with a guessed default when cwd inventory loading fails", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+      inventoryLoad: () =>
+        Effect.fail(
+          new OpenCodeRuntimeError({
+            operation: "agent.list",
+            detail: "Workspace inventory unavailable",
+          }),
+        ),
+    });
+    const error = yield* adapter.startSession(start).pipe(Effect.flip);
+    assert.equal(error._tag, "ProviderAdapterRequestError");
+    assert.propertyVal(error, "method", "agent.list");
+    assert.propertyVal(error, "detail", "Workspace inventory unavailable");
+    assert.deepStrictEqual(fake.starts, []);
+    assert.deepStrictEqual(yield* adapter.listSessions(), []);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("reconciles a resumed idle plan session to the configured default before sending", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine("plan");
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+      inventory: () => reviewDefaultInventory,
+    });
+    yield* adapter.startSession({
+      ...start,
+      resumeCursor: { schemaVersion: 1, sessionId: "ses_native" },
+    });
+    yield* adapter.sendTurn({
+      threadId,
+      input: "review it",
+      interactionMode: "default",
+    });
+    assert.deepStrictEqual(fake.starts, [{ directory: start.cwd, resumeSessionId: "ses_native" }]);
+    assert.deepStrictEqual(fake.calls, [
+      "start:/tmp/native-v2",
+      "switch::review",
+      "send:review it",
+    ]);
+    assert.deepStrictEqual(fake.promptAgents, ["review"]);
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "lets an explicit agent override plan mode and resets it when the agent option is removed",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+      });
+      const selection = {
+        instanceId: ProviderInstanceId.make("opencode"),
+        model: "openai/gpt-5",
+        options: [{ id: "agent", value: "review" }],
+      };
+      yield* adapter.startSession({ ...start, modelSelection: selection });
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "review the plan",
+        interactionMode: "plan",
+        modelSelection: selection,
+      });
+      fake.emit({ type: "turn.started", turnID: turn.turnId });
+      fake.emit({ type: "turn.completed", turnID: turn.turnId });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "build now",
+        modelSelection: { ...selection, options: [] },
+      });
+      assert.deepStrictEqual(fake.calls, [
+        "start:/tmp/native-v2",
+        "send:review the plan",
+        "switch::build",
+        "send:build now",
+      ]);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("uses native interrupt-and-switch semantics when entering plan mode mid-turn", () =>
+  Effect.gen(function* () {
+    const fake = fakeEngine();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: fake.create,
+    });
+    const interrupted = yield* Deferred.make<void>();
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      event.type === "turn.completed" && event.payload.state === "interrupted"
+        ? Deferred.succeed(interrupted, undefined)
+        : Effect.void,
+    ).pipe(Effect.forkChild);
+    yield* adapter.startSession(start);
+    const first = yield* adapter.sendTurn({ threadId, input: "long job" });
+    fake.emit({ type: "turn.started", turnID: first.turnId });
+    fake.setRunning(first.turnId);
+    const plan = yield* adapter.sendTurn({
+      threadId,
+      input: "plan instead",
+      interactionMode: "plan",
+    });
+    yield* Deferred.await(interrupted);
+    assert.notEqual(plan.turnId, first.turnId);
+    assert.deepStrictEqual(fake.calls, [
+      "start:/tmp/native-v2",
+      "send:long job",
+      "switch::plan",
+      "send:plan instead",
+    ]);
+    yield* adapter.stopSession(threadId);
+  }).pipe(Effect.provide(testLayer)),
+);
 
 it.effect("reports a failed native stop as lost while still stopping other sessions", () =>
   Effect.gen(function* () {
@@ -604,7 +1254,6 @@ it.effect(
           "turn.started",
           "item.started",
           "content.delta",
-          "content.delta",
           "item.completed",
           "item.started",
           "content.delta",
@@ -624,15 +1273,28 @@ it.effect(
           inputTokens: context.payload.usage.inputTokens,
           turnId: context.turnId,
         },
-        // The step's prompt (input + cache) plus its output is the live context size.
-        { usedTokens: 19, inputTokens: 14, turnId: turn.turnId },
+        // Occupancy estimates include reasoning; turn output below already includes it.
+        { usedTokens: 21, inputTokens: 14, turnId: turn.turnId },
       );
       assert.deepStrictEqual(
         events.filter((event) => event.type === "content.delta").map((event) => event.payload),
         [
           { streamKind: "assistant_text", delta: "Hello" },
-          { streamKind: "assistant_text", delta: " world" },
           { streamKind: "reasoning_text", delta: "Think" },
+        ],
+      );
+      assert.deepStrictEqual(
+        events
+          .filter(
+            (event) =>
+              event.type === "item.completed" &&
+              (event.payload.itemType === "assistant_message" ||
+                event.payload.itemType === "reasoning"),
+          )
+          .map((event) => event.payload),
+        [
+          { itemType: "assistant_message", status: "completed", finalText: "Hello world" },
+          { itemType: "reasoning", status: "completed", finalText: "Think" },
         ],
       );
       const terminal = events.find((event) => event.type === "turn.completed");
@@ -654,6 +1316,243 @@ it.effect(
       assert.deepStrictEqual(fake.calls, ["start:/tmp/native-v2", "send:hello", "stop"]);
     }).pipe(Effect.provide(testLayer)),
 );
+
+for (const kind of ["text", "reasoning"] as const) {
+  for (const scenario of [
+    { name: "rewritten final", deltas: ["Dr", "aft"], finalText: "Final" },
+    { name: "shorter final", deltas: ["Dr", "aft"], finalText: "Dra" },
+    { name: "empty final", deltas: ["Dr", "aft"], finalText: "" },
+    { name: "prefix-extension final", deltas: ["Dr", "aft"], finalText: "Draft answer" },
+    { name: "unchanged stream final", deltas: ["Dr", "aft"], finalText: "Draft" },
+    { name: "whitespace final", deltas: ["Dr", "aft"], finalText: " \n " },
+    { name: "final-only content", deltas: [], finalText: "  Final answer\n" },
+    { name: "final-only empty content", deltas: [], finalText: "" },
+  ]) {
+    it.effect(`native ${kind} completion preserves authoritative ${scenario.name}`, () =>
+      Effect.gen(function* () {
+        const fake = fakeEngine();
+        const adapter = yield* makeOpenCodeNativeAdapter({
+          url: "https://native.example",
+          engineCreate: fake.create,
+        });
+        const events: ProviderRuntimeEvent[] = [];
+        const completed = yield* Deferred.make<void>();
+        yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.gen(function* () {
+            events.push(yield* decodeRuntimeEvent(event));
+            if (event.type === "turn.completed") yield* Deferred.succeed(completed, undefined);
+          }),
+        ).pipe(Effect.forkChild);
+        yield* adapter.startSession(start);
+        const turn = yield* adapter.sendTurn({ threadId, input: "hello" });
+        const terminal = yield* decodeNativeFeed({
+          id: "evt_terminal",
+          type: `session.${kind}.ended`,
+          created: 1,
+          durable: { aggregateID: "ses_native", seq: 1, version: 1 },
+          data: {
+            sessionID: "ses_native",
+            assistantMessageID: "msg_a",
+            ordinal: 0,
+            text: scenario.finalText,
+          },
+        });
+        assert(
+          terminal.type === "session.text.ended" || terminal.type === "session.reasoning.ended",
+        );
+        const itemScope = {
+          sessionID: terminal.data.sessionID,
+          turnID: turn.turnId,
+          assistantMessageID: terminal.data.assistantMessageID,
+          ordinal: terminal.data.ordinal,
+          key: `${terminal.data.sessionID}:${terminal.data.assistantMessageID}:${kind}:${terminal.data.ordinal}`,
+        };
+        fake.emit({ type: "turn.started", turnID: turn.turnId });
+        fake.emit({ type: `${kind}.started`, ...itemScope });
+        for (const delta of scenario.deltas) {
+          fake.emit({ type: `${kind}.delta`, ...itemScope, delta });
+        }
+        fake.emit({ type: `${kind}.completed`, ...itemScope, text: terminal.data.text });
+        fake.emit({ type: "turn.completed", turnID: turn.turnId });
+        yield* Deferred.await(completed);
+
+        const itemEvents = events.filter((event) => "itemId" in event);
+        assert.deepStrictEqual(
+          itemEvents.map((event) => event.type),
+          ["item.started", ...scenario.deltas.map(() => "content.delta"), "item.completed"],
+        );
+        for (const event of itemEvents) {
+          assert.equal(event.itemId, `opencode:${itemScope.key}`);
+          assert.equal(event.turnId, turn.turnId);
+        }
+        assert.deepStrictEqual(
+          itemEvents
+            .filter((event) => event.type === "content.delta")
+            .map((event) => event.payload),
+          scenario.deltas.map((delta) => ({
+            streamKind: kind === "text" ? "assistant_text" : "reasoning_text",
+            delta,
+          })),
+        );
+        assert.deepStrictEqual(
+          itemEvents
+            .filter((event) => event.type === "item.completed")
+            .map((event) => event.payload),
+          [
+            {
+              itemType: kind === "text" ? "assistant_message" : "reasoning",
+              status: "completed",
+              finalText: scenario.finalText,
+            },
+          ],
+        );
+        yield* adapter.stopSession(threadId);
+      }).pipe(Effect.provide(testLayer)),
+    );
+  }
+}
+
+for (const outcome of ["success", "failed"] as const) {
+  for (const scenario of ["replacement", "empty", "absent", "terminal-only"] as const) {
+    it.effect(
+      `native tool ${outcome} forwards ${scenario} terminal metadata without stale progress`,
+      () =>
+        Effect.gen(function* () {
+          const fake = fakeEngine();
+          const adapter = yield* makeOpenCodeNativeAdapter({
+            url: "https://native.example",
+            engineCreate: fake.create,
+          });
+          const events: ProviderRuntimeEvent[] = [];
+          const completed = yield* Deferred.make<void>();
+          yield* Stream.runForEach(adapter.streamEvents, (event) =>
+            Effect.gen(function* () {
+              events.push(yield* decodeRuntimeEvent(event));
+              if (event.type === "turn.completed") yield* Deferred.succeed(completed, undefined);
+            }),
+          ).pipe(Effect.forkChild);
+          yield* adapter.startSession(start);
+          const turn = yield* adapter.sendTurn({ threadId, input: "run tool" });
+          const metadata =
+            scenario === "absent"
+              ? undefined
+              : scenario === "empty"
+                ? {}
+                : outcome === "success"
+                  ? {
+                      files: [
+                        {
+                          file: "/tmp/native-v2/app.ts",
+                          patch: "@@ -1 +1 @@\n-Draft\n+Final\n",
+                          status: "modified",
+                          additions: 1,
+                          deletions: 1,
+                        },
+                      ],
+                    }
+                  : { shellID: "shell_terminal", exit: 1, status: "completed", truncated: false };
+          const terminal = yield* decodeUnknownNativeFeed({
+            id: "evt_tool_terminal",
+            type: `session.tool.${outcome}`,
+            created: 1,
+            durable: { aggregateID: "ses_native", seq: 1, version: 2 },
+            data: {
+              sessionID: "ses_native",
+              assistantMessageID: "msg_a",
+              id: "call_a",
+              executed: true,
+              ...(metadata !== undefined ? { metadata } : {}),
+              ...(outcome === "success"
+                ? { content: [{ type: "text", text: "Edited app.ts" }] }
+                : {
+                    error: { type: "ToolError", message: "Command failed" },
+                    ...(scenario === "absent"
+                      ? {}
+                      : { content: [{ type: "text", text: "partial output" }] }),
+                  }),
+            },
+          });
+          assert(
+            terminal.type === "session.tool.success" || terminal.type === "session.tool.failed",
+          );
+          const tool = {
+            id: terminal.data.id,
+            assistantMessageID: terminal.data.assistantMessageID,
+            name: outcome === "success" ? "edit" : "bash",
+            inputText: "",
+            input: outcome === "success" ? { path: "app.ts" } : { command: "false" },
+            executed: false,
+          };
+          const toolScope = {
+            sessionID: terminal.data.sessionID,
+            turnID: turn.turnId,
+            key: `${terminal.data.sessionID}:${terminal.data.assistantMessageID}:tool:${terminal.data.id}`,
+          };
+          const progressMetadata = { stale: "progress only", shellID: "shell_progress" };
+          fake.emit({ type: "turn.started", turnID: turn.turnId });
+          fake.emit({ type: "tool.started", ...toolScope, tool });
+          fake.emit({ type: "tool.called", ...toolScope, tool });
+          if (scenario !== "terminal-only") {
+            fake.emit({
+              type: "tool.progress",
+              ...toolScope,
+              tool: { ...tool, metadata: progressMetadata },
+            });
+          }
+          // The engine already replaces progress metadata with this official terminal snapshot.
+          if (terminal.type === "session.tool.success") {
+            fake.emit({
+              type: "tool.completed",
+              ...toolScope,
+              tool: { ...tool, ...terminal.data },
+            });
+          } else {
+            fake.emit({ type: "tool.failed", ...toolScope, tool: { ...tool, ...terminal.data } });
+          }
+          fake.emit({ type: "turn.completed", turnID: turn.turnId });
+          yield* Deferred.await(completed);
+          const toolEvents = events.filter((event) => "itemId" in event);
+          assert.deepStrictEqual(
+            toolEvents.map((event) => event.type),
+            [
+              "item.started",
+              "item.updated",
+              ...(scenario === "terminal-only" ? [] : ["item.updated"]),
+              "item.completed",
+            ],
+          );
+          for (const event of toolEvents) {
+            assert.equal(event.itemId, `opencode:${toolScope.key}`);
+            assert.equal(event.turnId, turn.turnId);
+          }
+          if (scenario !== "terminal-only") {
+            const progress = toolEvents.at(-2);
+            assert(progress?.type === "item.updated");
+            assert.deepStrictEqual(progress.payload.data, {
+              tool: tool.name,
+              input: tool.input,
+              metadata: progressMetadata,
+            });
+          }
+          const result = toolEvents.at(-1);
+          assert(result?.type === "item.completed");
+          assert.deepStrictEqual(result.payload, {
+            itemType: outcome === "success" ? "file_change" : "command_execution",
+            title: tool.name,
+            status: outcome === "success" ? "completed" : "failed",
+            data: {
+              tool: tool.name,
+              input: tool.input,
+              content: terminal.data.content,
+              ...(terminal.type === "session.tool.failed" ? { error: terminal.data.error } : {}),
+              ...(metadata !== undefined ? { metadata } : {}),
+            },
+          });
+          yield* adapter.stopSession(threadId);
+        }).pipe(Effect.provide(testLayer)),
+    );
+  }
+}
 
 it.effect(
   "reports main and nested child step costs during a turn and includes them at completion",
@@ -1271,7 +2170,126 @@ it.effect(
       assert.equal(terminal?.type === "turn.completed" && terminal.payload.totalCostUsd, undefined);
       assert.equal(
         terminal?.type === "turn.completed" && terminal.payload.tokenUsage?.inputTokens,
-        2,
+        6,
+      );
+      assert.equal(
+        terminal?.type === "turn.completed" && terminal.payload.tokenUsage?.usageStatus,
+        "partial",
+      );
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "keeps recorded compaction/title usage session-scoped without double charging public compaction terminals",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+      });
+      const events: ProviderRuntimeEvent[] = [];
+      const done = yield* Deferred.make<void>();
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(yield* decodeRuntimeEvent(event));
+          if (event.type === "turn.completed") yield* Deferred.succeed(done, undefined);
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession(start);
+      const turn = yield* adapter.sendTurn({ threadId, input: "compaction" });
+      fake.emit({ type: "turn.started", turnID: turn.turnId });
+      const tokens = { input: 2, output: 1, reasoning: 1, cache: { read: 0, write: 0 } };
+      const scope = { sessionID: "ses_native", turnID: turn.turnId };
+      const durable = { aggregateID: scope.sessionID, seq: 1, version: 1 as const };
+      fake.emit({
+        type: "compaction.started",
+        ...scope,
+        key: "evt_start",
+        eventID: "evt_start",
+        durable,
+        compaction: { sessionID: scope.sessionID, reason: "auto", recent: "recent" },
+      });
+      for (const source of ["compaction", "title"] as const) {
+        const frame = yield* decodeUnknownNativeLog({
+          id: `evt_record_${source}`,
+          type: "session.usage.recorded",
+          created: 1,
+          durable,
+          data: {
+            sessionID: scope.sessionID,
+            source,
+            cost: source === "compaction" ? 0.2 : 99,
+            tokens,
+          },
+        });
+        if (frame.type !== "session.usage.recorded") return;
+        fake.emit({
+          type: "usage.recorded",
+          scope: "session",
+          eventID: frame.id,
+          durable: frame.durable,
+          usage: frame.data,
+        });
+      }
+      const terminal = {
+        type: "compaction.completed" as const,
+        ...scope,
+        key: "evt_start",
+        eventID: "evt_terminal",
+        durable,
+        compaction: {
+          sessionID: scope.sessionID,
+          reason: "auto" as const,
+          text: "summary",
+          recent: "recent",
+          cost: 0.2,
+          tokens,
+        },
+      };
+      fake.emit(terminal);
+      fake.emit(terminal);
+      // Once the engine's bounded feed cache evicts this ID, an already-closed
+      // attempt can be replayed under the terminal ID rather than the start ID.
+      fake.emit({ ...terminal, key: terminal.eventID });
+      fake.emit({
+        type: "compaction.started",
+        ...scope,
+        key: terminal.key,
+        eventID: "evt_start_replayed",
+        durable,
+        compaction: { sessionID: scope.sessionID, reason: "auto", recent: "recent" },
+      });
+      fake.emit({
+        type: "usage.updated",
+        sessionID: scope.sessionID,
+        scope: "session",
+        cost: 999,
+        tokens,
+      });
+      fake.emit({
+        type: "step.completed",
+        ...scope,
+        step: {
+          sessionID: scope.sessionID,
+          assistantMessageID: "msg_answer",
+          finish: "stop",
+          cost: 0.1,
+          tokens,
+        },
+      });
+      fake.emit({ type: "turn.completed", turnID: turn.turnId });
+      yield* Deferred.await(done);
+      assert.equal(
+        events.find((event) => event.type === "turn.completed")?.payload.totalCostUsd,
+        0.30000000000000004,
+      );
+      assert.deepStrictEqual(
+        events
+          .filter((event) => event.type === "turn.cost.updated")
+          .map((event) => event.payload.totalCostUsd),
+        [0.2, 0.30000000000000004],
       );
       yield* adapter.stopSession(threadId);
     }).pipe(Effect.provide(testLayer)),
@@ -2168,6 +3186,171 @@ it.effect("settles an interrupted native child once without ending the parent tu
   }).pipe(Effect.provide(testLayer)),
 );
 
+it.effect.each([false, true])(
+  "reactivates nested native task on explicit launch only, retaining background scopes and current results (same turn: %s)",
+  (sameTurn) =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+      });
+      const received = yield* Queue.unbounded<ProviderRuntimeEvent>();
+      yield* Stream.runForEach(adapter.streamEvents, (event) => Queue.offer(received, event)).pipe(
+        Effect.forkChild,
+      );
+      yield* adapter.startSession(start);
+      const first = yield* adapter.sendTurn({ threadId, input: "nested child" });
+      fake.emit({ type: "turn.started", turnID: first.turnId });
+      const outer = {
+        sessionID: "ses_outer",
+        parentSessionID: "ses_native",
+        parentToolKey: "ses_native:msg_outer:tool:call_outer",
+        turnID: first.turnId,
+      };
+      const original = {
+        sessionID: "ses_nested_reused",
+        parentSessionID: outer.sessionID,
+        parentToolKey: "ses_outer:msg_first:tool:call_first",
+        turnID: first.turnId,
+      };
+      const current = { ...original, parentToolKey: "ses_outer:msg_second:tool:call_second" };
+      const tokens = { input: 10, output: 5, reasoning: 2, cache: { read: 3, write: 1 } };
+      const step = (scope: typeof original, id: string, cost: number) =>
+        fake.emit({
+          type: "step.completed",
+          ...scope,
+          step: {
+            sessionID: scope.sessionID,
+            assistantMessageID: id,
+            finish: "stop",
+            cost,
+            tokens,
+          },
+        });
+      const events: ProviderRuntimeEvent[] = [];
+      const through = (predicate: (event: ProviderRuntimeEvent) => boolean) =>
+        Effect.gen(function* () {
+          while (true) {
+            const event = yield* Queue.take(received);
+            events.push(yield* decodeRuntimeEvent(event));
+            if (predicate(event)) return;
+          }
+        });
+      fake.emit({ type: "child.attached", ...outer, info: {} });
+      fake.emit({
+        type: "child.attached",
+        ...original,
+        info: { title: "Initial child", agent: "explore" },
+      });
+      step(original, "msg_original", 0.25);
+      fake.emit({ type: "child.completed", ...original, summary: "First result" });
+      if (!sameTurn) {
+        fake.emit({ type: "turn.completed", turnID: first.turnId });
+        const second = yield* adapter.sendTurn({ threadId, input: "unrelated next turn" });
+        fake.emit({ type: "turn.started", turnID: second.turnId });
+      }
+      // The outer child continues on the old turn even when the root is now on another turn.
+      fake.emit({
+        type: "child.attached",
+        ...current,
+        info: { title: "Second child", agent: "review" },
+      });
+      fake.emit({
+        type: "child.updated",
+        ...current,
+        info: { model: { providerID: "openai", id: "second" } },
+      });
+      fake.emit({ type: "child.started", ...current });
+      fake.emit({
+        type: "child.completed",
+        ...current,
+        summary: "Cannot settle before explicit activation",
+      });
+      fake.emit({
+        type: "child.started",
+        ...current,
+        reactivation: { key: original.parentToolKey },
+      });
+      fake.emit({
+        type: "child.started",
+        ...current,
+        reactivation: { key: current.parentToolKey },
+      });
+      fake.emit({
+        type: "child.started",
+        ...current,
+        reactivation: { key: current.parentToolKey },
+      });
+      // Same-turn reuse needs launch fencing as well as turn fencing.
+      fake.emit({ type: "child.updated", ...original, info: { title: "Stale child" } });
+      fake.emit({
+        type: "child.failed",
+        ...original,
+        error: { type: "old", message: "Stale failure" },
+      });
+      fake.emit({ type: "child.completed", ...original, summary: "Stale result" });
+      step(original, "msg_original", 999);
+      step(current, "msg_original", 999);
+      fake.emit({
+        type: "child.completed",
+        sessionID: current.sessionID,
+        parentSessionID: current.parentSessionID,
+        turnID: current.turnID,
+      });
+      step(current, "msg_second", 0.75);
+      fake.emit({ type: "child.completed", ...current, summary: "Current result" });
+      step(outer, "msg_outer", 0.5);
+      fake.emit({ type: "child.completed", ...outer, summary: "Outer result" });
+      if (sameTurn) fake.emit({ type: "turn.completed", turnID: first.turnId });
+      yield* through((event) =>
+        sameTurn
+          ? event.type === "turn.completed"
+          : event.type === "turn.cost.updated" && event.payload.status === "final",
+      );
+      const tasks = events.filter(
+        (event) =>
+          event.type.startsWith("task.") &&
+          "taskId" in event.payload &&
+          event.payload.taskId === current.sessionID,
+      );
+      assert.deepStrictEqual(
+        tasks.map((event) => event.type),
+        [
+          "task.started",
+          "task.progress",
+          "task.completed",
+          "task.updated",
+          "task.progress",
+          "task.completed",
+        ],
+      );
+      assert.deepStrictEqual(
+        tasks.map((event) => event.turnId),
+        Array(6).fill(first.turnId),
+      );
+      const reopened = tasks.find((event) => event.type === "task.updated");
+      assert.equal(reopened?.payload.parentAgentId, outer.sessionID);
+      assert.equal(reopened?.payload.title, "Second child");
+      assert.equal(reopened?.payload.model, "openai/second");
+      assert.equal(reopened?.payload.toolUseId, `opencode:${current.parentToolKey}`);
+      const completed = tasks.filter((event) => event.type === "task.completed");
+      assert.deepStrictEqual(
+        completed.map((event) => [event.payload.summary, event.payload.typedUsage?.costUsd]),
+        [
+          ["First result", 0.25],
+          ["Current result", 1],
+        ],
+      );
+      const final = events.findLast((event) =>
+        sameTurn ? event.type === "turn.completed" : event.type === "turn.cost.updated",
+      );
+      assert.equal(final?.turnId, first.turnId);
+      assert.equal(final && "totalCostUsd" in final.payload && final.payload.totalCostUsd, 1.5);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
 it.effect(
   "correlates native permission replies, external decisions and duplicates without auto-approval",
   () =>
@@ -2383,6 +3566,250 @@ it.effect("maps native form fields, validates answers and cancels explicitly", (
   }).pipe(Effect.provide(testLayer)),
 );
 
+const nativeStringValidationCases = [
+  {
+    name: "unanchored JavaScript pattern with required and length constraints",
+    constraints: { required: true, minLength: 5, maxLength: 12, pattern: "[A-Z]{2}" },
+    invalid: ["", "AB", "prefix-ab", "prefix-AB-too-long"],
+    valid: "prefix-AB",
+  },
+  {
+    name: "explicitly anchored case-sensitive JavaScript pattern",
+    constraints: { pattern: "^AB$" },
+    invalid: ["", "ab", "prefix-AB"],
+    valid: "AB",
+  },
+  {
+    name: "empty JavaScript pattern",
+    constraints: { pattern: "" },
+    invalid: [],
+    valid: "",
+  },
+  {
+    name: "native email format",
+    constraints: { format: "email" },
+    invalid: ["", "ada@example", "ada@@example.org", "ada @example.org", "ada@example.org\n"],
+    valid: "ada+tag@example.org",
+  },
+  {
+    name: "URL.canParse URI format",
+    constraints: { format: "uri" },
+    invalid: ["", "relative/path", "://invalid", "https://"],
+    valid: "https://example.org/path?key=value#fragment",
+  },
+  {
+    name: "non-HTTP URI scheme",
+    constraints: { format: "uri" },
+    invalid: ["relative/path"],
+    valid: "mailto:ada@example.org",
+  },
+  {
+    name: "real calendar date and leap year",
+    constraints: { format: "date" },
+    invalid: [
+      "",
+      "2023-02-29",
+      "1900-02-29",
+      "2024-02-30",
+      "2024-04-31",
+      "2024-13-01",
+      "2024-00-01",
+      "2024-01-00",
+    ],
+    valid: "2000-02-29",
+  },
+  {
+    name: "exact YYYY-MM-DD date shape",
+    constraints: { format: "date" },
+    invalid: [
+      "2024-2-09",
+      "2024-02-9",
+      "24-02-09",
+      "2024-02-09T00:00:00Z",
+      " 2024-02-09",
+      "2024-02-09\n",
+    ],
+    valid: "2024-02-09",
+  },
+  {
+    name: "parseable date-time format",
+    constraints: { format: "date-time" },
+    invalid: ["", "not a date", "2024-13-01T00:00:00Z", "2024-01-01T25:00:00Z"],
+    valid: "2024-02-29T12:34:56+02:00",
+  },
+  {
+    name: "date-time accepts native Date parsing rather than strict RFC3339",
+    constraints: { format: "date-time" },
+    invalid: ["not a date"],
+    valid: "March 1, 2024",
+  },
+  {
+    name: "date-time permits native Date calendar normalization",
+    constraints: { format: "date-time" },
+    invalid: ["not a date"],
+    valid: "2024-02-30T00:00:00Z",
+  },
+  {
+    name: "combined string pattern format and closed option constraints",
+    constraints: {
+      required: true,
+      minLength: 8,
+      maxLength: 25,
+      pattern: "@example\\.org$",
+      format: "email",
+      options: [{ label: "Ada", value: "ada@example.org" }],
+    },
+    invalid: ["", "ada@example.net", "ada@@example.org", "grace@example.org"],
+    valid: "ada@example.org",
+  },
+] satisfies ReadonlyArray<{
+  name: string;
+  constraints: Omit<Form.StringField, "key" | "type">;
+  invalid: ReadonlyArray<string>;
+  valid: string;
+}>;
+
+it.effect.each(nativeStringValidationCases)(
+  "validates native form string $name locally and allows a corrected reply",
+  ({ constraints, invalid, valid }) =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+      });
+      const events: ProviderRuntimeEvent[] = [];
+      const requested = yield* Deferred.make<void>();
+      const resolved = yield* Deferred.make<void>();
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "user-input.requested")
+            yield* Deferred.succeed(requested, undefined).pipe(Effect.ignore);
+          if (event.type === "user-input.resolved")
+            yield* Deferred.succeed(resolved, undefined).pipe(Effect.ignore);
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession(start);
+      const turn = yield* adapter.sendTurn({ threadId, input: "ask" });
+      // Decode the pinned public schema, including its exported string constraints.
+      const form = yield* decodeNativeForm({
+        id: "frm_string",
+        sessionID: "ses_native",
+        title: "String validation",
+        fields: [{ key: "value", type: "string", ...constraints }],
+      });
+      fake.emit({ type: "form.created", turnID: turn.turnId, form });
+      yield* Deferred.await(requested);
+      for (const value of invalid) {
+        const error = yield* adapter
+          .respondToUserInput(threadId, ApprovalRequestId.make(form.id), { value })
+          .pipe(Effect.flip);
+        assert.equal(error._tag, "ProviderAdapterValidationError", value);
+        assert.deepStrictEqual(fake.calls, ["start:/tmp/native-v2", "send:ask"]);
+        assert.equal(events.filter((event) => event.type === "user-input.resolved").length, 0);
+      }
+      yield* adapter.respondToUserInput(threadId, ApprovalRequestId.make(form.id), {
+        value: valid,
+      });
+      const encodedAnswer = yield* encodeNativeFormAnswer({ value: valid });
+      assert.deepStrictEqual(fake.calls, [
+        "start:/tmp/native-v2",
+        "send:ask",
+        `form:${form.id}:${encodedAnswer}`,
+      ]);
+      fake.emit({
+        type: "form.resolved",
+        turnID: turn.turnId,
+        sessionID: "ses_native",
+        formID: form.id,
+        answer: { value: valid },
+      });
+      yield* Deferred.await(resolved);
+      yield* adapter.respondToUserInput(threadId, ApprovalRequestId.make(form.id), {
+        value: valid,
+      });
+      assert.equal(fake.calls.filter((call) => call.startsWith("form:")).length, 1);
+      assert.equal(events.filter((event) => event.type === "user-input.requested").length, 1);
+      assert.equal(events.filter((event) => event.type === "user-input.resolved").length, 1);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "rejects an invalid native form string regexp locally and still allows cancellation",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+      });
+      yield* adapter.startSession(start);
+      const turn = yield* adapter.sendTurn({ threadId, input: "ask" });
+      const form = yield* decodeNativeForm({
+        id: "frm_pattern",
+        sessionID: "ses_native",
+        title: "Invalid pattern",
+        fields: [{ key: "value", type: "string", pattern: "[" }],
+      });
+      fake.emit({ type: "form.created", turnID: turn.turnId, form });
+      for (const value of ["anything", ""]) {
+        assert.equal(
+          (yield* adapter
+            .respondToUserInput(threadId, ApprovalRequestId.make(form.id), { value })
+            .pipe(Effect.flip))._tag,
+          "ProviderAdapterValidationError",
+        );
+        assert.deepStrictEqual(fake.calls, ["start:/tmp/native-v2", "send:ask"]);
+      }
+      yield* adapter.respondToUserInput(threadId, ApprovalRequestId.make(form.id), {});
+      assert.deepStrictEqual(fake.calls, [
+        "start:/tmp/native-v2",
+        "send:ask",
+        "form:frm_pattern:undefined",
+      ]);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "rejects supplied values for an empty closed native string field and still allows cancellation",
+  () =>
+    Effect.gen(function* () {
+      const fake = fakeEngine();
+      const adapter = yield* makeOpenCodeNativeAdapter({
+        url: "https://native.example",
+        engineCreate: fake.create,
+      });
+      yield* adapter.startSession(start);
+      const turn = yield* adapter.sendTurn({ threadId, input: "ask" });
+      const form = yield* decodeNativeForm({
+        id: "frm_empty_closed_options",
+        sessionID: "ses_native",
+        title: "Empty closed options",
+        fields: [{ key: "value", type: "string", options: [], custom: false }],
+      });
+      fake.emit({ type: "form.created", turnID: turn.turnId, form });
+
+      assert.equal(
+        (yield* adapter
+          .respondToUserInput(threadId, ApprovalRequestId.make(form.id), { value: "supplied" })
+          .pipe(Effect.flip))._tag,
+        "ProviderAdapterValidationError",
+      );
+      assert.deepStrictEqual(fake.calls, ["start:/tmp/native-v2", "send:ask"]);
+
+      yield* adapter.respondToUserInput(threadId, ApprovalRequestId.make(form.id), {});
+      assert.deepStrictEqual(fake.calls, [
+        "start:/tmp/native-v2",
+        "send:ask",
+        `form:${form.id}:undefined`,
+      ]);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.provide(testLayer)),
+);
+
 const recoveryFixture = Effect.fnUntraced(function* () {
   type Engine = ReturnType<typeof openCodeNativeSessionEngineCreate>;
   type StartReceipt = { index: number; options: Parameters<Engine["start"]>[0] };
@@ -2391,7 +3818,6 @@ const recoveryFixture = Effect.fnUntraced(function* () {
   const switches = yield* Queue.unbounded<number>();
   const liveSubscriptions = new Set<number>();
   const promptSelections: Array<Parameters<Engine["switchSelection"]>[0]> = [];
-  const prompts: Array<[string, object]> = [];
   let nativeSelection: Parameters<Engine["switchSelection"]>[0] = { agent: "build" };
   let heldStop:
     | { index: number; release: ReturnType<typeof Promise.withResolvers<void>> }
@@ -2457,7 +3883,6 @@ const recoveryFixture = Effect.fnUntraced(function* () {
       },
       send: async (...args) => {
         promptSelections.push(nativeSelection);
-        prompts.push([args[0], args[1] ?? {}]);
         return engine.send(...args);
       },
       stop: async (options) => {
@@ -2468,7 +3893,9 @@ const recoveryFixture = Effect.fnUntraced(function* () {
           await pending.release.promise;
         }
         liveSubscriptions.delete(index);
-        return options?.interrupt === false ? { success: true, data: undefined } : engine.stop();
+        return options?.interrupt === false
+          ? { success: true, data: undefined }
+          : engine.stop(options);
       },
     };
   };
@@ -2479,7 +3906,6 @@ const recoveryFixture = Effect.fnUntraced(function* () {
     switches,
     liveSubscriptions,
     promptSelections,
-    prompts,
     nativeSelection: () => nativeSelection,
     holdStop: (index: number) => {
       const release = Promise.withResolvers<void>();
@@ -2542,7 +3968,7 @@ it.effect(
       f.callbacks[0]!({ type: "turn.started", turnID: "stale-late-response" });
       f.loss(0);
       assert.deepStrictEqual((yield* adapter.listSessions())[0], recovered);
-      assert.deepStrictEqual(f.prompts, [["original once", {}]]);
+      assert.deepStrictEqual(f.fake.prompts, [["original once", {}]]);
       // Readiness is an observable receipt that drains earlier queued lifecycle events.
       const observed: ProviderRuntimeEvent[] = [];
       let ready = 0;
@@ -2645,7 +4071,7 @@ it.effect(
         options: { interrupt: false },
       });
       assert.equal(yield* adapter.hasSession(threadId), true);
-      assert.deepStrictEqual(f.prompts, [["ask once", {}]]);
+      assert.deepStrictEqual(f.fake.prompts, [["ask once", {}]]);
       assert.equal(
         f.fake.calls.some(
           (call) =>
@@ -2762,7 +4188,7 @@ it.effect(
         options: { interrupt: false },
       });
       assert.equal(yield* adapter.hasSession(threadId), true);
-      assert.deepStrictEqual(f.prompts, [["uncertain once", {}]]);
+      assert.deepStrictEqual(f.fake.prompts, [["uncertain once", {}]]);
       assert.equal((yield* adapter.listSessions())[0]?.activeTurnId, undefined);
       yield* adapter.stopSession(threadId);
     }).pipe(Effect.provide(testLayer)),
@@ -2790,13 +4216,11 @@ it.effect(
           .sendTurn({
             threadId,
             input: "stale waiting prompt",
+            interactionMode: "plan",
             modelSelection: {
               ...modelSelection,
               model: "openai/uncertain",
-              options: [
-                { id: "variant", value: "low" },
-                { id: "agent", value: "plan" },
-              ],
+              options: [{ id: "variant", value: "low" }],
             },
           })
           .pipe(Effect.exit, Effect.forkChild);
@@ -2809,7 +4233,7 @@ it.effect(
         yield* TestClock.adjust("250 millis");
         yield* Queue.take(f.starts);
         yield* Queue.take(f.stops);
-        assert.deepStrictEqual(f.prompts, []);
+        assert.deepStrictEqual(f.fake.prompts, []);
         assert.equal(yield* Queue.size(f.switches), 0);
         // Recovery must not change native selection or interrupt/replay work.
         assert.equal(f.nativeSelection().agent, "plan");
@@ -2821,7 +4245,7 @@ it.effect(
           .pipe(Effect.flip);
         assert.equal(busy._tag, "ProviderAdapterRequestError");
         assert.equal(yield* Queue.size(f.switches), 0);
-        assert.deepStrictEqual(f.prompts, []);
+        assert.deepStrictEqual(f.fake.prompts, []);
         assert.equal(f.nativeSelection().agent, "plan");
         f.callbacks[1]!({ type: "turn.completed", turnID: "remote-work" });
         const choice = explicit
@@ -2860,7 +4284,7 @@ it.effect(
         f.callbacks[1]!({ type: "turn.completed", turnID: turn.turnId });
         yield* adapter.sendTurn({ threadId, input: "verified prompt", interactionMode: "default" });
         assert.equal(yield* Queue.size(f.switches), 0);
-        assert.deepStrictEqual(f.prompts, [
+        assert.deepStrictEqual(f.fake.prompts, [
           ["new prompt", {}],
           ["verified prompt", {}],
         ]);
@@ -2868,6 +4292,31 @@ it.effect(
         yield* adapter.stopSession(threadId);
       }
     }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("scope removal while inventory loading prevents late native startup after disposal", () =>
+  Effect.gen(function* () {
+    const f = yield* recoveryFixture();
+    const scope = yield* Scope.make();
+    const loading = yield* Deferred.make<void>();
+    const inventory = yield* Deferred.make<OpenCodeNativeInventory>();
+    const adapter = yield* makeOpenCodeNativeAdapter({
+      url: "https://native.example",
+      engineCreate: f.create,
+      inventoryLoad: () =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(loading, undefined);
+          return yield* Deferred.await(inventory);
+        }),
+    }).pipe(Effect.provideService(Scope.Scope, scope));
+    const started = yield* adapter.startSession(start).pipe(Effect.exit, Effect.forkChild);
+    yield* Deferred.await(loading);
+    yield* Scope.close(scope, Exit.void);
+    yield* Deferred.succeed(inventory, reviewDefaultInventory);
+    assert.equal(Exit.isFailure(yield* Fiber.join(started)), true);
+    assert.deepStrictEqual(f.fake.calls, []);
+    assert.deepStrictEqual(yield* adapter.listSessions(), []);
+  }).pipe(Effect.provide(testLayer)),
 );
 
 it.effect(
@@ -2918,7 +4367,7 @@ it.effect(
       assert.equal(f.callbacks.length, 2);
       assert.equal(f.liveSubscriptions.size, 0);
       assert.deepStrictEqual(yield* adapter.listSessions(), []);
-      assert.deepStrictEqual(f.prompts, []);
+      assert.deepStrictEqual(f.fake.prompts, []);
     }).pipe(Effect.provide(testLayer)),
 );
 

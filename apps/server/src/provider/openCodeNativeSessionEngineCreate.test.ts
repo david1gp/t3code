@@ -4,12 +4,17 @@ import * as NodeHttp from "node:http";
 import * as NodeNet from "node:net";
 
 import { describe, expect, it, vi } from "vite-plus/test";
+import { isFormInvalidAnswerError, type FormInvalidAnswerError } from "@opencode/client";
+import { Form, Permission, Skill as NativeSkill } from "@opencode/client/effect";
+import * as Schema from "effect/Schema";
 
 import { openCodeNativeSessionEngineCreate } from "./openCodeNativeSessionEngineCreate.ts";
 import type { OpenCodeNativeInventory } from "./openCodeNativeInventorySchema.ts";
+import { openCodeNativeInventorySchema } from "./openCodeNativeInventorySchema.ts";
 
 const directory = "/tmp/native workspace";
 const session = { id: "ses_fixture", location: { directory } };
+const modelInventoryDecode = Schema.decodeSync(openCodeNativeInventorySchema.model);
 
 const fixture = async (
   handler: (request: NodeHttp.IncomingMessage, response: NodeHttp.ServerResponse) => void,
@@ -53,7 +58,21 @@ const frame = (
       "session.usage.updated",
     ].includes(type)
       ? {}
-      : { durable: { aggregateID: data.sessionID ?? "ses_fixture", seq, version: 1 } }),
+      : {
+          durable: {
+            aggregateID: data.sessionID ?? "ses_fixture",
+            seq,
+            version: [
+              "session.tool.success",
+              "session.tool.failed",
+              "session.deleted",
+              "session.forked",
+              "session.instructions.updated",
+            ].includes(type)
+              ? 2
+              : 1,
+          },
+        }),
     data,
   };
   res.write(`data: ${JSON.stringify(event)}\n\n`);
@@ -101,16 +120,33 @@ const workspaceInventory: OpenCodeNativeInventory = {
     { id: "native_skill_98ab", name: "quality", path: "/native/opaque/quality/SKILL.md" },
   ],
 };
+const resolutionSkills: ReadonlyArray<typeof NativeSkill.Info.Encoded> = [
+  { id: "opaque_prefix_27", name: "skill", path: "/native/prefix/SKILL.md", content: "Prefix" },
+  { id: "opaque_colon_93", name: "skill:review", path: "/native/colon/SKILL.md", content: "Colon" },
+  { id: "opaque_close_14", name: "skill)", path: "/native/close/SKILL.md", content: "Close" },
+  { id: "opaque_bracket_35", name: "skill]", path: "/native/bracket/SKILL.md", content: "Bracket" },
+  { id: "opaque_brace_61", name: "skill}", path: "/native/brace/SKILL.md", content: "Brace" },
+  {
+    id: "opaque_terminal_colon_08",
+    name: "skill:",
+    path: "/native/colon-end/SKILL.md",
+    content: "Terminal colon",
+  },
+  { id: "opaque_review_45", name: "review", path: "/native/review/SKILL.md", content: "Review" },
+];
 const sessionFixture = async (
   fetchImpl: typeof fetch = fetch,
   cachedInventory?: OpenCodeNativeInventory,
+  resume = false,
+  offeredSkills?: ReadonlyArray<typeof NativeSkill.Info.Encoded>,
 ) => {
   const capture = captureCreate();
   let stream: NodeHttp.ServerResponse | undefined;
   let logReads = 0;
-  const logRequests: Array<{ after: number; follow: string | null }> = [];
+  const logRequests: Array<{ after: number | null; follow: string | null }> = [];
   const loggedEvents: ReturnType<typeof frame>[] = [];
   let retainLog = true;
+  let logWatermark: number | undefined = 100;
   let heldLog: (() => void) | undefined;
   let logRequested: (() => void) | undefined;
   let pendingPermissions: Record<string, unknown>[] = [];
@@ -122,7 +158,10 @@ const sessionFixture = async (
   let interrupted = true;
   let prompts = 0;
   const promptBodies: Record<string, unknown>[] = [];
+  let heldPrompt: (() => void) | undefined;
+  let promptRequested: (() => void) | undefined;
   const inventoryRequests: string[] = [];
+  const inventoryLookups: string[] = [];
   let rejectedInventory: "command" | "skill" | undefined;
   const commandBodies: Array<{ path: string; body: Record<string, unknown> }> = [];
   let heldCommand: NodeHttp.ServerResponse | undefined;
@@ -141,6 +180,18 @@ const sessionFixture = async (
     }
     if (req.url === "/api/session") {
       send(res, { data: session });
+      return;
+    }
+    if (req.url === "/api/session/ses_fixture") {
+      send(res, { data: session });
+      return;
+    }
+    if (req.url === "/api/session/active") {
+      send(res, { data: {} });
+      return;
+    }
+    if (req.url === "/api/session/ses_fixture/inbox") {
+      send(res, { data: [] });
       return;
     }
     if (req.url === "/api/session/ses_fixture/permission") {
@@ -189,7 +240,10 @@ const sessionFixture = async (
       send(res, {
         location: { directory },
         data:
-          url.pathname === "/api/command" ? workspaceInventory.command : workspaceInventory.skill,
+          url.pathname === "/api/command"
+            ? workspaceInventory.command
+            : (offeredSkills ??
+              workspaceInventory.skill.map((skill) => ({ ...skill, content: "Fixture skill" }))),
       });
       return;
     }
@@ -205,18 +259,28 @@ const sessionFixture = async (
     if (req.url?.includes("/log")) {
       logReads++;
       const after = Number(url.searchParams.get("after") ?? -1);
-      logRequests.push({ after, follow: url.searchParams.get("follow") });
+      logRequests.push({
+        after: url.searchParams.has("after") ? after : null,
+        follow: url.searchParams.get("follow"),
+      });
+      if (after < 0 && url.searchParams.has("after")) {
+        res.writeHead(400).end();
+        return;
+      }
       const respond = () => {
         const parentEvents = loggedEvents.filter(
           (event) => event.durable?.aggregateID === session.id,
         );
-        const seq = Math.max(100, ...parentEvents.map((event) => event.durable!.seq));
+        const seq = Math.max(
+          logWatermark ?? -1,
+          ...parentEvents.map((event) => event.durable!.seq),
+        );
         const prefix = retainLog
           ? parentEvents.filter((event) => event.durable!.seq > after && event.durable!.seq <= seq)
           : [];
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.end(
-          [...prefix, { type: "log.synced", aggregateID: session.id, seq }]
+          [...prefix, { type: "log.synced", aggregateID: session.id, ...(seq >= 0 ? { seq } : {}) }]
             .map((event) => `data: ${JSON.stringify(event)}\n\n`)
             .join(""),
         );
@@ -234,7 +298,26 @@ const sessionFixture = async (
       prompts++;
       void bodyRead(req).then((body) => {
         promptBodies.push(body);
-        send(res, { data: { id: body.id, sessionID: session.id, type: "user" } });
+        const respond = () =>
+          send(res, { data: { id: body.id, sessionID: session.id, type: "user" } });
+        if (promptRequested) {
+          heldPrompt = respond;
+          promptRequested();
+          promptRequested = undefined;
+          return;
+        }
+        if (prompts > 1) {
+          const seq = Math.max(0, ...loggedEvents.map((event) => event.durable?.seq ?? 0)) + 1;
+          const delivered = frame(
+            stream!,
+            "session.inbox.delivered",
+            { sessionID: session.id, inboxID: body.id },
+            undefined,
+            seq,
+          );
+          loggedEvents.push(delivered);
+        }
+        respond();
       });
       return;
     }
@@ -256,10 +339,19 @@ const sessionFixture = async (
   const engine = openCodeNativeSessionEngineCreate({
     url: server.url,
     fetch: fetchImpl,
-    ...(cachedInventory ? { inventory: () => cachedInventory } : {}),
+    ...(cachedInventory
+      ? {
+          inventory: (cwd: string) => {
+            inventoryLookups.push(cwd);
+            return cachedInventory;
+          },
+        }
+      : {}),
     onEvent: capture.receive,
   });
-  expect((await engine.start({ directory })).success).toBe(true);
+  expect(
+    (await engine.start({ directory, ...(resume ? { resumeSessionId: session.id } : {}) })).success,
+  ).toBe(true);
   let marker = 1000;
   const write = (type: string, data: Record<string, unknown> = {}, id?: string, seq = 1) => {
     const event = frame(stream!, type, { sessionID: session.id, ...data }, id, seq);
@@ -281,6 +373,9 @@ const sessionFixture = async (
     setLogRetention: (value: boolean) => {
       retainLog = value;
     },
+    setLogWatermark: (value: number | undefined) => {
+      logWatermark = value;
+    },
     holdNextLog: () => {
       const requested = new Promise<void>((resolve) => {
         logRequested = resolve;
@@ -296,7 +391,21 @@ const sessionFixture = async (
     },
     promptCount: () => prompts,
     promptBodies,
+    holdNextPrompt: () => {
+      const requested = new Promise<void>((resolve) => {
+        promptRequested = resolve;
+      });
+      return {
+        requested,
+        release: () => {
+          if (!heldPrompt) throw new Error("No prompt request to release");
+          heldPrompt();
+          heldPrompt = undefined;
+        },
+      };
+    },
     inventoryRequests,
+    inventoryLookups,
     setInventoryFailure: (endpoint?: "command" | "skill") => {
       rejectedInventory = endpoint;
     },
@@ -377,9 +486,110 @@ const sessionFixture = async (
   };
 };
 
+it("translates official compaction attempt provenance and keeps internal usage records session-scoped across log/feed replay", async () => {
+  const test = await sessionFixture(fetch, workspaceInventory);
+  try {
+    test.setLogWatermark(undefined);
+    const turnID = await test.admit();
+    test.write("session.execution.started", {}, "compaction-execution", 1);
+    test.write(
+      "session.compaction.started",
+      { reason: "manual", recent: "recent", inputID: "msg_manual" },
+      "compaction-start",
+      2,
+    );
+    test.write(
+      "session.compaction.failed",
+      {
+        reason: "manual",
+        inputID: "msg_manual",
+        error: { type: "api", message: "charged" },
+        tokens: usage.tokens,
+      },
+      "compaction-failure",
+      3,
+    );
+    test.write(
+      "session.compaction.started",
+      { reason: "auto", recent: "recent" },
+      "compaction-auto-start",
+      4,
+    );
+    test.write(
+      "session.compaction.ended",
+      { reason: "auto", text: "summary", recent: "recent", ...usage },
+      "compaction-success",
+      5,
+    );
+    await test.drain();
+    // A command completion prefix discovers replay-only usage. Those records are
+    // not new compaction attempts and have no turn/activation ownership.
+    const command = test.holdNextCommand();
+    const sending = test.engine.send("/review");
+    await command.requested;
+    test.writeLog(
+      "session.usage.recorded",
+      { source: "compaction", ...usage },
+      "compaction-record",
+      6,
+    );
+    test.writeLog("session.usage.recorded", { source: "title", ...usage }, "title-record", 7);
+    command.release();
+    expect((await sending).success).toBe(true);
+    test.replayLogged();
+    await test.drain();
+    expect(test.events.filter((event) => event.type.startsWith("compaction."))).toMatchObject([
+      {
+        type: "compaction.started",
+        turnID,
+        key: "evt_compaction-start",
+        eventID: "evt_compaction-start",
+        inputID: "msg_manual",
+        durable: { aggregateID: session.id, seq: 2, version: 1 },
+      },
+      {
+        type: "compaction.failed",
+        turnID,
+        key: "evt_compaction-start",
+        eventID: "evt_compaction-failure",
+        inputID: "msg_manual",
+        compaction: { tokens: usage.tokens, error: { message: "charged" } },
+      },
+      { type: "compaction.started", turnID, key: "evt_compaction-auto-start" },
+      {
+        type: "compaction.completed",
+        turnID,
+        key: "evt_compaction-auto-start",
+        eventID: "evt_compaction-success",
+        compaction: usage,
+      },
+    ]);
+    expect(test.events.filter((event) => event.type === "usage.recorded")).toEqual([
+      {
+        type: "usage.recorded",
+        eventID: "evt_compaction-record",
+        durable: { aggregateID: session.id, seq: 6, version: 1 },
+        scope: "session",
+        usage: { sessionID: session.id, source: "compaction", ...usage },
+      },
+      {
+        type: "usage.recorded",
+        eventID: "evt_title-record",
+        durable: { aggregateID: session.id, seq: 7, version: 1 },
+        scope: "session",
+        usage: { sessionID: session.id, source: "title", ...usage },
+      },
+    ]);
+  } finally {
+    await test.close();
+  }
+});
+
 const stalledFetch = (stalledPath: string) => {
   const nativeFetch = globalThis.fetch;
   let stalled = false;
+  let cancelled = false;
+  let requests = 0;
   let requestReceived!: () => void;
   const requested = new Promise<void>((resolve) => {
     requestReceived = resolve;
@@ -390,11 +600,17 @@ const stalledFetch = (stalledPath: string) => {
   ) => {
     const url = new URL(input instanceof Request ? input.url : input.toString());
     if (!stalled || url.pathname !== stalledPath) return nativeFetch(input, init);
+    requests++;
     requestReceived();
     return await new Promise<Response>((_resolve, reject) => {
       const signal = init?.signal;
       if (!signal) return;
-      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      const cancel = () => {
+        cancelled = true;
+        reject(signal.reason);
+      };
+      signal.addEventListener("abort", cancel, { once: true });
+      if (signal.aborted) cancel();
     });
   }) as typeof globalThis.fetch;
   return {
@@ -402,8 +618,299 @@ const stalledFetch = (stalledPath: string) => {
     requested,
     stall: () => (stalled = true),
     resume: () => (stalled = false),
+    cancelled: () => cancelled,
+    requests: () => requests,
   };
 };
+
+// A buffered response can finish decoding after cancellation. Deliberately allow that
+// callback to complete so the engine's request-incarnation fencing is exercised.
+const replyTransportCreate = () => {
+  const held = new Map<string, (response: Response) => void>();
+  const waiting = new Map<string, () => void>();
+  const requests: string[] = [];
+  const fetchImpl: typeof fetch = async (request, init) => {
+    const path = new URL(request instanceof Request ? request.url : String(request)).pathname;
+    if (path.endsWith("/reply") || (init?.method === "DELETE" && path.includes("/form/")))
+      requests.push(path);
+    const requested = waiting.get(path);
+    if (!requested) return fetch(request, init);
+    waiting.delete(path);
+    return new Promise<Response>((resolve) => {
+      held.set(path, resolve);
+      requested();
+    });
+  };
+  return {
+    fetch: fetchImpl,
+    requests,
+    holdNext: (path: string) => {
+      const requested = new Promise<void>((resolve) => waiting.set(path, resolve));
+      return {
+        requested,
+        release: (status = 204, body?: unknown) => {
+          const resolve = held.get(path);
+          if (!resolve) throw new Error("No reply response to release");
+          held.delete(path);
+          resolve(
+            new Response(body === undefined ? null : JSON.stringify(body), {
+              status,
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        },
+      };
+    },
+  };
+};
+const replyFormFixture = Schema.decodeSync(Schema.toEncoded(Form.Info))({
+  id: "frm_reply",
+  sessionID: session.id,
+  title: "Choose",
+  fields: [{ key: "choice", type: "string", options: [{ label: "Yes", value: "yes" }] }],
+});
+const replyPermissionFixture = Schema.decodeSync(Schema.toEncoded(Permission.Request))({
+  id: "per_reply",
+  sessionID: session.id,
+  action: "bash",
+  resources: ["pwd"],
+});
+const invalidAnswer = {
+  _tag: "FormInvalidAnswerError",
+  id: replyFormFixture.id,
+  message: "choice must be one of: yes",
+} satisfies FormInvalidAnswerError;
+const replyCases = [
+  {
+    kind: "permission reply",
+    path: `/api/session/${session.id}/permission/${replyPermissionFixture.id}/reply`,
+    operation: "permission.reply",
+    reply: (engine: ReturnType<typeof openCodeNativeSessionEngineCreate>) =>
+      engine.replyPermission(replyPermissionFixture.id, "once"),
+  },
+  {
+    kind: "form reply",
+    path: `/api/session/${session.id}/form/${replyFormFixture.id}/reply`,
+    operation: "session.form.reply",
+    reply: (engine: ReturnType<typeof openCodeNativeSessionEngineCreate>) =>
+      engine.replyForm(replyFormFixture.id, { choice: "yes" }),
+  },
+  {
+    kind: "form cancel",
+    path: `/api/session/${session.id}/form/${replyFormFixture.id}`,
+    operation: "session.form.reply",
+    reply: (engine: ReturnType<typeof openCodeNativeSessionEngineCreate>) =>
+      engine.replyForm(replyFormFixture.id, undefined),
+  },
+] as const;
+const replyRequestsOpen = async (test: Awaited<ReturnType<typeof sessionFixture>>) => {
+  await test.admit();
+  test.setPending([replyPermissionFixture], [replyFormFixture]);
+  test.write("permission.asked", replyPermissionFixture);
+  test.write("form.created", { form: replyFormFixture });
+  await test.wait((event) => event.type === "form.created");
+};
+
+describe("native permission/form reply settlement", () => {
+  it.each(replyCases)(
+    "settles $kind once when the native terminal precedes HTTP success",
+    async (replyCase) => {
+      const transport = replyTransportCreate();
+      const test = await sessionFixture(transport.fetch);
+      try {
+        await replyRequestsOpen(test);
+        const response = transport.holdNext(replyCase.path);
+        const replying = replyCase.reply(test.engine);
+        await response.requested;
+        expect((await replyCase.reply(test.engine)).success).toBe(false);
+        if (replyCase.kind === "permission reply")
+          test.write("permission.replied", { requestID: replyPermissionFixture.id, reply: "once" });
+        else
+          test.write(replyCase.kind === "form reply" ? "form.replied" : "form.cancelled", {
+            id: replyFormFixture.id,
+            ...(replyCase.kind === "form reply" ? { answer: { choice: "yes" } } : {}),
+          });
+        await test.drain();
+        response.release();
+        expect(await replying).toEqual({ success: true, data: undefined });
+        expect((await replyCase.reply(test.engine)).success).toBe(false);
+        expect(transport.requests).toHaveLength(1);
+        expect(
+          test.events.filter(
+            (event) => event.type === "permission.replied" || event.type === "form.resolved",
+          ),
+        ).toHaveLength(1);
+      } finally {
+        await test.close();
+      }
+    },
+  );
+
+  it.each(["correct", "cancel"] as const)(
+    "unlocks the still-current form after pinned FormInvalidAnswerError to %s",
+    async (action) => {
+      const transport = replyTransportCreate();
+      const test = await sessionFixture(transport.fetch);
+      try {
+        await replyRequestsOpen(test);
+        expect(isFormInvalidAnswerError(invalidAnswer)).toBe(true);
+        const response = transport.holdNext(replyCases[1].path);
+        const replying = test.engine.replyForm(replyFormFixture.id, { choice: "invalid" });
+        await response.requested;
+        expect((await test.engine.replyForm(replyFormFixture.id, undefined)).success).toBe(false);
+        response.release(400, invalidAnswer);
+        expect(await replying).toMatchObject({
+          success: false,
+          rejected: true,
+          error: { operation: "session.form.reply", detail: invalidAnswer.message },
+        });
+        expect(test.events.filter((event) => event.type === "form.resolved")).toEqual([]);
+        expect(
+          await test.engine.replyForm(
+            replyFormFixture.id,
+            action === "correct" ? { choice: "yes" } : undefined,
+          ),
+        ).toEqual({ success: true, data: undefined });
+        test.write(action === "correct" ? "form.replied" : "form.cancelled", {
+          id: replyFormFixture.id,
+          ...(action === "correct" ? { answer: { choice: "yes" } } : {}),
+        });
+        await test.drain();
+        expect(test.events.filter((event) => event.type === "form.resolved")).toMatchObject([
+          { formID: replyFormFixture.id, answer: action === "correct" ? { choice: "yes" } : {} },
+        ]);
+        expect(transport.requests).toHaveLength(2);
+      } finally {
+        await test.close();
+      }
+    },
+  );
+
+  it.each([
+    { status: 503, body: undefined, reason: "ambiguous transport" },
+    { status: 400, body: { ...invalidAnswer, id: "frm_foreign" }, reason: "foreign rejection" },
+  ])(
+    "keeps a form locked after $reason without unsafe duplicate mutation",
+    async ({ status, body }) => {
+      const transport = replyTransportCreate();
+      const test = await sessionFixture(transport.fetch);
+      try {
+        await replyRequestsOpen(test);
+        const response = transport.holdNext(replyCases[1].path);
+        const replying = replyCases[1].reply(test.engine);
+        await response.requested;
+        response.release(status, body);
+        const result = await replying;
+        expect(result.success).toBe(false);
+        expect(result).not.toHaveProperty("rejected");
+        expect((await replyCases[1].reply(test.engine)).success).toBe(false);
+        expect((await replyCases[2].reply(test.engine)).success).toBe(false);
+        expect(transport.requests).toHaveLength(1);
+        expect(test.events.filter((event) => event.type === "form.resolved")).toEqual([]);
+      } finally {
+        await test.close();
+      }
+    },
+  );
+
+  it.each(["rejection", "success"] as const)(
+    "fences a stale form %s callback from a replaced still-replying form",
+    async (outcome) => {
+      const transport = replyTransportCreate();
+      const test = await sessionFixture(transport.fetch);
+      try {
+        await replyRequestsOpen(test);
+        const response = transport.holdNext(replyCases[1].path);
+        const outgoing = replyCases[1].reply(test.engine);
+        await response.requested;
+        // Keep the buffered response callback, but replace the engine's request incarnation.
+        await test.engine.stop({ interrupt: false });
+        expect((await test.engine.start({ directory })).success).toBe(true);
+        await test.admit();
+        test.write("form.created", { form: replyFormFixture });
+        await test.drain();
+        const replacement = transport.holdNext(replyCases[1].path);
+        // Release the old response and start the new reply in the same stack. The new
+        // request is already replying before the old response can finish decoding.
+        response.release(
+          outcome === "rejection" ? 400 : 204,
+          outcome === "rejection" ? invalidAnswer : undefined,
+        );
+        const current = replyCases[1].reply(test.engine);
+        await replacement.requested;
+        expect((await outgoing).success).toBe(false);
+        expect((await replyCases[1].reply(test.engine)).success).toBe(false);
+        expect(test.events.filter((event) => event.type === "form.resolved")).toEqual([]);
+        replacement.release();
+        expect(await current).toEqual({ success: true, data: undefined });
+        expect(transport.requests).toHaveLength(2);
+        expect(test.events.filter((event) => event.type === "form.resolved")).toHaveLength(1);
+      } finally {
+        await test.close();
+      }
+    },
+  );
+
+  for (const action of ["deadline", "local stop", "stream loss", "explicit stop"] as const) {
+    it.each(replyCases)(
+      "bounds $kind on " + action + " and never duplicates an uncertain mutation",
+      async (replyCase) => {
+        const stalled = stalledFetch(replyCase.path);
+        const interrupt = stalledFetch(`/api/session/${session.id}/interrupt`);
+        const test = await sessionFixture((request, init) => {
+          const path = new URL(request instanceof Request ? request.url : String(request)).pathname;
+          return path.endsWith("/interrupt")
+            ? interrupt.fetch(request, init)
+            : stalled.fetch(request, init);
+        });
+        try {
+          await replyRequestsOpen(test);
+          stalled.stall();
+          if (action === "deadline" || action === "explicit stop") vi.useFakeTimers();
+          const replying = replyCase.reply(test.engine);
+          await stalled.requested;
+          let stopping: ReturnType<typeof test.engine.stop> | undefined;
+          if (action === "deadline") {
+            await vi.advanceTimersByTimeAsync(15_000);
+          } else if (action === "local stop") stopping = test.engine.stop({ interrupt: false });
+          else if (action === "stream loss") {
+            test.disconnect();
+            await test.wait((event) => event.type === "stream.lost");
+          } else {
+            interrupt.stall();
+            stopping = test.engine.stop();
+            await interrupt.requested;
+          }
+          expect(await replying).toMatchObject({
+            success: false,
+            error: { operation: replyCase.operation },
+          });
+          expect(stalled.cancelled()).toBe(true);
+          expect((await replyCase.reply(test.engine)).success).toBe(false);
+          expect(stalled.requests()).toBe(1);
+          expect(
+            test.events.filter(
+              (event) => event.type === "form.resolved" || event.type === "permission.replied",
+            ),
+          ).toEqual([]);
+          if (action === "explicit stop") {
+            expect(interrupt.cancelled()).toBe(false);
+            await vi.advanceTimersByTimeAsync(15_000);
+            expect(await stopping).toMatchObject({
+              success: false,
+              error: { operation: "session.interrupt" },
+            });
+            expect(interrupt.cancelled()).toBe(true);
+          } else if (stopping) expect(await stopping).toEqual({ success: true, data: undefined });
+        } finally {
+          vi.useRealTimers();
+          interrupt.resume();
+          await test.close();
+        }
+      },
+    );
+  }
+});
 
 const stepStart = (assistantMessageID: string) => ({
   assistantMessageID,
@@ -421,6 +928,7 @@ const stepEnd = (assistantMessageID: string, finish = "stop") => ({
 // processing the preceding batch. This makes cross-transport race tests deterministic.
 const commandTransportReceipts = () => {
   let commandResponseReceived!: () => void;
+  let promptResponseReceived!: () => void;
   let eventBatchConsumed!: () => void;
   let completionLogReceived!: () => void;
   let logReads = 0;
@@ -437,6 +945,7 @@ const commandTransportReceipts = () => {
     const response = await fetch(request, init);
     const path = new URL(request instanceof Request ? request.url : String(request)).pathname;
     if (path.endsWith("/command")) commandResponseReceived();
+    if (path.endsWith("/prompt")) promptResponseReceived?.();
     if (path.endsWith("/log") && ++logReads === 2) completionLogReceived();
     if (path !== "/api/event") return response;
     const reader = response.body!.getReader();
@@ -464,7 +973,16 @@ const commandTransportReceipts = () => {
       { status: response.status, headers: response.headers },
     );
   };
-  return { fetch: fetchImpl, commandResponse, eventBatch, completionLogResponse };
+  return {
+    fetch: fetchImpl,
+    commandResponse,
+    nextPromptResponse: () =>
+      new Promise<void>((resolve) => {
+        promptResponseReceived = resolve;
+      }),
+    eventBatch,
+    completionLogResponse,
+  };
 };
 const commandPromptWrite = (
   test: Awaited<ReturnType<typeof sessionFixture>>,
@@ -487,9 +1005,12 @@ const commandTurnWrite = (
   test: Awaited<ReturnType<typeof sessionFixture>>,
   stale = false,
   logOnly = false,
+  coalesced = false,
 ) => {
   const write = logOnly ? test.writeLog : test.write;
-  write("session.execution.started", {}, undefined, 102);
+  if (coalesced)
+    write("session.inbox.delivered", { inboxID: "msg_native_command" }, undefined, 102);
+  else write("session.execution.started", {}, undefined, 102);
   if (stale) {
     write("session.execution.succeeded", {}, undefined, 98);
     write("session.step.started", stepStart("msg_stale_answer"), undefined, 99);
@@ -535,6 +1056,214 @@ const commandTurnExpect = (test: Awaited<ReturnType<typeof sessionFixture>>, tur
 };
 
 describe("native command and skill HTTP admission", () => {
+  it("admits the first resumed command without a selection SSE race or a negative cursor", async () => {
+    const test = await sessionFixture(fetch, workspaceInventory, true);
+    try {
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review resumed");
+      await command.requested;
+      commandPromptWrite(test, "msg_native_command", 101, session.id, true);
+      commandTurnWrite(test, false, true);
+      command.release();
+      expect(await sending).toEqual({ success: true, data: { turnID: "msg_native_command" } });
+      expect(test.logRequests).toEqual([
+        { after: null, follow: "false" },
+        { after: 100, follow: "false" },
+      ]);
+      commandTurnExpect(test, "msg_native_command");
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("omits both unknown command cursors when an empty log marker has no sequence", async () => {
+    const test = await sessionFixture();
+    try {
+      test.setLogWatermark(undefined);
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review empty log");
+      await command.requested;
+      command.release();
+      expect((await sending).success).toBe(true);
+      expect(test.logRequests).toEqual([
+        { after: null, follow: "false" },
+        { after: null, follow: "false" },
+      ]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it.each(["initial", "completion"] as const)(
+    "bounds a stalled %s command fence with uncertainty and no replay",
+    async (phase) => {
+      const stalled = stalledFetch("/api/experimental/session/ses_fixture/log");
+      const test = await sessionFixture(stalled.fetch, workspaceInventory);
+      try {
+        if (phase === "initial") stalled.stall();
+        const command = test.holdNextCommand();
+        vi.useFakeTimers();
+        const sending = test.engine.send("/review stalled fence");
+        if (phase === "completion") {
+          await command.requested;
+          stalled.stall();
+          command.release();
+        }
+        await stalled.requested;
+        await vi.advanceTimersByTimeAsync(15_000);
+        const result = await sending;
+        expect(result).toMatchObject({
+          success: false,
+          error: { operation: "session.command", detail: expect.stringContaining("uncertain") },
+        });
+        expect(result).not.toHaveProperty("rejected");
+        expect(stalled.cancelled()).toBe(true);
+        expect(await test.engine.send("/review do not replay")).toMatchObject({
+          success: false,
+          error: { detail: expect.stringContaining("uncertain") },
+        });
+        expect((await test.engine.recover()).success).toBe(false);
+        expect(test.commandBodies).toHaveLength(phase === "initial" ? 0 : 1);
+        expect(test.promptCount()).toBe(0);
+        expect(test.events.some((event) => event.type.startsWith("turn."))).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        await test.close();
+      }
+    },
+  );
+
+  it.each([
+    { phase: "initial", action: "stop" },
+    { phase: "initial", action: "loss" },
+    { phase: "completion", action: "stop" },
+    { phase: "completion", action: "loss" },
+  ] as const)(
+    "cancels a stalled $phase command fence on $action without replay",
+    async ({ phase, action }) => {
+      const stalled = stalledFetch("/api/experimental/session/ses_fixture/log");
+      const test = await sessionFixture(stalled.fetch, workspaceInventory);
+      try {
+        if (phase === "initial") stalled.stall();
+        const command = test.holdNextCommand();
+        const sending = test.engine.send("/review cancelled fence");
+        if (phase === "completion") {
+          await command.requested;
+          stalled.stall();
+          command.release();
+        }
+        await stalled.requested;
+        if (action === "stop") await test.engine.stop({ interrupt: false });
+        else {
+          test.disconnect();
+          await test.wait((event) => event.type === "stream.lost");
+        }
+        const result = await sending;
+        expect(result).toMatchObject({ success: false, error: { operation: "session.command" } });
+        expect(result).not.toHaveProperty("rejected");
+        expect(stalled.cancelled()).toBe(true);
+        expect((await test.engine.send("do not replay")).success).toBe(false);
+        expect((await test.engine.recover()).success).toBe(false);
+        expect(test.commandBodies).toHaveLength(phase === "initial" ? 0 : 1);
+        expect(test.promptCount()).toBe(0);
+        expect(test.events.some((event) => event.type.startsWith("turn."))).toBe(false);
+      } finally {
+        await test.close();
+      }
+    },
+  );
+
+  it.each(["retained gap", "marker beyond last row", "public gap", "unretained prefix"] as const)(
+    "bounds command coverage with a legitimate %s without fabricating completion or replay",
+    async (gap) => {
+      const receipts = commandTransportReceipts();
+      const test = await sessionFixture(receipts.fetch);
+      try {
+        const command = test.holdNextCommand();
+        const sending = test.engine.send("/review incomplete coverage");
+        await command.requested;
+        if (gap === "public gap" || gap === "unretained prefix") test.setLogRetention(false);
+        commandPromptWrite(test, "msg_native_command", 101, session.id, true);
+        if (gap !== "unretained prefix")
+          test.writeLog(
+            "session.metadata.updated",
+            { metadata: {} },
+            undefined,
+            gap === "retained gap" ? 103 : 102,
+          );
+        if (gap === "marker beyond last row") test.setLogWatermark(104);
+        vi.useFakeTimers();
+        command.release();
+        await receipts.completionLogResponse;
+        if (gap === "public gap") {
+          commandPromptWrite(test);
+          test.write("session.metadata.updated", { metadata: {} }, undefined, 104);
+        }
+        test.write("session.usage.updated", { ...usage, cost: 9000 }, "command_receipt_prefix");
+        await receipts.eventBatch;
+        expect(test.events.map((event) => event.type)).toEqual(["session.ready"]);
+        await vi.advanceTimersByTimeAsync(15_000);
+        const result = await sending;
+        expect(result).toMatchObject({
+          success: false,
+          error: { operation: "session.command", detail: expect.stringContaining("uncertain") },
+        });
+        expect(result).not.toHaveProperty("rejected");
+        // The admission lock is released, but uncertainty (not "still being admitted") blocks sends.
+        expect(await test.engine.send("do not replay")).toMatchObject({
+          success: false,
+          error: { detail: "Session already has pending or uncertain work." },
+        });
+        test.replayLogged();
+        expect((await test.engine.recover()).success).toBe(false);
+        expect(test.commandBodies).toHaveLength(1);
+        expect(test.promptCount()).toBe(0);
+        expect(test.events.some((event) => event.type.startsWith("turn."))).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        await test.close();
+      }
+    },
+  );
+
+  it("cancels command admission before a stalled explicit-stop interrupt settles", async () => {
+    const log = stalledFetch("/api/experimental/session/ses_fixture/log");
+    const interrupt = stalledFetch("/api/session/ses_fixture/interrupt");
+    const fetchImpl: typeof fetch = (request, init) => {
+      const path = new URL(request instanceof Request ? request.url : String(request)).pathname;
+      return path.endsWith("/interrupt")
+        ? interrupt.fetch(request, init)
+        : log.fetch(request, init);
+    };
+    const test = await sessionFixture(fetchImpl, workspaceInventory);
+    try {
+      log.stall();
+      interrupt.stall();
+      vi.useFakeTimers();
+      const sending = test.engine.send("/review stop");
+      await log.requested;
+      const stopping = test.engine.stop();
+      await interrupt.requested;
+      expect(await sending).toMatchObject({
+        success: false,
+        error: { operation: "session.command" },
+      });
+      expect(log.cancelled()).toBe(true);
+      expect(interrupt.cancelled()).toBe(false);
+      expect(test.commandBodies).toHaveLength(0);
+      expect(test.events.some((event) => event.type.startsWith("turn."))).toBe(false);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(await stopping).toMatchObject({
+        success: false,
+        error: { operation: "session.interrupt" },
+      });
+      expect(interrupt.cancelled()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      await test.close();
+    }
+  });
+
   it.each([
     { inventory: "command", text: "/review rejected" },
     { inventory: "skill", text: "$review rejected" },
@@ -659,7 +1388,7 @@ describe("native command and skill HTTP admission", () => {
       commandTurnExpect(test, "msg_native_command");
       expect(test.events.filter((event) => event.type === "text.completed")).toHaveLength(1);
       expect(test.logRequests).toEqual([
-        { after: -1, follow: "false" },
+        { after: null, follow: "false" },
         { after: 100, follow: "false" },
       ]);
       expect(
@@ -1005,8 +1734,16 @@ describe("native command and skill HTTP admission", () => {
           text,
           files: [{ uri: "file:///tmp/context.txt" }],
           skills: [
-            { id: "native_skill_7f42", mention: { start: 0, end: 7, text: "$review" } },
-            { id: "native_skill_98ab", mention: { start: 16, end: 24, text: "$quality" } },
+            {
+              id: "native_skill_7f42",
+              name: "review",
+              mention: { start: 0, end: 7, text: "$review" },
+            },
+            {
+              id: "native_skill_98ab",
+              name: "quality",
+              mention: { start: 16, end: 24, text: "$quality" },
+            },
           ],
         },
       ]);
@@ -1025,6 +1762,153 @@ describe("native command and skill HTTP admission", () => {
     }
   });
 
+  it.each([
+    { name: "skill:review", id: "opaque_colon_93" },
+    { name: "skill)", id: "opaque_close_14" },
+    { name: "skill]", id: "opaque_bracket_35" },
+    { name: "skill}", id: "opaque_brace_61" },
+    { name: "skill:", id: "opaque_terminal_colon_08" },
+  ])("submits exact offered $name at EOF rather than its skill prefix", async ({ name, id }) => {
+    const test = await sessionFixture(fetch, undefined, false, resolutionSkills);
+    try {
+      const text = `$${name}`;
+      const sending = await test.engine.send(text);
+      expect(sending.success).toBe(true);
+      if (!sending.success) throw new Error("Skill admission failed");
+      expect(test.promptBodies).toEqual([
+        {
+          id: sending.data.turnID,
+          text,
+          skills: [{ id, name, mention: { start: 0, end: text.length, text } }],
+        },
+      ]);
+      expect(test.inventoryRequests).toHaveLength(1);
+      expect(
+        new URL(test.inventoryRequests[0]!, "http://fixture").searchParams.get(
+          "location[directory]",
+        ),
+      ).toBe(directory);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("submits raw whitespace and JS skill offsets after astral text with delimiters outside exact mentions", async () => {
+    const test = await sessionFixture(fetch, undefined, false, resolutionSkills);
+    try {
+      const text = " \t😀 ($skill:review), [$skill]], {$skill}}! 𑿝skill)\n ";
+      const sending = await test.engine.send(text);
+      expect(sending.success).toBe(true);
+      if (!sending.success) throw new Error("Skill admission failed");
+      const expected = [
+        {
+          id: "opaque_colon_93",
+          name: "skill:review",
+          mention: { start: 6, end: 19, text: "$skill:review" },
+        },
+        {
+          id: "opaque_bracket_35",
+          name: "skill]",
+          mention: { start: 23, end: 30, text: "$skill]" },
+        },
+        { id: "opaque_brace_61", name: "skill}", mention: { start: 34, end: 41, text: "$skill}" } },
+        { id: "opaque_close_14", name: "skill)", mention: { start: 44, end: 52, text: "𑿝skill)" } },
+      ];
+      expect(test.promptBodies).toEqual([{ id: sending.data.turnID, text, skills: expected }]);
+      for (const skill of expected) {
+        expect(text.slice(skill.mention.start, skill.mention.end)).toBe(skill.mention.text);
+      }
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("keeps unknown slash and skill suffixes literal without attaching an offered shorter prefix", async () => {
+    const test = await sessionFixture(fetch, undefined, false, resolutionSkills);
+    try {
+      const text =
+        '/skill /unknown $skill:unknown $skill)extra $skill:review)extra $skills $skill/path prefix$skill \\$skill "$skill" `$skill` $unknown';
+      const sending = await test.engine.send(text);
+      expect(sending.success).toBe(true);
+      if (!sending.success) throw new Error("Literal admission failed");
+      expect(test.promptBodies).toEqual([{ id: sending.data.turnID, text }]);
+      expect(test.commandBodies).toEqual([]);
+      expect(test.logReads()).toBe(0);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("resolves command skill mentions against actual native command text and retains caller attachments", async () => {
+    const test = await sessionFixture(fetch, { ...workspaceInventory, skill: resolutionSkills });
+    try {
+      const command = test.holdNextCommand();
+      const skills = [{ id: "caller_native_id", name: "caller", text: "Caller text" }];
+      const sending = test.engine.send(" \t/review \t😀 ($review), $skill:review  \n", { skills });
+      await command.requested;
+      command.release();
+      expect((await sending).success).toBe(true);
+      const text = "😀 ($review), $skill:review  \n";
+      expect(test.commandBodies[0]?.body).toEqual({
+        name: "review",
+        text,
+        skills: [
+          ...skills,
+          {
+            id: "opaque_review_45",
+            name: "review",
+            mention: { start: 4, end: 11, text: "$review" },
+          },
+          {
+            id: "opaque_colon_93",
+            name: "skill:review",
+            mention: { start: 14, end: 27, text: "$skill:review" },
+          },
+        ],
+      });
+      expect(test.promptBodies).toEqual([]);
+      expect(test.inventoryRequests).toEqual([]);
+      expect(test.inventoryLookups).toEqual([directory]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("reuses each engine instance cwd catalog without mixing identical skill names across instances", async () => {
+    for (const id of ["native_instance_A", "native_instance_B"]) {
+      const test = await sessionFixture(fetch, {
+        ...workspaceInventory,
+        skill: [{ id, name: "review", path: `/native/${id}/SKILL.md`, content: id }],
+      });
+      try {
+        const command = test.holdNextCommand();
+        const sending = test.engine.send("/review $review");
+        await command.requested;
+        command.release();
+        expect((await sending).success).toBe(true);
+        const next = await test.engine.send(" $review ");
+        expect(next.success).toBe(true);
+        if (!next.success) throw new Error("Second cached admission failed");
+        expect(test.commandBodies[0]?.body).toEqual({
+          name: "review",
+          text: "$review",
+          skills: [{ id, name: "review", mention: { start: 0, end: 7, text: "$review" } }],
+        });
+        expect(test.promptBodies).toEqual([
+          {
+            id: next.data.turnID,
+            text: " $review ",
+            skills: [{ id, name: "review", mention: { start: 1, end: 8, text: "$review" } }],
+          },
+        ]);
+        expect(test.inventoryRequests).toEqual([]);
+        expect(test.inventoryLookups).toEqual([directory, directory]);
+      } finally {
+        await test.close();
+      }
+    }
+  });
+
   it("reuses cached raw inventory and keeps command and skill namespaces distinct", async () => {
     const test = await sessionFixture(fetch, workspaceInventory);
     try {
@@ -1040,8 +1924,16 @@ describe("native command and skill HTTP admission", () => {
         name: "review",
         text: "$review inspect $quality and $MISSING",
         skills: [
-          { id: "native_skill_7f42", mention: { start: 0, end: 7, text: "$review" } },
-          { id: "native_skill_98ab", mention: { start: 16, end: 24, text: "$quality" } },
+          {
+            id: "native_skill_7f42",
+            name: "review",
+            mention: { start: 0, end: 7, text: "$review" },
+          },
+          {
+            id: "native_skill_98ab",
+            name: "quality",
+            mention: { start: 16, end: 24, text: "$quality" },
+          },
         ],
       });
       expect(test.inventoryRequests).toEqual([]);
@@ -1061,7 +1953,7 @@ describe("native command and skill HTTP admission", () => {
       const sending = test.engine.send("/review while running");
       await command.requested;
       commandPromptWrite(test);
-      commandTurnWrite(test);
+      commandTurnWrite(test, false, false, true);
       command.release();
       expect(await sending).toEqual({ success: true, data: { turnID: originalID } });
       await test.wait((event) => event.type === "turn.completed");
@@ -1111,6 +2003,415 @@ describe("native command and skill HTTP admission", () => {
 });
 
 describe("native v2.0.18 session slice", () => {
+  it.each([
+    {
+      transport: "prompt",
+      receipt: "before boundaries",
+      enqueue: "before terminal",
+      terminal: "succeeded",
+    },
+    {
+      transport: "prompt",
+      receipt: "after boundaries",
+      enqueue: "before terminal",
+      terminal: "failed",
+    },
+    {
+      transport: "prompt",
+      receipt: "after boundaries",
+      enqueue: "after terminal",
+      terminal: "interrupted",
+    },
+    {
+      transport: "command",
+      receipt: "before boundaries",
+      enqueue: "before terminal",
+      terminal: "interrupted",
+    },
+    {
+      transport: "command",
+      receipt: "after boundaries",
+      enqueue: "before terminal",
+      terminal: "succeeded",
+    },
+    {
+      transport: "command",
+      receipt: "after boundaries",
+      enqueue: "after terminal",
+      terminal: "failed",
+    },
+  ] as const)(
+    "routes a $transport successor exactly once with receipt $receipt, enqueue $enqueue and old $terminal",
+    async ({ transport, receipt, enqueue, terminal }) => {
+      const receipts = commandTransportReceipts();
+      const test = await sessionFixture(receipts.fetch, workspaceInventory);
+      try {
+        const oldID = await test.admit();
+        test.write("session.execution.started", {}, "old-start", 1);
+        await test.wait((event) => event.type === "turn.started");
+        const request = transport === "command" ? test.holdNextCommand() : test.holdNextPrompt();
+        const sending = test.engine.send(
+          transport === "command" ? "/review successor" : "successor",
+        );
+        await request.requested;
+        const successorID =
+          transport === "command" ? "msg_successor" : String(test.promptBodies[1]!.id);
+        const oldTerminal = (seq: number, id = "old-terminal") =>
+          test.write(
+            `session.execution.${terminal}`,
+            terminal === "failed"
+              ? { error: { type: "old.failed", message: "Old execution failed" } }
+              : terminal === "interrupted"
+                ? { reason: "user" }
+                : {},
+            id,
+            seq,
+          );
+        if (receipt === "before boundaries") {
+          // The command's completion log covers its enqueue, while the actual
+          // delivery and successor execution still arrive asynchronously via SSE.
+          if (transport === "command") commandPromptWrite(test, successorID, 101, session.id, true);
+          const completionLog = transport === "command" ? test.holdNextLog() : undefined;
+          const promptResponse = transport === "prompt" ? receipts.nextPromptResponse() : undefined;
+          const pending = test.holdNextPermissionList();
+          request.release();
+          if (completionLog) {
+            await completionLog.requested;
+            completionLog.release();
+            await receipts.completionLogResponse;
+          } else {
+            await promptResponse;
+          }
+          // Ordinary prompt acknowledgement precedes boundary association; a
+          // command completion fence is observed by the next held log instead.
+          if (transport === "prompt") {
+            // No pending reconciliation is possible until ownership is known.
+            expect(test.events.filter((event) => event.type === "turn.completed")).toEqual([]);
+          }
+          if (enqueue === "before terminal") {
+            commandPromptWrite(test, successorID, 101);
+            oldTerminal(102);
+          } else {
+            oldTerminal(101);
+            commandPromptWrite(test, successorID, 102);
+          }
+          test.write("session.execution.started", {}, "successor-start", 103);
+          test.write(
+            "session.inbox.delivered",
+            { inboxID: successorID },
+            "successor-delivered",
+            104,
+          );
+          test.write(
+            "session.text.ended",
+            { assistantMessageID: "msg_successor_answer", ordinal: 0, text: "Successor answer" },
+            "successor-answer",
+            105,
+          );
+          oldTerminal(102, "acknowledged-old-terminal");
+          test.write("session.execution.succeeded", {}, "successor-terminal", 106);
+          await pending.requested;
+          pending.release();
+        } else {
+          if (enqueue === "before terminal") {
+            commandPromptWrite(test, successorID, 101);
+            oldTerminal(102);
+          } else {
+            oldTerminal(101);
+            commandPromptWrite(test, successorID, 102);
+          }
+          test.write("session.execution.started", {}, "successor-start", 103);
+          test.write(
+            "session.inbox.delivered",
+            { inboxID: successorID },
+            "successor-delivered",
+            104,
+          );
+          test.write(
+            "session.text.ended",
+            { assistantMessageID: "msg_successor_answer", ordinal: 0, text: "Successor answer" },
+            "successor-answer",
+            105,
+          );
+          oldTerminal(102, "acknowledged-old-terminal");
+          test.write("session.execution.succeeded", {}, "successor-terminal", 106);
+          request.release();
+        }
+        expect(await sending).toEqual({ success: true, data: { turnID: successorID } });
+        test.replayLogged();
+        // A separately acknowledged old terminal is still fenced by its durable
+        // position, not just by an identical public-feed id.
+        test.write(
+          `session.execution.${terminal}`,
+          terminal === "failed"
+            ? { error: { type: "old.failed", message: "late" } }
+            : terminal === "interrupted"
+              ? { reason: "user" }
+              : {},
+          "late-old-terminal",
+          102,
+        );
+        await test.drain();
+        expect(test.events.filter((event) => event.type.startsWith("turn."))).toMatchObject([
+          { type: "turn.started", turnID: oldID },
+          { type: terminal === "succeeded" ? "turn.completed" : "turn.failed", turnID: oldID },
+          { type: "turn.started", turnID: successorID },
+          { type: "turn.completed", turnID: successorID },
+        ]);
+        expect(test.events.filter((event) => event.type === "text.completed")).toMatchObject([
+          {
+            turnID: successorID,
+            assistantMessageID: "msg_successor_answer",
+            text: "Successor answer",
+          },
+        ]);
+      } finally {
+        await test.close();
+      }
+    },
+  );
+
+  it.each(["steer", "queue"] as const)(
+    "keeps a delivered %s input on its actual coalesced execution",
+    async (delivery) => {
+      const test = await sessionFixture();
+      try {
+        const turnID = await test.admit();
+        test.write("session.execution.started", {}, undefined, 1);
+        await test.wait((event) => event.type === "turn.started");
+        const prompt = test.holdNextPrompt();
+        const sending = test.engine.send("coalesced input", { delivery });
+        await prompt.requested;
+        const inboxID = String(test.promptBodies[1]!.id);
+        test.write(
+          "session.inbox.enqueued",
+          { inboxID, item: { type: "user", delivery, payload: { text: "coalesced input" } } },
+          undefined,
+          2,
+        );
+        test.write("session.inbox.delivered", { inboxID }, undefined, 3);
+        test.write(
+          "session.text.ended",
+          { assistantMessageID: "msg_coalesced", ordinal: 0, text: "Coalesced answer" },
+          undefined,
+          4,
+        );
+        test.write("session.execution.succeeded", {}, undefined, 5);
+        prompt.release();
+        expect(await sending).toEqual({ success: true, data: { turnID } });
+        test.replayLogged();
+        await test.drain();
+        expect(test.events.filter((event) => event.type.startsWith("turn."))).toEqual([
+          { type: "turn.started", turnID },
+          { type: "turn.completed", turnID },
+        ]);
+        expect(test.events.filter((event) => event.type === "text.completed")).toMatchObject([
+          { turnID, text: "Coalesced answer" },
+        ]);
+      } finally {
+        await test.close();
+      }
+    },
+  );
+
+  it("routes command admission when the old execution settles inside the initial log fence", async () => {
+    const test = await sessionFixture(fetch, workspaceInventory);
+    try {
+      const oldID = await test.admit();
+      test.write("session.execution.started", {}, undefined, 1);
+      await test.wait((event) => event.type === "turn.started");
+      const fence = test.holdNextLog();
+      const command = test.holdNextCommand();
+      const sending = test.engine.send("/review settlement fence");
+      await fence.requested;
+      test.write("session.execution.succeeded", {}, "old-terminal", 2);
+      fence.release();
+      await command.requested;
+      commandPromptWrite(test);
+      commandTurnWrite(test);
+      command.release();
+      expect(await sending).toEqual({ success: true, data: { turnID: "msg_native_command" } });
+      test.replayLogged();
+      await test.drain();
+      expect(test.events.filter((event) => event.type.startsWith("turn."))).toEqual([
+        { type: "turn.started", turnID: oldID },
+        { type: "turn.completed", turnID: oldID },
+        { type: "turn.started", turnID: "msg_native_command" },
+        { type: "turn.completed", turnID: "msg_native_command" },
+      ]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("associates a successor failure before inbox promotion with its admitted input", async () => {
+    const test = await sessionFixture();
+    try {
+      const oldID = await test.admit();
+      test.write("session.execution.started", {}, undefined, 1);
+      await test.wait((event) => event.type === "turn.started");
+      const prompt = test.holdNextPrompt();
+      const sending = test.engine.send("blocked initialization");
+      await prompt.requested;
+      const nextID = String(test.promptBodies[1]!.id);
+      commandPromptWrite(test, nextID, 2);
+      test.write("session.execution.succeeded", {}, undefined, 3);
+      test.write("session.execution.started", {}, undefined, 4);
+      test.write(
+        "session.execution.failed",
+        { error: { type: "instructions.blocked", message: "Initialization blocked" } },
+        "successor-failed",
+        5,
+      );
+      prompt.release();
+      expect(await sending).toEqual({ success: true, data: { turnID: nextID } });
+      test.replayLogged();
+      await test.drain();
+      expect(test.events.filter((event) => event.type.startsWith("turn."))).toMatchObject([
+        { type: "turn.started", turnID: oldID },
+        { type: "turn.completed", turnID: oldID },
+        { type: "turn.started", turnID: nextID },
+        { type: "turn.failed", turnID: nextID, reason: "failed" },
+      ]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it.each(["deadline", "stop", "loss"] as const)(
+    "releases unresolved successor association on %s without replay or fabricated completion",
+    async (action) => {
+      const test = await sessionFixture();
+      try {
+        await test.admit();
+        test.write("session.execution.started", {}, undefined, 1);
+        await test.wait((event) => event.type === "turn.started");
+        const prompt = test.holdNextPrompt();
+        if (action === "deadline") vi.useFakeTimers();
+        const sending = test.engine.send("unresolved successor");
+        await prompt.requested;
+        commandPromptWrite(test, String(test.promptBodies[1]!.id), 2);
+        prompt.release();
+        // The usage receipt is ordered after the admitted enqueue and proves
+        // the engine has drained admission and is waiting on an actual boundary.
+        await test.drain();
+        expect(await test.engine.send("cannot overlap association")).toMatchObject({
+          success: false,
+          rejected: true,
+        });
+        if (action === "deadline") await vi.advanceTimersByTimeAsync(15_000);
+        else if (action === "stop") await test.engine.stop({ interrupt: false });
+        else {
+          test.disconnect();
+          await test.wait((event) => event.type === "stream.lost");
+        }
+        expect(await sending).toMatchObject({
+          success: false,
+          error: { operation: "session.prompt" },
+        });
+        expect(test.promptCount()).toBe(2);
+        expect(
+          test.events.filter(
+            (event) => event.type === "turn.completed" || event.type === "turn.failed",
+          ),
+        ).toEqual([]);
+        expect((await test.engine.send("do not replay")).success).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        await test.close();
+      }
+    },
+  );
+
+  it.each([
+    { label: "text and files", text: "Read these attachments" },
+    { label: "files only", text: "" },
+  ])("admits $label over HTTP and completes the same turn through SSE", async ({ text }) => {
+    const test = await sessionFixture();
+    try {
+      const files = [
+        { uri: "data:image/png;base64,cGl4ZWw=", name: "image.png" },
+        { uri: "data:text/plain;base64,Y29udGV4dA==", name: "context.txt" },
+        { uri: "data:application/pdf;base64,JVBERg==", name: "report.pdf" },
+      ];
+      const sending = await test.engine.send(text, { files });
+      expect(sending.success).toBe(true);
+      if (!sending.success) throw new Error("File admission failed");
+      expect(test.promptBodies).toEqual([{ id: sending.data.turnID, text, files }]);
+      expect(test.inventoryRequests).toEqual([]);
+      commandTurnWrite(test);
+      await test.wait((event) => event.type === "turn.completed");
+      commandTurnExpect(test, sending.data.turnID);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("rejects truly empty native prompts without admitting work or blocking a later explicit continuation", async () => {
+    const test = await sessionFixture();
+    try {
+      for (const text of ["", "  "]) {
+        expect(await test.engine.send(text, { files: [] })).toMatchObject({
+          success: false,
+          rejected: true,
+          error: { operation: "session.prompt" },
+        });
+      }
+      expect(test.promptCount()).toBe(0);
+      const text = "Continue where you left off";
+      const sending = await test.engine.send(text);
+      expect(sending.success).toBe(true);
+      if (!sending.success) throw new Error("Explicit continuation admission failed");
+      expect(test.promptBodies).toEqual([{ id: sending.data.turnID, text }]);
+      commandTurnWrite(test);
+      await test.wait((event) => event.type === "turn.completed");
+      commandTurnExpect(test, sending.data.turnID);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("reverses the sticky plan agent through HTTP before admitting the next native prompt", async () => {
+    const test = await sessionFixture();
+    try {
+      expect((await test.engine.switchSelection({ agent: "plan" })).success).toBe(true);
+      const planning = await test.engine.send("make a plan");
+      expect(planning.success).toBe(true);
+      if (!planning.success) throw new Error("Planning admission failed");
+      test.write("session.execution.started");
+      test.write("session.execution.succeeded");
+      await test.wait(
+        (event) => event.type === "turn.completed" && event.turnID === planning.data.turnID,
+      );
+      expect((await test.engine.switchSelection({ agent: "build" })).success).toBe(true);
+      const building = await test.engine.send("implement it");
+      expect(building.success).toBe(true);
+      if (!building.success) throw new Error("Default-agent admission failed");
+      test.write("session.execution.started", {}, undefined, 2);
+      test.write("session.execution.succeeded", {}, undefined, 3);
+      await test.wait(
+        (event) => event.type === "turn.completed" && event.turnID === building.data.turnID,
+      );
+      expect(test.switches).toEqual([
+        { path: "/api/session/ses_fixture/agent", body: { agent: "plan" } },
+        { path: "/api/session/ses_fixture/agent", body: { agent: "build" } },
+      ]);
+      expect(test.promptBodies).toEqual([
+        { id: planning.data.turnID, text: "make a plan" },
+        { id: building.data.turnID, text: "implement it" },
+      ]);
+      expect(test.events.filter((event) => event.type.startsWith("turn."))).toEqual([
+        { type: "turn.started", turnID: planning.data.turnID },
+        { type: "turn.completed", turnID: planning.data.turnID },
+        { type: "turn.started", turnID: building.data.turnID },
+        { type: "turn.completed", turnID: building.data.turnID },
+      ]);
+      expect(test.interrupts()).toBe(0);
+    } finally {
+      await test.close();
+    }
+  });
+
   it("bounds stalled session creation and tears down the event subscription", async () => {
     const server = await fixture((req, res) => {
       if (req.url === "/api/event") {
@@ -1870,6 +3171,8 @@ describe("native v2.0.18 session slice", () => {
           else admission = body;
           expect(body).toMatchObject({ text: steer === body ? "second" : "hello" });
           expect(body.id).toMatch(/^msg_/);
+          if (steer === body)
+            frame(stream!, "session.inbox.delivered", { sessionID: session.id, inboxID: body.id });
           send(res, {
             data: {
               id: body.id,
@@ -2245,6 +3548,90 @@ describe("native v2.0.18 session slice", () => {
       expect(test.events.filter((event) => event.type === "turn.completed")).toEqual([
         { type: "turn.completed", turnID },
       ]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("looks up context limits from deterministic official native model payloads without credentials", async () => {
+    const requested: string[] = [];
+    const payload = modelInventoryDecode({
+      location: { directory },
+      data: [
+        {
+          id: "route/model",
+          modelID: "underlying",
+          providerID: "other",
+          name: "Other",
+          enabled: true,
+          status: "active",
+          variants: [],
+          capabilities: { tools: true, input: ["text"], output: ["text"] },
+          time: { released: 0 },
+          cost: [],
+          limit: { context: 1_000, output: 100 },
+        },
+        {
+          id: "route/model",
+          modelID: "underlying",
+          providerID: "native",
+          name: "Actual",
+          enabled: true,
+          status: "active",
+          variants: [],
+          capabilities: { tools: true, input: ["text"], output: ["text"] },
+          time: { released: 0 },
+          cost: [],
+          limit: { context: 200_000, output: 10_000 },
+        },
+      ],
+    });
+    const test = await sessionFixture(async (request, init) => {
+      const url = new URL(request instanceof Request ? request.url : String(request));
+      if (url.pathname !== "/api/model") return fetch(request, init);
+      expect(url.searchParams.get("location[directory]")).toBe(directory);
+      expect(new Headers(init?.headers).has("Authorization")).toBe(false);
+      requested.push(url.pathname);
+      return Response.json(payload);
+    });
+    try {
+      expect(await test.engine.contextLimit({ providerID: "native", id: "route/model" })).toBe(
+        200_000,
+      );
+      expect(await test.engine.contextLimit({ providerID: "native", id: "underlying" })).toBe(
+        200_000,
+      );
+      expect(
+        await test.engine.contextLimit({ providerID: "absent", id: "route/model" }),
+      ).toBeUndefined();
+      expect(requested).toHaveLength(3);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("translates native model selections while idle and preserves effective step model identity", async () => {
+    const test = await sessionFixture();
+    try {
+      test.write("session.model.selected", { model: { providerID: "native", id: "selected" } });
+      await test.wait((event) => event.type === "model.selected");
+      const turnID = await test.admit();
+      test.write("session.step.started", {
+        ...stepStart("msg_actual"),
+        model: { providerID: "native", id: "actual", variant: "high" },
+      });
+      test.write("session.step.ended", stepEnd("msg_actual"));
+      test.write("session.execution.succeeded");
+      await test.drain();
+      expect(test.events.find((event) => event.type === "model.selected")).toMatchObject({
+        type: "model.selected",
+        sessionID: session.id,
+        model: { providerID: "native", id: "selected" },
+      });
+      expect(test.events.find((event) => event.type === "step.started")).toMatchObject({
+        turnID,
+        step: { model: { providerID: "native", id: "actual", variant: "high" } },
+      });
     } finally {
       await test.close();
     }
@@ -2655,6 +4042,526 @@ describe("native v2.0.18 session slice", () => {
     }
   });
 
+  it("reactivates a settled native child through a new launch key across two turns without moving original step usage", async () => {
+    const test = await sessionFixture();
+    try {
+      const firstTurn = await test.admit();
+      const childID = "ses_reused";
+      const launch = (assistantMessageID: string, id: string, reused: boolean) => {
+        const ref = { assistantMessageID, id };
+        test.write("session.tool.input.started", { ...ref, name: "subagent" });
+        test.write("session.tool.called", {
+          ...ref,
+          input: {
+            agent: reused ? "review" : "explore",
+            ...(reused ? { sessionID: childID } : {}),
+          },
+          executed: false,
+        });
+        test.write("session.tool.progress", {
+          ...ref,
+          metadata: { sessionID: childID, status: "running" },
+        });
+        return ref;
+      };
+      const firstRef = launch("msg_parent_first", "call_first", false);
+      test.write("session.execution.started", { sessionID: childID }, undefined, 10);
+      test.write(
+        "session.step.started",
+        { ...stepStart("msg_child_first"), sessionID: childID },
+        undefined,
+        11,
+      );
+      test.write(
+        "session.step.ended",
+        { ...stepEnd("msg_child_first"), sessionID: childID },
+        undefined,
+        12,
+      );
+      test.write("session.execution.succeeded", { sessionID: childID }, undefined, 13);
+      test.write("session.tool.success", {
+        ...firstRef,
+        content: [{ type: "text", text: "first answer" }],
+        metadata: { sessionID: childID, status: "completed" },
+        executed: false,
+      });
+      test.write("session.execution.succeeded");
+      await test.wait((event) => event.type === "turn.completed" && event.turnID === firstTurn);
+      const originalSteps = test.events.filter(
+        (event) => event.type === "step.completed" && event.sessionID === childID,
+      );
+
+      const secondTurn = await test.admit();
+      const secondRef = launch("msg_parent_second", "call_second", true);
+      // Progress is emitted before child prompt admission. A delayed terminal in
+      // this window cannot settle the pending new activation, even with a higher
+      // sequence than the last observed outgoing frame.
+      test.write(
+        "session.execution.failed",
+        {
+          sessionID: childID,
+          error: { type: "provider.error", message: "old activation" },
+        },
+        undefined,
+        14,
+      );
+      await test.drain();
+      expect(test.events.filter((event) => event.type === "child.failed")).toEqual([]);
+      expect(test.events.filter((event) => event.type === "child.started")).toHaveLength(1);
+
+      test.write("session.execution.started", { sessionID: childID }, undefined, 20);
+      const secondKey = "ses_fixture:msg_parent_second:tool:call_second";
+      await test.wait(
+        (event) => event.type === "child.started" && event.parentToolKey === secondKey,
+      );
+      // Native execution has sessionID only. Durable order fences every old
+      // terminal shape, including a distinct event ID, rather than guessing IDs.
+      test.write("session.execution.succeeded", { sessionID: childID }, undefined, 13);
+      test.write(
+        "session.execution.failed",
+        {
+          sessionID: childID,
+          error: { type: "provider.error", message: "late failure" },
+        },
+        undefined,
+        14,
+      );
+      test.write(
+        "session.execution.interrupted",
+        { sessionID: childID, reason: "user" },
+        undefined,
+        15,
+      );
+      test.write("session.execution.started", { sessionID: childID }, undefined, 10);
+      test.write(
+        "session.step.ended",
+        { ...stepEnd("msg_child_first"), sessionID: childID },
+        undefined,
+        12,
+      );
+      test.write(
+        "session.created",
+        {
+          sessionID: childID,
+          parentID: session.id,
+          projectID: "proj_fixture",
+          slug: "old-child",
+          location: { directory },
+          version: "2.0.18",
+          agent: "old-agent",
+          title: "stale title",
+        },
+        undefined,
+        1,
+      );
+      test.write("session.text.delta", {
+        sessionID: childID,
+        assistantMessageID: "msg_child_first",
+        ordinal: 0,
+        delta: "stale output",
+      });
+      test.write(
+        "session.synthetic",
+        {
+          text: "old notification has no launch identity",
+          metadata: { source: "subagent", childID, state: "completed" },
+        },
+        undefined,
+        250,
+      );
+      test.write(
+        "session.step.started",
+        { ...stepStart("msg_child_second"), sessionID: childID },
+        undefined,
+        21,
+      );
+      test.write(
+        "session.text.ended",
+        {
+          sessionID: childID,
+          assistantMessageID: "msg_child_second",
+          ordinal: 0,
+          text: "second answer",
+        },
+        undefined,
+        22,
+      );
+      test.write(
+        "session.step.ended",
+        {
+          ...stepEnd("msg_child_second"),
+          sessionID: childID,
+          cost: 0.75,
+        },
+        undefined,
+        23,
+      );
+      test.write("session.usage.updated", { ...usage, sessionID: childID, cost: 1 });
+      await test.drain();
+      expect(test.events.filter((event) => event.type === "child.completed")).toHaveLength(1);
+      expect(
+        test.events.filter(
+          (event) => event.type === "child.failed" || event.type === "child.interrupted",
+        ),
+      ).toEqual([]);
+      expect(
+        test.events.some(
+          (event) => event.type === "child.updated" && event.info.agent === "old-agent",
+        ),
+      ).toBe(false);
+      expect(
+        test.events.some((event) => event.type === "text.delta" && event.delta === "stale output"),
+      ).toBe(false);
+      expect(
+        test.events.filter(
+          (event) => event.type === "step.completed" && event.sessionID === childID,
+        ),
+      ).toEqual([
+        ...originalSteps,
+        expect.objectContaining({
+          turnID: secondTurn,
+          parentToolKey: secondKey,
+          step: expect.objectContaining({ cost: 0.75 }),
+        }),
+      ]);
+      expect(originalSteps).toEqual([
+        expect.objectContaining({
+          turnID: firstTurn,
+          parentToolKey: "ses_fixture:msg_parent_first:tool:call_first",
+          step: expect.objectContaining({ cost: usage.cost }),
+        }),
+      ]);
+      expect(
+        test.events.find((event) => event.type === "usage.updated" && event.sessionID === childID),
+      ).toEqual({
+        type: "usage.updated",
+        sessionID: childID,
+        scope: "session",
+        ...usage,
+        cost: 1,
+      });
+      test.write("session.execution.succeeded", { sessionID: childID }, undefined, 24);
+      test.write(
+        "session.tool.success",
+        {
+          ...secondRef,
+          content: [{ type: "text", text: "second answer" }],
+          metadata: { sessionID: childID, status: "completed" },
+          executed: false,
+        },
+        undefined,
+        251,
+      );
+      // Older launch progress/results cannot move the active task's linkage.
+      test.write("session.tool.progress", {
+        ...firstRef,
+        metadata: { sessionID: childID, status: "running" },
+      });
+      test.write("session.execution.succeeded", {}, undefined, 252);
+      await test.drain();
+      expect(test.events.filter((event) => event.type === "child.started")).toEqual([
+        {
+          type: "child.started",
+          sessionID: childID,
+          turnID: firstTurn,
+          parentSessionID: session.id,
+          parentToolKey: "ses_fixture:msg_parent_first:tool:call_first",
+        },
+        {
+          type: "child.started",
+          sessionID: childID,
+          turnID: secondTurn,
+          parentSessionID: session.id,
+          parentToolKey: secondKey,
+          reactivation: { key: secondKey },
+        },
+      ]);
+      expect(test.events.filter((event) => event.type === "child.completed")).toEqual([
+        {
+          type: "child.completed",
+          sessionID: childID,
+          turnID: firstTurn,
+          parentSessionID: session.id,
+          parentToolKey: "ses_fixture:msg_parent_first:tool:call_first",
+        },
+        {
+          type: "child.completed",
+          sessionID: childID,
+          turnID: secondTurn,
+          parentSessionID: session.id,
+          parentToolKey: secondKey,
+        },
+      ]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("requires a new reuse launch's running progress and does not let an older tool result terminate same-turn reactivation", async () => {
+    const test = await sessionFixture();
+    try {
+      const turnID = await test.admit();
+      const childID = "ses_same_turn";
+      const call = (id: string, reuseID?: string) => {
+        const ref = { assistantMessageID: "msg_same_parent", id };
+        test.write("session.tool.input.started", { ...ref, name: "subagent" });
+        test.write("session.tool.called", {
+          ...ref,
+          input: { agent: "explore", ...(reuseID ? { sessionID: reuseID } : {}) },
+          executed: false,
+        });
+        return ref;
+      };
+      const progress = (ref: ReturnType<typeof call>) =>
+        test.write("session.tool.progress", {
+          ...ref,
+          metadata: { sessionID: childID, status: "running" },
+        });
+      const result = (ref: ReturnType<typeof call>) =>
+        test.write("session.tool.success", {
+          ...ref,
+          executed: false,
+          content: [{ type: "text", text: "tool result" }],
+          metadata: { sessionID: childID, status: "completed" },
+        });
+      const first = call("call_original");
+      progress(first);
+      test.write("session.execution.started", { sessionID: childID }, undefined, 5);
+      // A different tool can steer an already-running native child. It is not a
+      // new execution and must not relabel it, now or in a delayed replay.
+      const steering = call("call_steering", childID);
+      progress(steering);
+      test.write("session.execution.succeeded", { sessionID: childID }, undefined, 8);
+      // Identity-only starts, terminal-only results, a mismatched requested child,
+      // and a repeat of the original launch are not reactivation evidence.
+      progress(call("call_no_reuse"));
+      progress(call("call_wrong_child", "ses_foreign"));
+      result(call("call_terminal_only", childID));
+      progress(first);
+      progress(steering);
+      await test.drain();
+      expect(test.events.filter((event) => event.type === "child.attached")).toHaveLength(1);
+      const next = call("call_new", childID);
+      progress(next);
+      progress(next);
+      test.write("session.execution.started", { sessionID: childID }, undefined, 15);
+      // The parent is still on the same assistant step, so these old tool frames
+      // reach childAttach rather than being rejected by the parent turn fence.
+      result(first);
+      progress(first);
+      test.write(
+        "session.execution.failed",
+        {
+          sessionID: childID,
+          error: { type: "provider.error", message: "older failure" },
+        },
+        undefined,
+        8,
+      );
+      test.write(
+        "session.text.ended",
+        {
+          sessionID: childID,
+          assistantMessageID: "msg_same_child_new",
+          ordinal: 0,
+          text: "current result",
+        },
+        undefined,
+        16,
+      );
+      await test.drain();
+      expect(test.events.filter((event) => event.type === "child.completed")).toHaveLength(1);
+      expect(test.events.filter((event) => event.type === "child.failed")).toEqual([]);
+      expect(test.events.filter((event) => event.type === "child.started")).toMatchObject([
+        { turnID, parentToolKey: "ses_fixture:msg_same_parent:tool:call_original" },
+        {
+          turnID,
+          parentToolKey: "ses_fixture:msg_same_parent:tool:call_new",
+          reactivation: { key: "ses_fixture:msg_same_parent:tool:call_new" },
+        },
+      ]);
+      test.write("session.execution.succeeded", { sessionID: childID }, undefined, 17);
+      result(next);
+      // General late duplicates, including a fresh event ID under the settled
+      // launch, still cannot reopen this activation.
+      progress(next);
+      test.write("session.execution.started", { sessionID: childID }, undefined, 18);
+      await test.drain();
+      expect(test.events.filter((event) => event.type === "child.started")).toHaveLength(2);
+      expect(test.events.filter((event) => event.type === "child.completed")).toHaveLength(2);
+      expect(test.events.filter((event) => event.type === "text.completed")).toMatchObject([
+        {
+          turnID,
+          sessionID: childID,
+          parentToolKey: "ses_fixture:msg_same_parent:tool:call_new",
+          text: "current result",
+        },
+      ]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("preserves nested background origins on child reuse and fences old launch terminals and unkeyed notifications", async () => {
+    const test = await sessionFixture();
+    try {
+      const firstTurn = await test.admit();
+      const launch = (
+        sessionID: string,
+        assistantMessageID: string,
+        childID: string,
+        reused: boolean,
+      ) => {
+        const ref = { sessionID, assistantMessageID, id: "call_shared" };
+        test.write(
+          "session.tool.input.started",
+          { ...ref, name: "subagent" },
+          undefined,
+          reused ? 21 : sessionID === session.id ? 1 : 11,
+        );
+        test.write(
+          "session.tool.called",
+          {
+            ...ref,
+            input: {
+              agent: "explore",
+              background: true,
+              ...(reused ? { sessionID: childID } : {}),
+            },
+            executed: false,
+          },
+          undefined,
+          reused ? 22 : sessionID === session.id ? 2 : 12,
+        );
+        test.write("session.tool.progress", {
+          ...ref,
+          metadata: { sessionID: childID, status: "running" },
+        });
+        return ref;
+      };
+      const oldLaunch = launch(session.id, "msg_parent_old", "ses_outer", false);
+      test.write("session.execution.started", { sessionID: "ses_outer" }, undefined, 10);
+      launch("ses_outer", "msg_outer_old", "ses_nested_reuse", false);
+      test.write("session.execution.started", { sessionID: "ses_nested_reuse" }, undefined, 10);
+      test.write("session.execution.succeeded", { sessionID: "ses_nested_reuse" }, undefined, 12);
+      test.write("session.execution.succeeded", { sessionID: "ses_outer" }, undefined, 13);
+      test.write("session.execution.succeeded");
+      await test.wait((event) => event.type === "turn.completed" && event.turnID === firstTurn);
+      const secondTurn = await test.admit();
+      launch(session.id, "msg_parent_new", "ses_outer", true);
+      test.write("session.execution.started", { sessionID: "ses_outer" }, undefined, 20);
+      launch("ses_outer", "msg_outer_new", "ses_nested_reuse", true);
+      test.write("session.execution.started", { sessionID: "ses_nested_reuse" }, undefined, 20);
+      test.write(
+        "session.tool.success",
+        {
+          ...oldLaunch,
+          content: [{ type: "text", text: "old foreground result" }],
+          metadata: { sessionID: "ses_outer", status: "completed" },
+          executed: false,
+        },
+        undefined,
+        201,
+      );
+      test.write("session.execution.succeeded", { sessionID: "ses_outer" }, undefined, 12);
+      test.write("session.execution.succeeded", { sessionID: "ses_nested_reuse" }, undefined, 12);
+      test.write(
+        "session.inbox.enqueued",
+        {
+          sessionID: "ses_outer",
+          inboxID: "msg_late_notification",
+          item: {
+            type: "synthetic",
+            payload: {
+              text: "late nested result",
+              metadata: { source: "subagent", childID: "ses_nested_reuse", state: "completed" },
+            },
+          },
+        },
+        undefined,
+        23,
+      );
+      // Background tools may finish while their children continue, and the
+      // spawning parent can settle before either child's current terminal.
+      test.write(
+        "session.tool.success",
+        {
+          assistantMessageID: "msg_parent_new",
+          id: "call_shared",
+          executed: false,
+          content: [{ type: "text", text: "running in background" }],
+          metadata: { sessionID: "ses_outer", status: "running" },
+        },
+        undefined,
+        202,
+      );
+      test.write("session.execution.succeeded", {}, undefined, 203);
+      await test.drain();
+      const thirdTurn = await test.admit();
+      test.write(
+        "session.execution.failed",
+        {
+          sessionID: "ses_nested_reuse",
+          error: { type: "provider.error", message: "new nested failure" },
+        },
+        undefined,
+        22,
+      );
+      test.write(
+        "session.execution.interrupted",
+        { sessionID: "ses_outer", reason: "user" },
+        undefined,
+        24,
+      );
+      await test.drain();
+      const current = test.events.filter(
+        (event) =>
+          event.type.startsWith("child.") && "turnID" in event && event.turnID === secondTurn,
+      );
+      expect(current.filter((event) => event.type === "child.started")).toMatchObject([
+        {
+          sessionID: "ses_outer",
+          parentSessionID: session.id,
+          reactivation: { key: "ses_fixture:msg_parent_new:tool:call_shared" },
+        },
+        {
+          sessionID: "ses_nested_reuse",
+          parentSessionID: "ses_outer",
+          reactivation: { key: "ses_outer:msg_outer_new:tool:call_shared" },
+        },
+      ]);
+      expect(current.filter((event) => event.type === "child.completed")).toEqual([]);
+      expect(
+        current.filter(
+          (event) => event.type === "child.failed" || event.type === "child.interrupted",
+        ),
+      ).toMatchObject([
+        {
+          type: "child.failed",
+          sessionID: "ses_nested_reuse",
+          turnID: secondTurn,
+          parentToolKey: "ses_outer:msg_outer_new:tool:call_shared",
+          error: { message: "new nested failure" },
+        },
+        {
+          type: "child.interrupted",
+          sessionID: "ses_outer",
+          turnID: secondTurn,
+          parentToolKey: "ses_fixture:msg_parent_new:tool:call_shared",
+          reason: "user",
+        },
+      ]);
+      expect(
+        test.events.some(
+          (event) =>
+            event.type.startsWith("child.") && "turnID" in event && event.turnID === thirdTurn,
+        ),
+      ).toBe(false);
+    } finally {
+      await test.close();
+    }
+  });
+
   it("uses real session.created parentID for nested ancestry and rejects tool metadata contradicting a foreign parent", async () => {
     const test = await sessionFixture();
     try {
@@ -2884,6 +4791,7 @@ describe("native v2.0.18 session slice", () => {
         error: { name: "legacy error", data: { message: "wrong protocol" } },
       });
       test.write("session.execution.interrupted", { reason: "unknown" });
+      test.write("session.step.started", stepStart("msg_valid"), "step-valid", -1);
       test.write(
         "session.step.started",
         { ...stepStart("msg_valid"), model: "wrong shape" },

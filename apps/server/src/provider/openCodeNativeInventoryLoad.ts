@@ -10,8 +10,9 @@ import {
 import { OpenCodeRuntimeError } from "./opencodeRuntime.ts";
 
 const NATIVE_INVENTORY_REQUEST_TIMEOUT_MS = 5_000;
+const configDecode = Schema.decodeUnknownExit(openCodeNativeInventorySchema.config);
 
-/** Load the five v2 inventory endpoints through the typed client, preserving the requested location. */
+/** Load native location resources without replacing the machine-wide model catalog. */
 export const openCodeNativeInventoryLoad = (input: {
   readonly url: string;
   readonly serverPassword?: string;
@@ -69,10 +70,62 @@ export const openCodeNativeInventoryLoad = (input: {
         }),
       );
 
-    // Skills and commands are location-dependent; keep the complete inventory
-    // authoritative for status, and avoid unnecessary model/provider requests for cwd snapshots.
-    const [skill, command] = yield* Effect.all(
+    const config = Effect.tryPromise({
+      // v2.0.18's Solid location.config.list cache is backed by this public transport.
+      try: (signal) =>
+        client.config.get(
+          { location: { directory: input.directory } },
+          {
+            signal: AbortSignal.any([
+              signal,
+              AbortSignal.timeout(NATIVE_INVENTORY_REQUEST_TIMEOUT_MS),
+            ]),
+          },
+        ),
+      catch: (cause) =>
+        new OpenCodeRuntimeError({
+          operation: "config.get",
+          detail: statuses.has("/api/config")
+            ? `Native inventory request returned HTTP ${statuses.get("/api/config")}.`
+            : "Native inventory request failed.",
+          cause,
+        }),
+    }).pipe(
+      Effect.flatMap((body) => {
+        const decoded = configDecode(body);
+        if (Exit.isFailure(decoded)) {
+          return Effect.fail(
+            new OpenCodeRuntimeError({
+              operation: "config.get",
+              detail: "Invalid native configuration response.",
+            }),
+          );
+        }
+        // Config.latest: sources are lowest-to-highest priority; absent fields do
+        // not erase earlier selections. Agent.Info already contains agent overrides.
+        const entry = decoded.value.findLast(
+          (entry) => entry.type === "document" && entry.info.model !== undefined,
+        );
+        const selected = entry?.type === "document" ? entry.info.model : undefined;
+        return Effect.succeed(
+          selected
+            ? {
+                id: selected.model,
+                providerID: selected.providerID,
+                ...(selected.variant === undefined ? {} : { variant: selected.variant }),
+              }
+            : undefined,
+        );
+      }),
+    );
+    // Workspace loads need agents/config/skills/commands, never models/providers.
+    const [agent, skill, command, configuredModel] = yield* Effect.all(
       [
+        read(
+          "agent",
+          (signal) => client.agent.list({ location: { directory: input.directory } }, { signal }),
+          Schema.decodeUnknownExit(openCodeNativeInventorySchema.agent),
+        ),
         read(
           "skill",
           (signal) => client.skill.list({ location: { directory: input.directory } }, { signal }),
@@ -83,11 +136,13 @@ export const openCodeNativeInventoryLoad = (input: {
           (signal) => client.command.list({ location: { directory: input.directory } }, { signal }),
           Schema.decodeUnknownExit(openCodeNativeInventorySchema.command),
         ),
+        config,
       ],
       { concurrency: "unbounded" },
     );
-    if (input.workspaceOnly) return { provider: [], model: [], agent: [], skill, command };
-    const [provider, model, agent] = yield* Effect.all(
+    const workspace = { agent, skill, command, ...(configuredModel ? { configuredModel } : {}) };
+    if (input.workspaceOnly) return { provider: [], model: [], ...workspace };
+    const [provider, model] = yield* Effect.all(
       [
         read(
           "provider",
@@ -100,13 +155,8 @@ export const openCodeNativeInventoryLoad = (input: {
           (signal) => client.model.list({ location: { directory: input.directory } }, { signal }),
           Schema.decodeUnknownExit(openCodeNativeInventorySchema.model),
         ),
-        read(
-          "agent",
-          (signal) => client.agent.list({ location: { directory: input.directory } }, { signal }),
-          Schema.decodeUnknownExit(openCodeNativeInventorySchema.agent),
-        ),
       ],
       { concurrency: "unbounded" },
     );
-    return { provider, model, agent, skill, command };
+    return { provider, model, ...workspace };
   });

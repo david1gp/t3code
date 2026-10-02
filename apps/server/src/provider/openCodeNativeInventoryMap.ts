@@ -2,6 +2,7 @@ import type {
   ServerProviderModel,
   ServerProviderSkill,
   ServerProviderSlashCommand,
+  ProviderOptionDescriptor,
 } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 
@@ -18,6 +19,7 @@ const label = (value: string) =>
 /** Convert v2.0.18 inventory to the existing provider snapshot fields. */
 export const openCodeNativeInventoryMap = (
   inventory: OpenCodeNativeInventory,
+  machineModels?: ReadonlyArray<ServerProviderModel>,
 ): {
   readonly models: ReadonlyArray<ServerProviderModel>;
   readonly skills: ReadonlyArray<ServerProviderSkill>;
@@ -33,7 +35,22 @@ export const openCodeNativeInventoryMap = (
     (agent) => !agent.hidden && (agent.mode === "primary" || agent.mode === "all"),
   );
   // v2 resolves agents by `id`; `name` is a display label (e.g. "Build").
-  const defaultAgent = agents.find((agent) => agent.id === "build")?.id ?? agents[0]?.id;
+  // Native inventory lists the resolved default first, including configured agents.
+  const defaultAgent = agents[0]?.id;
+  const agentDescriptor: ProviderOptionDescriptor | undefined =
+    agents.length > 0
+      ? {
+          id: "agent",
+          label: "Agent",
+          type: "select",
+          options: agents.map((agent) => ({
+            id: agent.id,
+            label: trimmed(agent.name) ?? label(agent.id),
+            ...(agent.id === defaultAgent ? { isDefault: true as const } : {}),
+          })),
+          ...(defaultAgent ? { currentValue: defaultAgent } : {}),
+        }
+      : undefined;
   const models: ServerProviderModel[] = [];
   for (const model of inventory.model) {
     const provider = providers.get(model.providerID);
@@ -42,11 +59,66 @@ export const openCodeNativeInventoryMap = (
     const variants = [
       ...new Set(model.variants.map((variant) => variant.id).filter((id) => trimmed(id))),
     ];
+    const costs = model.cost ?? [];
+    const baseCost = costs.find((cost) => cost.tier === undefined);
+    const tierCosts = costs.flatMap((cost) =>
+      cost.tier
+        ? [
+            {
+              inputTokensAbove: cost.tier.size,
+              input: cost.input,
+              output: cost.output,
+              cache: cost.cache,
+            },
+          ]
+        : [],
+    );
+    const limits = model.limit
+      ? {
+          ...(model.limit.context !== undefined ? { context: model.limit.context } : {}),
+          ...(model.limit.input !== undefined ? { input: model.limit.input } : {}),
+          ...(model.limit.output !== undefined ? { output: model.limit.output } : {}),
+        }
+      : undefined;
+    const metadata = {
+      ...(limits && Object.keys(limits).length > 0 ? { limits } : {}),
+      ...(model.capabilities?.input !== undefined || model.capabilities?.output !== undefined
+        ? {
+            modalities: {
+              ...(model.capabilities.input !== undefined
+                ? { input: model.capabilities.input }
+                : {}),
+              ...(model.capabilities.output !== undefined
+                ? { output: model.capabilities.output }
+                : {}),
+            },
+          }
+        : {}),
+      ...(model.capabilities?.tools !== undefined ? { tools: model.capabilities.tools } : {}),
+      ...(costs.length > 0
+        ? {
+            pricing: {
+              unit: "usd_per_million_tokens" as const,
+              ...(baseCost
+                ? {
+                    base: {
+                      input: baseCost.input,
+                      output: baseCost.output,
+                      cache: baseCost.cache,
+                    },
+                  }
+                : {}),
+              ...(tierCosts.length > 0 ? { tiers: tierCosts } : {}),
+            },
+          }
+        : {}),
+    };
     models.push({
       slug: `${provider.id}/${model.id}`,
       name,
       ...(trimmed(provider.name) ? { subProvider: provider.name.trim() } : {}),
       isCustom: false,
+      metadata,
       capabilities: createModelCapabilities({
         optionDescriptors: [
           ...(variants.length > 0
@@ -59,21 +131,7 @@ export const openCodeNativeInventoryMap = (
                 },
               ]
             : []),
-          ...(agents.length > 0
-            ? [
-                {
-                  id: "agent",
-                  label: "Agent",
-                  type: "select" as const,
-                  options: agents.map((agent) => ({
-                    id: agent.id,
-                    label: trimmed(agent.name) ?? label(agent.id),
-                    ...(agent.id === defaultAgent ? { isDefault: true as const } : {}),
-                  })),
-                  ...(defaultAgent ? { currentValue: defaultAgent } : {}),
-                },
-              ]
-            : []),
+          ...(agentDescriptor ? [agentDescriptor] : []),
         ],
       }),
     });
@@ -102,7 +160,19 @@ export const openCodeNativeInventoryMap = (
     slashCommands.push({ name, ...(description ? { description } : {}) });
   }
   return {
-    models: models.toSorted((left, right) => left.name.localeCompare(right.name)),
+    models: machineModels
+      ? machineModels.map((model) => ({
+          ...model,
+          capabilities: createModelCapabilities({
+            optionDescriptors: [
+              ...(model.capabilities?.optionDescriptors ?? []).filter(
+                (entry) => entry.id !== "agent",
+              ),
+              ...(agentDescriptor ? [agentDescriptor] : []),
+            ],
+          }),
+        }))
+      : models.toSorted((left, right) => left.name.localeCompare(right.name)),
     skills: skills.toSorted((left, right) => left.name.localeCompare(right.name)),
     slashCommands,
     // /api/provider already returns the available (connected) providers, even
