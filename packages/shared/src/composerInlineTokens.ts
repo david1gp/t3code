@@ -1,3 +1,5 @@
+export { composerSkillMentionsResolve } from "./composerSkillMentionsResolve.ts";
+
 export type ComposerInlineToken =
   | {
       readonly type: "mention";

@@ -1845,9 +1845,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const providerInstanceEntries = useMemo<ReadonlyArray<ProviderInstanceEntry>>(
     () =>
       sortProviderInstanceEntries(
-        applyProviderInstanceSettings(deriveProviderInstanceEntries(providerStatuses), settings),
+        applyProviderInstanceSettings(
+          deriveProviderInstanceEntries(providerStatuses, gitCwd),
+          settings,
+        ),
       ),
-    [providerStatuses, settings],
+    [providerStatuses, settings, gitCwd],
   );
   const selectedProviderByThreadId = composerDraft.activeProvider ?? null;
   const {
@@ -2043,11 +2046,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           settings,
           entry,
           entry.instanceId === selectedInstanceId ? selectedModelForPicker : null,
+          gitCwd,
         ),
       );
     }
     return out;
-  }, [providerInstanceEntries, selectedInstanceId, selectedModelForPicker, settings]);
+  }, [providerInstanceEntries, selectedInstanceId, selectedModelForPicker, settings, gitCwd]);
   const selectedModelForPickerWithCustomFallback = useMemo(() => {
     const currentOptions = modelOptionsByInstance.get(selectedInstanceId) ?? [];
     return currentOptions.some((option) => option.slug === selectedModelForPicker)

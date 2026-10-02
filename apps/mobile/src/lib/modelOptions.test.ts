@@ -15,6 +15,58 @@ import {
 } from "./modelOptions";
 
 describe("mobile model options", () => {
+  it("passes catalog metadata through model options and leaves absent metadata absent", () => {
+    const metadata = {
+      limits: { context: 128_000, output: 8_000 },
+      modalities: { input: ["text", "image"], output: ["text"] },
+      tools: true,
+      reasoning: false,
+      pricing: {
+        unit: "usd_per_million_tokens",
+        tiers: [
+          { inputTokensAbove: 200_000, input: 4, output: 16, cache: { read: 0.4, write: 4 } },
+        ],
+      },
+      promptCacheSeconds: { short: 300 },
+      inputLimits: { maxRequestBytes: 20_000_000 },
+    } as const;
+    const config = {
+      providers: [
+        {
+          instanceId: "pi",
+          driver: "pi",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          models: [
+            { slug: "metadata-model", name: "Metadata Model", capabilities: null, metadata },
+            { slug: "plain-model", name: "Plain Model", capabilities: null },
+          ],
+        },
+      ],
+    } as unknown as ServerConfig;
+
+    const options = buildModelOptions(config, null);
+
+    expect(options.find((option) => option.key === "pi:metadata-model")?.metadata).toEqual({
+      limits: { context: 128_000, output: 8_000 },
+      modalities: { input: ["text", "image"], output: ["text"] },
+      tools: true,
+      reasoning: false,
+      pricing: {
+        unit: "usd_per_million_tokens",
+        tiers: [
+          { inputTokensAbove: 200_000, input: 4, output: 16, cache: { read: 0.4, write: 4 } },
+        ],
+      },
+      promptCacheSeconds: { short: 300 },
+      inputLimits: { maxRequestBytes: 20_000_000 },
+    });
+    expect(options.find((option) => option.key === "pi:plain-model")).not.toHaveProperty(
+      "metadata",
+    );
+  });
+
   it("selects Pi models generically and retains model options for a custom Pi instance", () => {
     const config = {
       providers: [

@@ -6,6 +6,7 @@ import type {
   SidebarProjectSnapshot,
 } from "../../sidebarProjectGrouping";
 import { resolveSettingsScope, validateSettingsScopeSearch } from "./settingsScope";
+import { settingsScopeCwdResolve } from "./settingsScopeCwdResolve";
 
 const laptopId = EnvironmentId.make("laptop");
 const serverId = EnvironmentId.make("server");
@@ -58,6 +59,38 @@ function group(
 }
 
 const groups = [group("t3code", [first, second, third]), group("other", [other])];
+
+describe("settings workspace cwd", () => {
+  it("resolves the exact project/environment target, not the first grouped checkout", () => {
+    const scope = resolveSettingsScope({ project: "t3code" }, groups, environments);
+    expect(settingsScopeCwdResolve(scope, { environmentId: laptopId, projectId: second.id })).toBe(
+      second.workspaceRoot,
+    );
+    expect(settingsScopeCwdResolve(scope, { environmentId: serverId, projectId: third.id })).toBe(
+      third.workspaceRoot,
+    );
+    expect(
+      settingsScopeCwdResolve(scope, { environmentId: serverId, projectId: second.id }),
+    ).toBeNull();
+  });
+
+  it("uses machine inventory for global settings and never infers an absent project target", () => {
+    for (const search of [{}, { machine: laptopId }]) {
+      expect(
+        settingsScopeCwdResolve(resolveSettingsScope(search, groups, environments), {
+          environmentId: laptopId,
+          projectId: first.id,
+        }),
+      ).toBeNull();
+    }
+    expect(
+      settingsScopeCwdResolve(
+        resolveSettingsScope({ project: "t3code" }, groups, environments),
+        null,
+      ),
+    ).toBeNull();
+  });
+});
 
 describe("settings scope search", () => {
   it("ignores the retired scope key from older links", () => {

@@ -5,6 +5,8 @@ import type {
   ServerProviderSlashCommand,
 } from "@t3tools/contracts";
 
+export { providerModelsResolveForCwd } from "./providerModelsResolveForCwd.ts";
+
 export type ProviderSkillSourceKind = "app" | "repo" | "project" | "personal" | "system" | "other";
 
 function titleCaseWords(value: string): string {

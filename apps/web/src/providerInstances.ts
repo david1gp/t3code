@@ -29,6 +29,7 @@ import {
   resolveProviderInstanceDisplayName,
   shouldShowInstanceBadge,
 } from "@t3tools/client-runtime/state/provider-instance-display";
+import { providerModelsResolveForCwd } from "@t3tools/client-runtime/providerSkills";
 
 export { normalizeProviderAccentColor, shouldShowInstanceBadge };
 
@@ -93,6 +94,7 @@ export function isProviderInstancePickerVisible(entry: ProviderInstanceEntry): b
  */
 export function deriveProviderInstanceEntries(
   providers: ReadonlyArray<ServerProvider>,
+  effectiveCwd?: string | null,
 ): ReadonlyArray<ProviderInstanceEntry> {
   return providers.map((snapshot) => {
     const instanceId = snapshot.instanceId;
@@ -111,7 +113,7 @@ export function deriveProviderInstanceEntries(
       isDefault,
       isAvailable: snapshot.availability !== "unavailable",
       snapshot,
-      models: snapshot.models,
+      models: providerModelsResolveForCwd(snapshot, effectiveCwd),
     } satisfies ProviderInstanceEntry;
   });
 }

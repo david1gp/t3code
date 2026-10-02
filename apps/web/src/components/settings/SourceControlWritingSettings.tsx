@@ -19,6 +19,7 @@ import {
 } from "./useScopedSettings";
 import { useScopedModelDisabledReason } from "./useScopedModelAvailability";
 import { useSettingsScope } from "./SettingsScopeContext";
+import { settingsScopeCwdResolve } from "./settingsScopeCwdResolve";
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
@@ -64,7 +65,8 @@ export function SourceControlWritingSettingsSection() {
   const settings = useScopedSettings();
   const updateSettings = useUpdateScopedSettings();
   const navigate = useNavigate();
-  const { environment, connectedEnvironments, targets } = useSettingsScope();
+  const { scope, environment, connectedEnvironments, targets, target } = useSettingsScope();
+  const effectiveCwd = settingsScopeCwdResolve(scope, target);
   // The representative supplies the provider list; a model choice is checked
   // against every target before it fans out.
   const environmentId = environment?.environmentId ?? null;
@@ -100,7 +102,11 @@ export function SourceControlWritingSettingsSection() {
   const textGenerationProviders = serverProviders.filter(
     (provider) => provider.supportsTextGeneration !== false,
   );
-  const defaultModelSelection = resolveAppModelSelectionState(settings, textGenerationProviders);
+  const defaultModelSelection = resolveAppModelSelectionState(
+    settings,
+    textGenerationProviders,
+    effectiveCwd,
+  );
   const usesDedicatedModel = settings.sourceControlWriterModelSelection !== null;
   const activeSelection = resolveAppModelSelectionState(
     {
@@ -111,9 +117,13 @@ export function SourceControlWritingSettingsSection() {
       ),
     },
     textGenerationProviders,
+    effectiveCwd,
   );
   const instanceEntries = sortProviderInstanceEntries(
-    applyProviderInstanceSettings(deriveProviderInstanceEntries(textGenerationProviders), settings),
+    applyProviderInstanceSettings(
+      deriveProviderInstanceEntries(textGenerationProviders, effectiveCwd),
+      settings,
+    ),
   );
   const canEnableDedicatedModel = instanceEntries.some(
     (entry) =>
@@ -124,6 +134,7 @@ export function SourceControlWritingSettingsSection() {
     textGenerationProviders,
     activeSelection.instanceId,
     activeSelection.model,
+    effectiveCwd,
   );
   const writerModelDisabledReason = useScopedModelDisabledReason(settings, instanceEntries);
 

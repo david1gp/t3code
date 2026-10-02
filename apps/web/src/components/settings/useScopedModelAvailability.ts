@@ -9,6 +9,7 @@ import {
 } from "../../providerInstances";
 import { useEnvironments } from "../../state/environments";
 import { useSettingsScope } from "./SettingsScopeContext";
+import { settingsScopeCwdResolve } from "./settingsScopeCwdResolve";
 
 /**
  * A model choice fans out to every selected target, so it must exist on all
@@ -20,7 +21,7 @@ export function useScopedModelDisabledReason(
   settings: UnifiedSettings,
   entries: readonly ProviderInstanceEntry[],
 ) {
-  const { targets } = useSettingsScope();
+  const { scope, targets } = useSettingsScope();
   const { environments } = useEnvironments();
   return useCallback(
     (instanceId: ProviderInstanceId, model: string): string | null => {
@@ -38,6 +39,9 @@ export function useScopedModelDisabledReason(
         const options = getCustomModelOptionsByInstance(
           { ...settings, ...candidate.settings },
           config.providers,
+          undefined,
+          undefined,
+          settingsScopeCwdResolve(scope, candidate),
         ).get(instanceId);
         if (
           !entry?.enabled ||
@@ -50,6 +54,6 @@ export function useScopedModelDisabledReason(
       }
       return null;
     },
-    [entries, environments, settings, targets],
+    [entries, environments, settings, scope, targets],
   );
 }

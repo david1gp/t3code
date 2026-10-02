@@ -31,6 +31,7 @@ import { Switch } from "../ui/switch";
 import type { ProjectSettingsCategory } from "./ProjectSettingsPanel";
 import { searchableSetting } from "./settingsSearch";
 import { useSettingsScope } from "./SettingsScopeContext";
+import { settingsScopeCwdResolve } from "./settingsScopeCwdResolve";
 import { providerSupportsRuntimeMode } from "./providerSupportsRuntimeMode";
 import {
   SETTINGS_PICKER_TRIGGER_CLASSNAME,
@@ -65,15 +66,17 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
     ? environments.find((environment) => environment.environmentId === target.environmentId)
     : undefined;
   const providers = representative?.serverConfig?.providers ?? EMPTY_SERVER_PROVIDERS;
+  const effectiveCwd = settingsScopeCwdResolve(scope, target);
   const selection = resolveDefaultProviderModelSelection(providers, settings.defaultModelSelection);
   const entries = sortProviderInstanceEntries(
-    applyProviderInstanceSettings(deriveProviderInstanceEntries(providers), settings),
+    applyProviderInstanceSettings(deriveProviderInstanceEntries(providers, effectiveCwd), settings),
   );
   const modelOptions = getCustomModelOptionsByInstance(
     settings,
     providers,
     selection?.instanceId,
     selection?.model,
+    effectiveCwd,
   );
   const activeEntry = entries.find((entry) => entry.instanceId === selection?.instanceId);
   const mixedModel = useScopedSettingsMixed(["defaultModelSelection"]);
@@ -111,6 +114,9 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
       const options = getCustomModelOptionsByInstance(
         { ...settings, ...candidate.settings },
         config.providers,
+        undefined,
+        undefined,
+        settingsScopeCwdResolve(scope, candidate),
       ).get(instanceId);
       if (
         !entry?.enabled ||

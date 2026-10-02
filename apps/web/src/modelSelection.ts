@@ -4,6 +4,7 @@ import {
   DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
   type ModelSelection,
+  type ModelMetadata,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
@@ -32,6 +33,7 @@ import {
   NO_PROVIDER_MODEL_SELECTION,
 } from "./providerInstances";
 import { sortModelsForProviderInstance } from "./modelOrdering";
+import { providerModelsResolveForCwd } from "@t3tools/client-runtime/providerSkills";
 
 const MAX_CUSTOM_MODEL_COUNT = 32;
 export const MAX_CUSTOM_MODEL_LENGTH = 256;
@@ -89,6 +91,7 @@ export interface AppModelOption {
   isDefault?: boolean;
   isLegacy?: boolean;
   isUnavailable?: boolean;
+  metadata?: ModelMetadata;
 }
 
 function appendUnavailableDynamicModelSelection(
@@ -124,6 +127,7 @@ function toAppModelOption(model: ServerProvider["models"][number]): AppModelOpti
   if (model.badge) option.badge = model.badge;
   if (model.isDefault) option.isDefault = true;
   if (model.isLegacy) option.isLegacy = true;
+  if (model.metadata) option.metadata = model.metadata;
   return option;
 }
 
@@ -241,13 +245,16 @@ export function getAppModelOptionsForInstance(
   settings: UnifiedSettings,
   entry: ProviderInstanceEntry,
   selectedModel?: string | null,
+  effectiveCwd?: string | null,
 ): AppModelOption[] {
-  const options: AppModelOption[] = entry.models
-    .filter((model) => !model.isCustom)
-    .map(toAppModelOption);
+  const models =
+    effectiveCwd === undefined
+      ? entry.models
+      : providerModelsResolveForCwd(entry.snapshot, effectiveCwd);
+  const options: AppModelOption[] = models.filter((model) => !model.isCustom).map(toAppModelOption);
   const seen = new Set(options.map((option) => option.slug));
   const builtInModelSlugs = new Set(
-    Arr.filterMap(entry.models, (model) =>
+    Arr.filterMap(models, (model) =>
       model.isCustom ? Result.failVoid : Result.succeed(model.slug),
     ),
   );
@@ -265,7 +272,7 @@ export function getAppModelOptionsForInstance(
   const preferences = readInstanceModelPreferences(settings, entry.instanceId);
   return appendUnavailableDynamicModelSelection(
     applyInstanceModelPreferences(options, preferences),
-    entry.models,
+    models,
     entry.driverKind,
     selectedModel,
     preferences.hiddenModels,
@@ -334,6 +341,7 @@ export function getCustomModelOptionsByInstance(
   providers: ReadonlyArray<ServerProvider>,
   selectedInstanceId?: ProviderInstanceId | null,
   selectedModel?: string | null,
+  effectiveCwd?: string | null,
 ): ReadonlyMap<ProviderInstanceId, ReadonlyArray<ModelEsque>> {
   const out = new Map<ProviderInstanceId, ReadonlyArray<ModelEsque>>();
   for (const entry of deriveProviderInstanceEntries(providers)) {
@@ -343,6 +351,7 @@ export function getCustomModelOptionsByInstance(
         settings,
         entry,
         entry.instanceId === selectedInstanceId ? selectedModel : null,
+        effectiveCwd,
       ),
     );
   }
@@ -397,6 +406,7 @@ export function resolvePlanAgentHealPatch(input: {
 export function resolveAppModelSelectionState(
   settings: UnifiedSettings,
   providers: ReadonlyArray<ServerProvider>,
+  effectiveCwd?: string | null,
 ): ModelSelection {
   const selection = settings.textGenerationModelSelection ?? {
     instanceId: DEFAULT_TEXT_GENERATION_INSTANCE_ID,
@@ -405,7 +415,7 @@ export function resolveAppModelSelectionState(
   const supportedProviders = providers.filter(
     (provider) => provider.supportsTextGeneration !== false,
   );
-  const entries = deriveProviderInstanceEntries(supportedProviders);
+  const entries = deriveProviderInstanceEntries(supportedProviders, effectiveCwd);
   const selectedEntry = entries.find(
     (entry) => entry.instanceId === selection.instanceId && entry.enabled && entry.isAvailable,
   );

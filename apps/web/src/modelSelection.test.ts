@@ -66,6 +66,50 @@ function settingsWithProviderInstances(): UnifiedSettings {
 }
 
 describe("instance-scoped model selection", () => {
+  it("preserves provider model metadata in picker options", () => {
+    const metadata = {
+      limits: { context: 128_000, input: 120_000, output: 8_000 },
+      modalities: { input: ["text", "image"], output: ["text"] },
+      tools: true,
+      reasoning: true,
+      pricing: {
+        unit: "usd_per_million_tokens",
+        base: { input: 2, output: 8, cache: { read: 0.2, write: 2 } },
+        tiers: [
+          { inputTokensAbove: 200_000, input: 4, output: 16, cache: { read: 0.4, write: 4 } },
+        ],
+      },
+      promptCacheSeconds: { short: 300, long: 3_600 },
+      inputLimits: { maxRequestBytes: 20_000_000, images: { maxPerRequest: 10 } },
+    } as const;
+    const baseProvider = provider({ instanceId: "claudeAgent", models: ["claude-opus"] });
+    const providers = [
+      {
+        ...baseProvider,
+        models: [{ ...baseProvider.models[0]!, metadata }],
+      },
+    ];
+    const entry = deriveProviderInstanceEntries(providers)[0]!;
+
+    expect(
+      getAppModelOptionsForInstance(settingsWithProviderInstances(), entry)[0]?.metadata,
+    ).toEqual({
+      limits: { context: 128_000, input: 120_000, output: 8_000 },
+      modalities: { input: ["text", "image"], output: ["text"] },
+      tools: true,
+      reasoning: true,
+      pricing: {
+        unit: "usd_per_million_tokens",
+        base: { input: 2, output: 8, cache: { read: 0.2, write: 2 } },
+        tiers: [
+          { inputTokensAbove: 200_000, input: 4, output: 16, cache: { read: 0.4, write: 4 } },
+        ],
+      },
+      promptCacheSeconds: { short: 300, long: 3_600 },
+      inputLimits: { maxRequestBytes: 20_000_000, images: { maxPerRequest: 10 } },
+    });
+  });
+
   it("preserves server-provided legacy model metadata", () => {
     const baseProvider = provider({
       instanceId: "claudeAgent",

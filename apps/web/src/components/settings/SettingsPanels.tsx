@@ -82,6 +82,7 @@ import {
 } from "./useScopedSettings";
 import { useScopedModelDisabledReason } from "./useScopedModelAvailability";
 import { useSettingsScope } from "./SettingsScopeContext";
+import { settingsScopeCwdResolve } from "./settingsScopeCwdResolve";
 import { ProjectDefaultsSettings } from "./ProjectDefaultsSettings";
 import { useThreadActions } from "../../hooks/useThreadActions";
 import { useDesktopUpdateState } from "../../state/desktopUpdate";
@@ -2157,7 +2158,8 @@ export function GeneralSettingsPanel() {
   const settings = useScopedSettings();
   const updateSettings = useUpdateScopedSettings();
   const navigate = useNavigate();
-  const { scope, environment, connectedEnvironments } = useSettingsScope();
+  const { scope, environment, connectedEnvironments, target } = useSettingsScope();
+  const effectiveCwd = settingsScopeCwdResolve(scope, target);
   // The representative environment supplies the provider list for pickers;
   // a fanned-out model choice is validated against every target before it
   // is written. Per-machine tuning (background activity overrides) still
@@ -2189,12 +2191,16 @@ export function GeneralSettingsPanel() {
   const textGenerationModelSelection = resolveAppModelSelectionState(
     settings,
     textGenerationProviders,
+    effectiveCwd,
   );
   const textGenInstanceId = textGenerationModelSelection.instanceId;
   const textGenModel = textGenerationModelSelection.model;
   const textGenModelOptions = textGenerationModelSelection.options;
   const textGenerationModelInstanceEntries = sortProviderInstanceEntries(
-    applyProviderInstanceSettings(deriveProviderInstanceEntries(textGenerationProviders), settings),
+    applyProviderInstanceSettings(
+      deriveProviderInstanceEntries(textGenerationProviders, effectiveCwd),
+      settings,
+    ),
   );
   const hasTextGenerationProvider = textGenerationModelInstanceEntries.some(
     (entry) => entry.enabled && entry.isAvailable,
@@ -2209,6 +2215,7 @@ export function GeneralSettingsPanel() {
     textGenerationProviders,
     textGenInstanceId,
     textGenModel,
+    effectiveCwd,
   );
   const isTextGenerationModelDirty = !Equal.equals(
     settings.textGenerationModelSelection ?? null,
@@ -3546,6 +3553,7 @@ export function GeneralSettingsPanel() {
                           ),
                         },
                         textGenerationProviders,
+                        effectiveCwd,
                       ),
                     });
                   }}
@@ -3579,6 +3587,7 @@ export function GeneralSettingsPanel() {
                             ),
                           },
                           textGenerationProviders,
+                          effectiveCwd,
                         ),
                       });
                     }}

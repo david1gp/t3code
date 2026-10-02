@@ -3,12 +3,14 @@ import {
   type ProviderDriverKind,
   ModelCapabilities,
   ModelSelection,
+  ModelMetadata,
   ServerConfig as T3ServerConfig,
 } from "@t3tools/contracts";
 import {
   buildExplicitProviderOptionSelectionsFromDescriptors,
   getProviderOptionDescriptors,
 } from "@t3tools/shared/model";
+import { providerModelsResolveForCwd } from "@t3tools/client-runtime/providerSkills";
 
 export type ModelOption = {
   readonly key: string;
@@ -21,6 +23,7 @@ export type ModelOption = {
   readonly isLegacy: boolean;
   readonly isUnavailable?: boolean;
   readonly capabilities: ModelCapabilities | null;
+  readonly metadata?: ModelMetadata;
   readonly selection: ModelSelection;
 };
 
@@ -150,6 +153,7 @@ export function resolveNewTaskModelSelection(input: {
 export function buildModelOptions(
   config: T3ServerConfig | null | undefined,
   fallbackModelSelection: ModelSelection | null,
+  effectiveCwd?: string | null,
 ): ReadonlyArray<ModelOption> {
   const options = new Map<string, ModelOption>();
 
@@ -164,7 +168,7 @@ export function buildModelOptions(
     }
 
     const providerLabel = providerDisplayLabel(provider);
-    for (const model of provider.models) {
+    for (const model of providerModelsResolveForCwd(provider, effectiveCwd)) {
       const key = `${provider.instanceId}:${model.slug}`;
       options.set(key, {
         key,
@@ -176,6 +180,7 @@ export function buildModelOptions(
         isDefault: model.isDefault === true,
         isLegacy: model.isLegacy === true,
         capabilities: model.capabilities,
+        ...(model.metadata ? { metadata: model.metadata } : {}),
         selection: normalizeSelectionOptions(
           {
             instanceId: provider.instanceId,
@@ -226,6 +231,7 @@ export function buildModelOptions(
           ? { isUnavailable: true }
           : {}),
         capabilities: model?.capabilities ?? null,
+        ...(model?.metadata ? { metadata: model.metadata } : {}),
         selection: fallbackModelSelection,
       });
     }
