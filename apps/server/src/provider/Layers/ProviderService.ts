@@ -820,6 +820,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         ...(tokenUsage?.reasoningTokens !== undefined
           ? { reasoningTokens: tokenUsage.reasoningTokens }
           : {}),
+        ...(tokenUsage?.reasoningTokensAvailable !== undefined
+          ? { reasoningTokensAvailable: tokenUsage.reasoningTokensAvailable }
+          : {}),
       },
     };
     const properties = yield* Ref.modify(turnAnalytics, (state) => {

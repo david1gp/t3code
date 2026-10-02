@@ -545,6 +545,101 @@ it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-branch-pr-proje
   },
 );
 
+it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-authoritative-finals-")))(
+  "authoritative final projection",
+  (it) => {
+    it.effect(
+      "persists and replays authoritative assistant and reasoning finals including empty text",
+      () =>
+        Effect.gen(function* () {
+          const pipeline = yield* OrchestrationProjectionPipeline;
+          const store = yield* OrchestrationEventStore;
+          const sql = yield* SqlClient.SqlClient;
+          const now = "2026-01-01T00:00:00.000Z";
+          const threadId = ThreadId.make("thread-authoritative-finals");
+          const fields = {
+            aggregateKind: "thread" as const,
+            aggregateId: threadId,
+            occurredAt: now,
+            commandId: null,
+            causationEventId: null,
+            correlationId: null,
+            metadata: {},
+          };
+          const created = yield* store.append({
+            ...fields,
+            eventId: EventId.make("authoritative-created"),
+            type: "thread.created",
+            payload: {
+              threadId,
+              projectId: ProjectId.make("project-finals"),
+              title: "Finals",
+              modelSelection: {
+                instanceId: ProviderInstanceId.make("codex"),
+                model: "gpt-5-codex",
+              },
+              runtimeMode: "full-access",
+              branch: null,
+              worktreePath: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+          });
+          yield* pipeline.projectEvent(created);
+          for (const role of ["assistant", "reasoning"] as const) {
+            const messageId = MessageId.make(`authoritative-${role}`);
+            for (const [index, update] of [
+              { text: "Draft", streaming: true },
+              { text: "", streaming: false },
+              { text: "Final", streaming: false, textMode: "replace" as const },
+              { text: "Dra", streaming: false, textMode: "replace" as const },
+              { text: "", streaming: false, textMode: "replace" as const },
+            ].entries()) {
+              const event = yield* store.append({
+                ...fields,
+                eventId: EventId.make(`authoritative-${role}-${index}`),
+                type: "thread.message-sent",
+                payload: {
+                  threadId,
+                  messageId,
+                  role,
+                  turnId: null,
+                  createdAt: now,
+                  updatedAt: now,
+                  ...update,
+                },
+              });
+              yield* pipeline.projectEvent(event);
+              const rows = yield* sql<{
+                text: string;
+                isStreaming: number;
+                createdAt: string;
+              }>`SELECT text, is_streaming AS "isStreaming", created_at AS "createdAt" FROM projection_thread_messages WHERE message_id = ${messageId}`;
+              assert.deepEqual(rows, [
+                {
+                  text: index === 1 ? "Draft" : update.text,
+                  isStreaming: update.streaming ? 1 : 0,
+                  createdAt: now,
+                },
+              ]);
+            }
+          }
+          yield* sql`DELETE FROM projection_thread_messages WHERE thread_id = ${threadId}`;
+          yield* sql`UPDATE projection_state SET last_applied_sequence = 0 WHERE projector = 'projection.thread-messages'`;
+          yield* pipeline.bootstrap;
+          const rows = yield* sql<{
+            text: string;
+            isStreaming: number;
+          }>`SELECT text, is_streaming AS "isStreaming" FROM projection_thread_messages WHERE thread_id = ${threadId} ORDER BY message_id`;
+          assert.deepEqual(rows, [
+            { text: "", isStreaming: 0 },
+            { text: "", isStreaming: 0 },
+          ]);
+        }),
+    );
+  },
+);
+
 it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
   it.effect("bootstraps all projection states and writes projection rows", () =>
     Effect.gen(function* () {

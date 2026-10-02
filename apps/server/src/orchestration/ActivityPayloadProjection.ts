@@ -502,15 +502,21 @@ export function projectActivityPayload(
 
 /**
  * Matches the validity rule in the web client's
- * `deriveLatestContextWindowSnapshot`: rows without a finite, non-negative
- * `usedTokens` are skipped during its backward walk, so they must not shadow
- * an earlier resolvable row here.
+ * `deriveLatestContextWindowSnapshot`: an explicit unknown occupancy shadows
+ * older known rows, while malformed rows do not.
  */
 function isResolvableContextWindowActivity(activity: OrchestrationThreadActivity): boolean {
   if (activity.kind !== "context-window.updated") {
     return false;
   }
   const payload = asRecord(activity.payload);
+  const status = payload?.contextUsageStatus;
+  if (status === "unknown") {
+    return payload?.usedTokens === undefined;
+  }
+  if (status !== undefined && status !== "reported" && status !== "estimated") {
+    return false;
+  }
   const usedTokens = payload?.usedTokens;
   return typeof usedTokens === "number" && Number.isFinite(usedTokens) && usedTokens >= 0;
 }

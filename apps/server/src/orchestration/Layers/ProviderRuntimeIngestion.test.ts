@@ -443,6 +443,282 @@ describe("ProviderRuntimeIngestion", () => {
     };
   }
 
+  it.each(
+    (["assistant", "reasoning"] as const).flatMap((role) =>
+      (["buffered", "persisted", "partial", "token"] as const).flatMap((delivery) =>
+        ["Final", "Dra", "", "Draft extended"].map((finalText) => ({ role, delivery, finalText })),
+      ),
+    ),
+  )(
+    "replaces $delivery $role Draft with authoritative '$finalText'",
+    async ({ role, delivery, finalText }) => {
+      const harness = await createHarness({
+        serverSettings: {
+          responseStreamingMode:
+            delivery === "buffered" ? "turn" : delivery === "token" ? "token" : "paragraph",
+        },
+      });
+      const fields = {
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("turn-final"),
+        itemId: asItemId("item-final"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+      };
+      const streamKind = role === "reasoning" ? "reasoning_text" : "assistant_text";
+      await harness.emitAndDrain([
+        {
+          ...fields,
+          type: "content.delta",
+          eventId: asEventId("draft"),
+          payload: { streamKind, delta: delivery === "buffered" ? "Draft" : "Draft\n\n" },
+        },
+        ...(delivery === "partial"
+          ? [
+              {
+                ...fields,
+                type: "content.delta",
+                eventId: asEventId("pending-suffix"),
+                payload: { streamKind, delta: "pending suffix" },
+              },
+            ]
+          : []),
+      ]);
+      const before = (await harness.readModel()).threads[0]!.messages;
+      expect(before).toHaveLength(delivery === "buffered" ? 0 : 1);
+      if (delivery !== "buffered") expect(before[0]!.text).toBe("Draft\n\n");
+
+      const completion = {
+        ...fields,
+        type: "item.completed",
+        payload: { itemType: role === "reasoning" ? "reasoning" : "assistant_message", finalText },
+      };
+      await harness.emitAndDrain([{ ...completion, eventId: asEventId("final") }]);
+      const firstFinal = (await harness.readModel()).threads[0]!.messages;
+      expect(firstFinal).toHaveLength(1);
+      expect(firstFinal[0]).toMatchObject({ role, text: finalText, streaming: false });
+
+      await harness.emitAndDrain([
+        { ...completion, eventId: asEventId("repeated-final") },
+        {
+          ...fields,
+          type: "turn.completed",
+          eventId: asEventId("turn-final-completed"),
+          payload: { state: "completed" },
+        },
+      ]);
+      const repeated = (await harness.readModel()).threads[0]!.messages;
+      expect(repeated).toHaveLength(1);
+      expect(repeated[0]).toMatchObject({
+        id: firstFinal[0]!.id,
+        role,
+        text: finalText,
+        streaming: false,
+      });
+    },
+  );
+
+  it.each(["assistant_message", "reasoning"] as const)(
+    "creates distinct final-only %s items once, including empty finals",
+    async (itemType) => {
+      const harness = await createHarness();
+      const fields = {
+        type: "item.completed",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("turn-final-only"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+      };
+      for (const [index, finalText] of ["Final", ""].entries()) {
+        const event = {
+          ...fields,
+          itemId: asItemId(`only-${index}`),
+          payload: { itemType, finalText },
+        };
+        await harness.emitAndDrain([
+          { ...event, eventId: asEventId(`only-${index}`) },
+          { ...event, eventId: asEventId(`only-${index}-repeat`) },
+        ]);
+      }
+      const messages = (await harness.readModel()).threads[0]!.messages;
+      expect(messages.map((message) => message.text)).toEqual(["Final", ""]);
+      expect(messages.every((message) => !message.streaming)).toBe(true);
+      expect(new Set(messages.map((message) => message.id)).size).toBe(2);
+    },
+  );
+
+  it.each(["assistant", "reasoning"] as const)(
+    "replaces a closed %s item without overwriting a newer streaming item",
+    async (role) => {
+      const harness = await createHarness({ serverSettings: { responseStreamingMode: "turn" } });
+      const fields = {
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("turn-item-identity"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+      };
+      const streamKind = role === "reasoning" ? "reasoning_text" : "assistant_text";
+      const itemType = role === "reasoning" ? "reasoning" : "assistant_message";
+      await harness.emitAndDrain([
+        {
+          ...fields,
+          type: "content.delta",
+          eventId: asEventId("old-draft"),
+          itemId: asItemId("old-item"),
+          payload: { streamKind, delta: "Draft" },
+        },
+        {
+          ...fields,
+          type: "item.completed",
+          eventId: asEventId("old-close"),
+          itemId: asItemId("old-item"),
+          payload: { itemType },
+        },
+        {
+          ...fields,
+          type: "content.delta",
+          eventId: asEventId("new-draft"),
+          itemId: asItemId("new-item"),
+          payload: { streamKind, delta: "New draft" },
+        },
+        {
+          ...fields,
+          type: "item.completed",
+          eventId: asEventId("old-final"),
+          itemId: asItemId("old-item"),
+          payload: { itemType, finalText: "" },
+        },
+        {
+          ...fields,
+          type: "item.completed",
+          eventId: asEventId("new-final"),
+          itemId: asItemId("new-item"),
+          payload: { itemType, finalText: "New final" },
+        },
+      ]);
+      const messages = (await harness.readModel()).threads[0]!.messages;
+      expect(messages).toHaveLength(2);
+      expect(messages.find((message) => message.id.includes("old-item"))?.text).toBe("");
+      expect(messages.find((message) => message.id.includes("new-item"))?.text).toBe("New final");
+      expect(messages.every((message) => !message.streaming)).toBe(true);
+    },
+  );
+
+  it.each(
+    (["assistant", "reasoning"] as const).flatMap((role) =>
+      (["turn", "token"] as const).flatMap((responseStreamingMode) =>
+        ["Draft continued", "Final", "Dra", ""].map((finalText) => ({
+          role,
+          responseStreamingMode,
+          finalText,
+        })),
+      ),
+    ),
+  )(
+    "replaces the whole split $role item with '$finalText' in $responseStreamingMode mode",
+    async ({ role, responseStreamingMode, finalText }) => {
+      const harness = await createHarness({ serverSettings: { responseStreamingMode } });
+      const fields = {
+        provider: ProviderDriverKind.make("opencode"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("turn-split-final"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+      };
+      const itemId = asItemId("split-item");
+      const streamKind = role === "reasoning" ? "reasoning_text" : "assistant_text";
+      const itemType = role === "reasoning" ? "reasoning" : "assistant_message";
+      // OpenCode 2.0.18's openai-chat reasoning channel stays open across tool
+      // input, and its publisher's ended event contains the whole fragment.
+      // Approval similarly splits assistant display rows, not provider items.
+      await harness.emitAndDrain([
+        {
+          ...fields,
+          type: "content.delta",
+          eventId: asEventId("split-first"),
+          itemId,
+          payload: { streamKind, delta: "Draft" },
+        },
+        role === "reasoning"
+          ? {
+              ...fields,
+              type: "item.started",
+              eventId: asEventId("split-tool"),
+              itemId: asItemId("tool"),
+              payload: { itemType: "dynamic_tool_call", title: "edit" },
+            }
+          : {
+              ...fields,
+              type: "request.opened",
+              eventId: asEventId("split-approval"),
+              requestId: ApprovalRequestId.make("split-approval"),
+              payload: { requestType: "command_execution_approval", detail: "edit" },
+            },
+        {
+          ...fields,
+          type: "content.delta",
+          eventId: asEventId("split-second"),
+          itemId,
+          payload: { streamKind, delta: " continued" },
+        },
+      ]);
+      const completion = {
+        ...fields,
+        type: "item.completed",
+        itemId,
+        payload: { itemType, finalText },
+      };
+      await harness.emitAndDrain([{ ...completion, eventId: asEventId("split-final") }]);
+      const messages = (await harness.readModel()).threads[0]!.messages;
+      expect(messages).toHaveLength(2);
+      expect(messages.map((message) => message.text)).toEqual(
+        finalText.startsWith("Draft")
+          ? ["Draft", finalText.slice("Draft".length)]
+          : ["", finalText],
+      );
+      expect(messages.map((message) => message.text).join("")).toBe(finalText);
+      expect(messages.every((message) => !message.streaming)).toBe(true);
+
+      await harness.emitAndDrain([{ ...completion, eventId: asEventId("split-final-repeat") }]);
+      const repeated = (await harness.readModel()).threads[0]!.messages;
+      expect(repeated.map((message) => message.id)).toEqual(messages.map((message) => message.id));
+      expect(repeated.map((message) => message.text)).toEqual(
+        messages.map((message) => message.text),
+      );
+    },
+  );
+
+  it("replaces a legacy final-only reasoning snapshot without creating another message", async () => {
+    const harness = await createHarness();
+    const fields = {
+      type: "item.completed",
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-snapshot-replacement"),
+      itemId: asItemId("snapshot-replacement"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+    };
+    await harness.emitAndDrain([
+      {
+        ...fields,
+        eventId: asEventId("legacy-snapshot"),
+        payload: { itemType: "reasoning", detail: "Draft" },
+      },
+    ]);
+    const original = (await harness.readModel()).threads[0]!.messages;
+    expect(original).toHaveLength(1);
+    expect(original[0]!.text).toBe("Draft");
+    await harness.emitAndDrain([
+      {
+        ...fields,
+        eventId: asEventId("authoritative-snapshot"),
+        payload: { itemType: "reasoning", finalText: "" },
+      },
+    ]);
+    const replaced = (await harness.readModel()).threads[0]!.messages;
+    expect(replaced).toHaveLength(1);
+    expect(replaced[0]).toMatchObject({ id: original[0]!.id, text: "", streaming: false });
+  });
+
   it("maps turn started/completed events into thread session updates", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
@@ -4649,6 +4925,73 @@ describe("ProviderRuntimeIngestion", () => {
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.title).toBe("User-set title");
   });
+
+  it("projects context availability snapshots without restoring or zero-filling older usage", async () => {
+    const harness = await createHarness();
+    const usages = [
+      { usedTokens: 81_659, maxTokens: 200_000 },
+      { contextUsageStatus: "unknown" as const, compactsAutomatically: false },
+      { contextUsageStatus: "estimated" as const, usedTokens: 4_000 },
+      { usedTokens: 5_000 },
+    ];
+    for (const [index, usage] of usages.entries()) {
+      harness.emit({
+        type: "thread.token-usage.updated",
+        eventId: asEventId(`availability-${index}`),
+        provider: ProviderDriverKind.make("pi"),
+        createdAt: "2026-10-01T00:00:00.000Z",
+        threadId: asThreadId("thread-1"),
+        payload: { usage },
+      });
+    }
+    await harness.drain();
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === asThreadId("thread-1"));
+    const activities = thread?.activities.filter(
+      (activity) => activity.kind === "context-window.updated",
+    );
+    expect(activities?.map((activity) => activity.payload)).toEqual(usages);
+  });
+
+  it.each(["unknown", "estimated"] as const)(
+    "does not infer a compaction reduction across %s occupancy",
+    async (contextUsageStatus) => {
+      const harness = await createHarness();
+      const usages = [
+        { usedTokens: 80_000 },
+        contextUsageStatus === "unknown"
+          ? { contextUsageStatus }
+          : { contextUsageStatus, usedTokens: 5_000 },
+        { usedTokens: 4_000 },
+      ];
+      for (const [index, usage] of usages.entries()) {
+        harness.emit({
+          type: "thread.token-usage.updated",
+          eventId: asEventId(`compaction-availability-${index}`),
+          provider: ProviderDriverKind.make("pi"),
+          createdAt: "2026-10-01T00:00:00.000Z",
+          threadId: asThreadId("thread-1"),
+          payload: { usage },
+        });
+      }
+      harness.emit({
+        type: "thread.state.changed",
+        eventId: asEventId("compacted-unknown-counts"),
+        provider: ProviderDriverKind.make("pi"),
+        createdAt: "2026-10-01T00:00:00.000Z",
+        threadId: asThreadId("thread-1"),
+        payload: { state: "compacted" },
+      });
+      await harness.drain();
+      const readModel = await harness.readModel();
+      const thread = readModel.threads.find((entry) => entry.id === asThreadId("thread-1"));
+      const compacted = thread?.activities.find(
+        (activity) => activity.id === "compacted-unknown-counts",
+      );
+      expect(compacted).toBeDefined();
+      expect(compacted?.summary).not.toContain("→");
+    },
+  );
 
   it("projects context window updates into normalized thread activities", async () => {
     const harness = await createHarness();

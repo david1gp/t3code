@@ -2714,6 +2714,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
                 : {}),
               ...(typeof accumulatedTotalProcessedTokens === "number" &&
               Number.isFinite(accumulatedTotalProcessedTokens) &&
+              lastGoodUsage.usedTokens !== undefined &&
               accumulatedTotalProcessedTokens > lastGoodUsage.usedTokens
                 ? {
                     totalProcessedTokens: accumulatedTotalProcessedTokens,
@@ -2729,6 +2730,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
               : {}),
             ...(typeof accumulatedTotalProcessedTokens === "number" &&
             Number.isFinite(accumulatedTotalProcessedTokens) &&
+            lastGoodUsage.usedTokens !== undefined &&
             accumulatedTotalProcessedTokens > lastGoodUsage.usedTokens
               ? {
                   totalProcessedTokens: accumulatedTotalProcessedTokens,

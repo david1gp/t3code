@@ -3797,6 +3797,7 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
             cacheCreationTokens: 100,
             outputTokens: 300,
             reasoningTokens: 120,
+            reasoningTokensAvailable: true,
             hasSubagents: false,
           },
         },
@@ -3827,6 +3828,7 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
         cacheCreationTokens: 100,
         outputTokens: 300,
         reasoningTokens: 120,
+        reasoningTokensAvailable: true,
       });
     }),
   );

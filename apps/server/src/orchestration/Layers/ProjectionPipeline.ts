@@ -1164,7 +1164,9 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           const nextText = Option.match(existingMessage, {
             onNone: () => event.payload.text,
             onSome: (message) =>
-              event.payload.text.length === 0 ? message.text : event.payload.text,
+              event.payload.textMode !== "replace" && event.payload.text.length === 0
+                ? message.text
+                : event.payload.text,
           });
           const nextAttachments =
             event.payload.attachments !== undefined

@@ -321,7 +321,11 @@ function reasoningSegmentBaseKeyFromEvent(
 function buildContextWindowActivityPayload(
   event: ProviderRuntimeEvent,
 ): ThreadTokenUsageSnapshot | undefined {
-  if (event.type !== "thread.token-usage.updated" || event.payload.usage.usedTokens < 0) {
+  if (event.type !== "thread.token-usage.updated") {
+    return undefined;
+  }
+  const { usedTokens, contextUsageStatus } = event.payload.usage;
+  if (contextUsageStatus !== "unknown" && (usedTokens === undefined || usedTokens < 0)) {
     return undefined;
   }
   return event.payload.usage;
@@ -347,6 +351,11 @@ function compactedTokenCountsFromActivities(
       if (!isAfterLastCompaction) return [];
     }
     const payload = Predicate.isObject(activity.payload) ? activity.payload : undefined;
+    // Unavailable/estimated occupancy breaks the pair: never infer a reported
+    // before/after reduction across a compaction invalidation.
+    if (payload?.contextUsageStatus === "unknown" || payload?.contextUsageStatus === "estimated") {
+      return [undefined];
+    }
     return Predicate.isNumber(payload?.usedTokens) && payload.usedTokens >= 0
       ? [payload.usedTokens]
       : [];
@@ -490,6 +499,7 @@ export function runtimeEventToActivities(
           summary: "Provider reported turn cost",
           payload: {
             totalCostUsd,
+            providerName: event.provider,
             status: event.payload.status === "final" ? "final" : "provisional",
             ...(event.payload.costModel ? { model: event.payload.costModel } : {}),
             ...(event.payload.costSessionId
@@ -518,6 +528,7 @@ export function runtimeEventToActivities(
           summary: "Provider reported turn cost",
           payload: {
             totalCostUsd,
+            providerName: event.provider,
             status: "final",
             ...(event.payload.costModel ? { model: event.payload.costModel } : {}),
             ...(event.payload.costSessionId
@@ -1155,6 +1166,41 @@ const make = Effect.gen(function* () {
       ),
   });
 
+  // Display boundaries do not end provider items. A whole-item final must
+  // reconcile every associated row, including rows closed at tools or pauses.
+  const messageIdsByProviderItemKey = yield* Cache.make<string, ReadonlyArray<MessageId>>({
+    capacity: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_CACHE_CAPACITY,
+    timeToLive: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_TTL,
+    lookup: () => Effect.die("provider item message should be read through getOption"),
+  });
+  const providerItemMessageKey = (event: ProviderRuntimeEvent, role: MessageStreamRole) =>
+    JSON.stringify([
+      event.provider,
+      event.providerInstanceId ?? null,
+      event.threadId,
+      event.turnId ?? null,
+      role,
+      event.itemId,
+    ]);
+  const rememberProviderItemMessage = (
+    event: ProviderRuntimeEvent,
+    role: MessageStreamRole,
+    messageId: MessageId,
+  ) =>
+    event.itemId === undefined
+      ? Effect.void
+      : Cache.getOption(messageIdsByProviderItemKey, providerItemMessageKey(event, role)).pipe(
+          Effect.flatMap((existing) => {
+            const ids = Option.getOrUndefined(existing) ?? [];
+            return ids.includes(messageId)
+              ? Effect.void
+              : Cache.set(messageIdsByProviderItemKey, providerItemMessageKey(event, role), [
+                  ...ids,
+                  messageId,
+                ]);
+          }),
+        );
+
   const bufferedProposedPlanById = yield* Cache.make<string, { text: string; createdAt: string }>({
     capacity: BUFFERED_PROPOSED_PLAN_BY_ID_CACHE_CAPACITY,
     timeToLive: BUFFERED_PROPOSED_PLAN_BY_ID_TTL,
@@ -1556,6 +1602,7 @@ const make = Effect.gen(function* () {
     commandTag: string;
     finalDeltaCommandTag: string;
     fallbackText?: string;
+    finalText?: string;
     hasProjectedMessage?: boolean;
   }) =>
     Effect.gen(function* () {
@@ -1569,6 +1616,22 @@ const make = Effect.gen(function* () {
       const hasRenderableText = hasRenderableAssistantText(text);
 
       const isReasoning = messageStreamRoleOf(input.messageId) === "reasoning";
+
+      if (input.finalText !== undefined) {
+        yield* orchestrationEngine.dispatch({
+          type: isReasoning
+            ? "thread.message.reasoning.complete"
+            : "thread.message.assistant.complete",
+          commandId: yield* providerCommandId(input.event, input.commandTag),
+          threadId: input.threadId,
+          messageId: input.messageId,
+          finalText: input.finalText,
+          ...(input.turnId ? { turnId: input.turnId } : {}),
+          createdAt: input.createdAt,
+        });
+        yield* clearAssistantMessageState(input.messageId);
+        return;
+      }
 
       if (hasRenderableText) {
         yield* orchestrationEngine.dispatch({
@@ -2044,6 +2107,7 @@ const make = Effect.gen(function* () {
           createdAt: now,
           turnId,
         });
+        yield* rememberProviderItemMessage(event, "reasoning", reasoningMessageId);
         yield* rememberAssistantMessageId(thread.id, turnId, reasoningMessageId);
 
         if (
@@ -2114,6 +2178,7 @@ const make = Effect.gen(function* () {
           event,
           ...(turnId ? { turnId } : {}),
         });
+        yield* rememberProviderItemMessage(event, "assistant", assistantMessageId);
         if (turnId) {
           yield* rememberAssistantMessageId(thread.id, turnId, assistantMessageId);
         }
@@ -2231,7 +2296,107 @@ const make = Effect.gen(function* () {
         }
       }
 
-      if (event.type === "item.completed" && event.payload.itemType === "reasoning") {
+      if (
+        event.type === "item.completed" &&
+        event.payload.finalText !== undefined &&
+        (event.payload.itemType === "assistant_message" || event.payload.itemType === "reasoning")
+      ) {
+        const turnId = toTurnId(event.turnId);
+        const role = event.payload.itemType === "reasoning" ? "reasoning" : "assistant";
+        if (role === "assistant" && turnId) {
+          yield* finalizeActiveSegmentForTurn({
+            event,
+            threadId: thread.id,
+            turnId,
+            createdAt: now,
+            commandTag: "reasoning-complete-on-authoritative-assistant",
+            finalDeltaCommandTag: "reasoning-delta-finalize-on-authoritative-assistant",
+            hasProjectedMessage: false,
+            role: "reasoning",
+          });
+        }
+        const identifiedMessageIds =
+          event.itemId === undefined
+            ? Option.none<ReadonlyArray<MessageId>>()
+            : yield* Cache.getOption(
+                messageIdsByProviderItemKey,
+                providerItemMessageKey(event, role),
+              );
+        const state = turnId
+          ? yield* getAssistantSegmentStateForTurn(thread.id, turnId, role)
+          : Option.none<AssistantSegmentState>();
+        const matchingActiveMessageId = Option.flatMap(state, (entry) =>
+          entry.activeMessageId &&
+          (event.itemId === undefined ||
+            entry.baseKey === assistantSegmentBaseKeyFromEvent(event) ||
+            entry.baseKey === reasoningSegmentBaseKeyFromEvent(event, "reasoning_text") ||
+            entry.baseKey === reasoningSegmentBaseKeyFromEvent(event, "reasoning_summary_text"))
+            ? Option.some(entry.activeMessageId)
+            : Option.none(),
+        );
+        const messageId = Option.getOrElse(
+          Option.orElse(
+            Option.flatMap(identifiedMessageIds, (ids) => Option.fromUndefinedOr(ids.at(-1))),
+            () => matchingActiveMessageId,
+          ),
+          () => assistantSegmentMessageId(assistantSegmentBaseKeyFromEvent(event), 0, role),
+        );
+        yield* rememberProviderItemMessage(event, role, messageId);
+        const earlierMessageIds = Option.getOrElse(identifiedMessageIds, () => []).filter(
+          (id) => id !== messageId,
+        );
+        const earlierMessages = yield* Effect.forEach(earlierMessageIds, (id) =>
+          getThreadMessageById(thread.id, id),
+        );
+        const earlierText = earlierMessages.map((message) => message?.text ?? "").join("");
+        // Preserve unchanged prefixes on their side of the display boundary.
+        // A rewritten prefix has no provider segment identity: clear those
+        // stale rows and place the replacement on the item's latest row.
+        const preservePrefix = event.payload.finalText.startsWith(earlierText);
+        if (!preservePrefix) {
+          yield* Effect.forEach(earlierMessageIds, (id) =>
+            finalizeAssistantMessage({
+              event,
+              threadId: thread.id,
+              messageId: id,
+              ...(turnId ? { turnId } : {}),
+              createdAt: now,
+              commandTag: `${role}-complete-authoritative-prefix`,
+              finalDeltaCommandTag: `${role}-delta-finalize-authoritative-prefix`,
+              finalText: "",
+            }),
+          );
+        }
+        yield* finalizeAssistantMessage({
+          event,
+          threadId: thread.id,
+          messageId,
+          ...(turnId ? { turnId } : {}),
+          createdAt: now,
+          commandTag: `${role}-complete-authoritative`,
+          finalDeltaCommandTag: `${role}-delta-finalize-authoritative`,
+          finalText: preservePrefix
+            ? event.payload.finalText.slice(earlierText.length)
+            : event.payload.finalText,
+        });
+        if (turnId) {
+          yield* forgetAssistantMessageId(thread.id, turnId, messageId);
+          if (Option.isSome(state) && state.value.activeMessageId === messageId) {
+            yield* setAssistantSegmentStateForTurn(
+              thread.id,
+              turnId,
+              { ...state.value, activeMessageId: null },
+              role,
+            );
+          }
+        }
+      }
+
+      if (
+        event.type === "item.completed" &&
+        event.payload.itemType === "reasoning" &&
+        event.payload.finalText === undefined
+      ) {
         const turnId = toTurnId(event.turnId);
         if (turnId) {
           const activeReasoningMessageId = yield* getActiveAssistantMessageIdForTurn(
@@ -2267,6 +2432,7 @@ const make = Effect.gen(function* () {
                 0,
                 "reasoning",
               );
+              yield* rememberProviderItemMessage(event, "reasoning", snapshotMessageId);
               const existingSnapshot = yield* getThreadMessageById(thread.id, snapshotMessageId);
               if (existingSnapshot === undefined) {
                 yield* orchestrationEngine.dispatch({
@@ -2305,7 +2471,9 @@ const make = Effect.gen(function* () {
       }
 
       const assistantCompletion =
-        event.type === "item.completed" && event.payload.itemType === "assistant_message"
+        event.type === "item.completed" &&
+        event.payload.itemType === "assistant_message" &&
+        event.payload.finalText === undefined
           ? {
               messageId: MessageId.make(
                 `assistant:${event.itemId ?? event.turnId ?? event.eventId}`,

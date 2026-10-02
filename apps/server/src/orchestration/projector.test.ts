@@ -40,6 +40,69 @@ function makeEvent(input: {
 }
 
 describe("orchestration projector", () => {
+  it.each(["assistant", "reasoning"])(
+    "replays authoritative %s text without retaining empty drafts",
+    async (role) => {
+      const now = "2026-01-01T00:00:00.000Z";
+      const fields = {
+        aggregateKind: "thread" as const,
+        aggregateId: "thread-1",
+        occurredAt: now,
+        commandId: null,
+      };
+      let model = await Effect.runPromise(
+        projectEvent(
+          createEmptyReadModel(now),
+          makeEvent({
+            ...fields,
+            sequence: 1,
+            type: "thread.created",
+            payload: {
+              threadId: "thread-1",
+              projectId: "project-1",
+              title: "Final",
+              modelSelection: { provider: "codex", model: "gpt-5-codex" },
+              runtimeMode: "full-access",
+              branch: null,
+              worktreePath: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+          }),
+        ),
+      );
+      const payload = {
+        threadId: "thread-1",
+        messageId: "message-final",
+        role,
+        turnId: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      for (const [index, update] of [
+        { text: "Draft", streaming: true },
+        { text: "", streaming: false },
+        { text: "Dra", streaming: false, textMode: "replace" },
+        { text: "", streaming: false, textMode: "replace" },
+        { text: "Final", streaming: false, textMode: "replace" },
+      ].entries()) {
+        model = await Effect.runPromise(
+          projectEvent(
+            model,
+            makeEvent({
+              ...fields,
+              sequence: index + 2,
+              type: "thread.message-sent",
+              payload: { ...payload, ...update },
+            }),
+          ),
+        );
+        expect(model.threads[0]!.messages).toHaveLength(1);
+        expect(model.threads[0]!.messages[0]!.text).toBe(index === 1 ? "Draft" : update.text);
+      }
+    },
+  );
+
   it("applies thread.created events", async () => {
     const now = "2026-01-01T00:00:00.000Z";
     const model = createEmptyReadModel(now);
