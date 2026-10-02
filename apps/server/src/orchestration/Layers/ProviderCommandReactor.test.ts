@@ -178,6 +178,7 @@ describe("ProviderCommandReactor", () => {
     readonly titleRegenerationBeforeStart?: "one" | "two";
     readonly serverActivation?: Effect.Effect<void>;
     readonly beforeReadySessionDispatch?: () => Effect.Effect<void>;
+    readonly afterReadySessionDispatch?: () => Effect.Effect<void>;
     readonly beforeTurnStartDispatch?: () => Effect.Effect<void>;
     readonly afterTurnStartDispatch?: () => Effect.Effect<void>;
     readonly compactThreadEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
@@ -272,7 +273,9 @@ describe("ProviderCommandReactor", () => {
         turnId: asTurnId("turn-1"),
       }),
     );
-    const compactThread = vi.fn((_: ThreadId) => input?.compactThreadEffect?.() ?? Effect.void);
+    const compactThread = vi.fn<ProviderServiceShape["compactThread"]>(
+      () => input?.compactThreadEffect?.() ?? Effect.void,
+    );
     const interruptTurn = vi.fn((_: unknown) => input?.interruptTurnEffect?.() ?? Effect.void);
     const respondToRequest = vi.fn<ProviderServiceShape["respondToRequest"]>(() => Effect.void);
     const respondToUserInput = vi.fn<ProviderServiceShape["respondToUserInput"]>(() => Effect.void);
@@ -448,7 +451,11 @@ describe("ProviderCommandReactor", () => {
             return (before?.() ?? Effect.void).pipe(
               Effect.andThen(engine.dispatch(command)),
               Effect.tap(() =>
-                isReplay ? (input?.afterTurnStartDispatch?.() ?? Effect.void) : Effect.void,
+                command.type === "thread.session.set" && command.session.status === "ready"
+                  ? (input?.afterReadySessionDispatch?.() ?? Effect.void)
+                  : isReplay
+                    ? (input?.afterTurnStartDispatch?.() ?? Effect.void)
+                    : Effect.void,
               ),
             );
           },
@@ -1035,6 +1042,123 @@ describe("ProviderCommandReactor", () => {
       yield* Effect.promise(() => harness.drain());
       expect(harness.compactThread).not.toHaveBeenCalled();
     }),
+  );
+
+  effectIt.effect.each(["completed", "failed"] as const)(
+    "native /compact dispatch retains selection/request context and restores after %s without slash forwarding",
+    (outcome) =>
+      Effect.gen(function* () {
+        const compactStarted = yield* Deferred.make<void>();
+        const releaseCompact = yield* Deferred.make<void>();
+        const restored = yield* Deferred.make<void>();
+        const firstSent = yield* Deferred.make<void>();
+        let compacting = false;
+        const selection: ModelSelection = {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "fixture/selected",
+          options: [{ id: "agent", value: "review" }],
+        };
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            threadModelSelection: selection,
+            compactThreadEffect: () =>
+              Effect.gen(function* () {
+                compacting = true;
+                yield* Deferred.succeed(compactStarted, undefined);
+                yield* Deferred.await(releaseCompact);
+                if (outcome === "failed")
+                  return yield* new ProviderAdapterRequestError({
+                    provider: "opencode",
+                    method: "session.compact",
+                    detail: "charged compaction failed",
+                  });
+              }),
+            afterReadySessionDispatch: () =>
+              compacting ? Deferred.succeed(restored, undefined).pipe(Effect.asVoid) : Effect.void,
+          }),
+        );
+        const threadId = ThreadId.make("thread-1");
+        const now = "2026-01-01T00:00:00.000Z";
+        harness.sendTurn.mockImplementation(() =>
+          Deferred.succeed(firstSent, undefined).pipe(
+            Effect.as({ threadId, turnId: asTurnId("ordinary-before-compact") }),
+          ),
+        );
+        const dispatch = (id: string, text: string) =>
+          harness.engine.dispatch({
+            type: "thread.turn.start",
+            commandId: CommandId.make(`cmd-native-${id}`),
+            threadId,
+            message: {
+              messageId: asMessageId(`native-${id}`),
+              role: "user",
+              text,
+              attachments: [],
+            },
+            modelSelection: selection,
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "full-access",
+            createdAt: now,
+          });
+        yield* dispatch("context", "existing conversation");
+        yield* Deferred.await(firstSent);
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-native-ready"),
+          threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "opencode",
+            providerInstanceId: selection.instanceId,
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+          createdAt: now,
+        });
+        yield* dispatch("compact", "/compact");
+        yield* Deferred.await(compactStarted);
+        expect(harness.compactThread).toHaveBeenCalledExactlyOnceWith(
+          threadId,
+          selection,
+          asMessageId("native-compact"),
+        );
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        // A second command while admission is outstanding is rejected, not forwarded.
+        yield* dispatch("overlap", "/compact");
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.compactThread).toHaveBeenCalledTimes(1);
+        const pendingThread = (yield* Effect.promise(() => harness.readModel())).threads.find(
+          (thread) => thread.id === threadId,
+        );
+        expect(pendingThread?.activities).toContainEqual(
+          expect.objectContaining({
+            summary: "Context compaction failed",
+            payload: expect.objectContaining({
+              detail: "Context compaction is unavailable while a provider turn is running.",
+            }),
+          }),
+        );
+        yield* Deferred.succeed(releaseCompact, undefined);
+        yield* Deferred.await(restored);
+        yield* Effect.promise(() => harness.drain());
+        const settled = (yield* Effect.promise(() => harness.readModel())).threads.find(
+          (thread) => thread.id === threadId,
+        );
+        expect(settled?.session?.status).toBe("ready");
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        if (outcome === "failed")
+          expect(settled?.activities).toContainEqual(
+            expect.objectContaining({
+              summary: "Context compaction failed",
+              payload: expect.objectContaining({
+                detail: expect.stringContaining("charged compaction failed"),
+              }),
+            }),
+          );
+      }),
   );
 
   effectIt.effect.each(["resume", "stop before resume", "stop after send"])(

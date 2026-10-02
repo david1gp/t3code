@@ -27,10 +27,12 @@ import type {
   ProviderInstanceEnvironment,
   ProviderInstanceId,
   ServerProvider,
+  ServerProviderWorkspaceSnapshot,
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 import type * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
+import type * as Stream from "effect/Stream";
 
 import type * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import type { ProviderAdapterError, ProviderDriverError } from "./Errors.ts";
@@ -73,6 +75,13 @@ export interface ProviderInstance {
   readonly enabled: boolean;
   readonly snapshot: ServerProviderShape;
   readonly snapshotForCwd?: (cwd: string) => Effect.Effect<ServerProvider, ProviderDriverError>;
+  /**
+   * Already-initialized catalogs, keyed by the same canonical cwd used by
+   * `snapshotForCwd`. Replaces that workspace's resources without discovery
+   * or changing machine inventory. The stream belongs to this instance's
+   * scope; the registry discards publications from replaced instances.
+   */
+  readonly streamWorkspaceSnapshotChanges?: Stream.Stream<ServerProviderWorkspaceSnapshot>;
   readonly refreshModels?: () => Effect.Effect<void, ProviderDriverError>;
   /** Invalidate T3-owned discovery caches before an explicit provider refresh. */
   readonly invalidateCaches?: Effect.Effect<void>;

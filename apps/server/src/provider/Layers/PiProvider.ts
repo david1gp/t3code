@@ -1,13 +1,13 @@
 import type { ModelRuntime, PromptTemplate } from "@earendil-works/pi-coding-agent";
-import {
-  type PiSettings,
-  type ServerProvider,
-  type ServerProviderModel,
-  type ServerProviderSlashCommand,
+import type {
+  PiSettings,
+  ServerProvider,
+  ServerProviderModel,
+  ServerProviderSlashCommand,
 } from "@t3tools/contracts";
+import { createModelCapabilities } from "@t3tools/shared/model";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import { createModelCapabilities } from "@t3tools/shared/model";
 import {
   buildServerProvider,
   providerModelsFromSettings,
@@ -23,7 +23,13 @@ const EMPTY_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
 type PiSdkModel = Pick<
   ReturnType<ModelRuntime["getModels"]>[number],
   "provider" | "id" | "name" | "reasoning" | "thinkingLevelMap"
->;
+> &
+  Partial<
+    Pick<
+      ReturnType<ModelRuntime["getModels"]>[number],
+      "input" | "contextWindow" | "maxTokens" | "cost" | "inputLimits" | "promptCache"
+    >
+  >;
 const THINKING_LEVELS = [
   "off",
   "minimal",
@@ -115,7 +121,88 @@ export function piModelsFromSdk(
     if (seen.has(slug)) return [];
     seen.add(slug);
     const name = model.name.trim() || model.id;
-    return [{ slug, name, isCustom: false, capabilities: piCapabilities(model, presetNames) }];
+    const metadata: ServerProviderModel["metadata"] = {
+      ...(model.contextWindow !== undefined || model.maxTokens !== undefined
+        ? {
+            limits: {
+              ...(model.contextWindow !== undefined ? { context: model.contextWindow } : {}),
+              ...(model.maxTokens !== undefined ? { output: model.maxTokens } : {}),
+            },
+          }
+        : {}),
+      ...(model.input !== undefined ? { modalities: { input: model.input } } : {}),
+      reasoning: model.reasoning,
+      ...(model.inputLimits
+        ? {
+            inputLimits: {
+              ...(model.inputLimits.maxRequestBytes !== undefined
+                ? { maxRequestBytes: model.inputLimits.maxRequestBytes }
+                : {}),
+              ...(model.inputLimits.images
+                ? {
+                    images: {
+                      ...(model.inputLimits.images.maxPerMessage !== undefined
+                        ? {
+                            maxPerMessage: model.inputLimits.images.maxPerMessage,
+                          }
+                        : {}),
+                      ...(model.inputLimits.images.maxPerRequest !== undefined
+                        ? {
+                            maxPerRequest: model.inputLimits.images.maxPerRequest,
+                          }
+                        : {}),
+                      ...(model.inputLimits.images.resize
+                        ? { resize: model.inputLimits.images.resize }
+                        : {}),
+                    },
+                  }
+                : {}),
+            },
+          }
+        : {}),
+      ...(model.cost
+        ? {
+            pricing: {
+              unit: "usd_per_million_tokens",
+              base: {
+                input: model.cost.input,
+                output: model.cost.output,
+                cache: {
+                  read: model.cost.cacheRead,
+                  write: model.cost.cacheWrite,
+                },
+              },
+              ...(model.cost.tiers !== undefined
+                ? {
+                    tiers: model.cost.tiers.map((tier) => ({
+                      inputTokensAbove: tier.inputTokensAbove,
+                      input: tier.input,
+                      output: tier.output,
+                      cache: { read: tier.cacheRead, write: tier.cacheWrite },
+                    })),
+                  }
+                : {}),
+            },
+          }
+        : {}),
+      ...(model.promptCache
+        ? {
+            promptCacheSeconds: {
+              ...(model.promptCache.short !== undefined ? { short: model.promptCache.short } : {}),
+              ...(model.promptCache.long !== undefined ? { long: model.promptCache.long } : {}),
+            },
+          }
+        : {}),
+    };
+    return [
+      {
+        slug,
+        name,
+        isCustom: false,
+        capabilities: piCapabilities(model, presetNames),
+        ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+      },
+    ];
   });
 }
 
@@ -146,7 +233,9 @@ export function piAuthFromSdk(
   runtime: {
     readonly getModels: () => ReadonlyArray<{ readonly provider: string }>;
     readonly getRegisteredProviderIds: () => ReadonlyArray<string>;
-    readonly getProviderAuthStatus: (provider: string) => { readonly configured: boolean };
+    readonly getProviderAuthStatus: (provider: string) => {
+      readonly configured: boolean;
+    };
   },
   models: ReadonlyArray<{ readonly provider: string }> = runtime.getModels(),
 ) {
@@ -219,5 +308,8 @@ export function enrichPiSnapshot(
   snapshot: ServerProvider,
   models: ReadonlyArray<ServerProviderModel>,
 ): ServerProvider {
-  return { ...snapshot, models: providerModelsFromSettings(models, [], EMPTY_CAPABILITIES) };
+  return {
+    ...snapshot,
+    models: providerModelsFromSettings(models, [], EMPTY_CAPABILITIES),
+  };
 }

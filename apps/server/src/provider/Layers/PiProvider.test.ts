@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { PiSettings, ProviderDriverKind, ProviderInstanceId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { ServerProviderModel } from "@t3tools/contracts";
 import { piSkillsToServerProviderSkills } from "../piSkillsToServerProviderSkills.ts";
 import {
   buildInitialPiProviderSnapshot,
@@ -14,6 +15,8 @@ import {
 } from "./PiProvider.ts";
 
 const decodePiSettings = Schema.decodeSync(PiSettings);
+const decodeServerProviderModel = Schema.decodeSync(ServerProviderModel);
+const encodeServerProviderModel = Schema.encodeSync(ServerProviderModel);
 const customCapabilities = {
   optionDescriptors: [
     {
@@ -69,16 +72,36 @@ describe("Pi provider catalog", () => {
   it("maps invokable prompt metadata and keeps Pi's first-name-wins collision behavior", () => {
     expect(
       piPromptTemplatesToSlashCommands([
-        { name: "global", description: " Global description ", argumentHint: " <topic> " },
-        { name: "shared", description: "Global version", argumentHint: " [args] " },
-        { name: "shared", description: "Project version", argumentHint: "ignored" },
+        {
+          name: "global",
+          description: " Global description ",
+          argumentHint: " <topic> ",
+        },
+        {
+          name: "shared",
+          description: "Global version",
+          argumentHint: " [args] ",
+        },
+        {
+          name: "shared",
+          description: "Project version",
+          argumentHint: "ignored",
+        },
         { name: "", description: "invalid" },
         { name: "not invokable/name", description: "invalid" },
         { name: "plain", description: "  ", argumentHint: " " },
       ]),
     ).toEqual([
-      { name: "global", description: "Global description", input: { hint: "<topic>" } },
-      { name: "shared", description: "Global version", input: { hint: "[args]" } },
+      {
+        name: "global",
+        description: "Global description",
+        input: { hint: "<topic>" },
+      },
+      {
+        name: "shared",
+        description: "Global version",
+        input: { hint: "[args]" },
+      },
       { name: "plain" },
     ]);
   });
@@ -86,14 +109,139 @@ describe("Pi provider catalog", () => {
   it("deduplicates provider/model records without changing their slugs or names", () => {
     expect(
       piModelsFromSdk([
-        { provider: "anthropic", id: "claude-3", name: "Claude 3", reasoning: false },
-        { provider: "anthropic", id: "claude-3", name: "duplicate", reasoning: false },
+        {
+          provider: "anthropic",
+          id: "claude-3",
+          name: "Claude 3",
+          reasoning: false,
+        },
+        {
+          provider: "anthropic",
+          id: "claude-3",
+          name: "duplicate",
+          reasoning: false,
+        },
         { provider: "openai", id: "gpt-5", name: "GPT-5", reasoning: true },
       ]).map(({ slug, name }) => ({ slug, name })),
     ).toEqual([
       { slug: "anthropic/claude-3", name: "Claude 3" },
       { slug: "openai/gpt-5", name: "GPT-5" },
     ]);
+  });
+
+  it("maps SDK limits, modalities, rates, request-wide tiers, image constraints, and cache lifetimes", () => {
+    const [model] = piModelsFromSdk([
+      {
+        provider: "openai",
+        id: "vision-reasoner",
+        name: "Vision Reasoner",
+        reasoning: true,
+        input: ["text", "image"],
+        contextWindow: 128_000,
+        maxTokens: 16_000,
+        cost: {
+          input: 2,
+          output: 8,
+          cacheRead: 0.2,
+          cacheWrite: 2.5,
+          tiers: [
+            {
+              inputTokensAbove: 200_000,
+              input: 1,
+              output: 4,
+              cacheRead: 0.1,
+              cacheWrite: 1.25,
+            },
+          ],
+        },
+        inputLimits: {
+          maxRequestBytes: 0,
+          images: {
+            maxPerMessage: 0,
+            maxPerRequest: 10,
+            resize: {
+              maxWidth: 1024,
+              maxHeight: 768,
+              maxBytes: 0,
+              jpegQuality: 0,
+            },
+          },
+        },
+        promptCache: { short: 0, long: 86_400 },
+      },
+    ]);
+
+    const modelRoundTrip = model
+      ? decodeServerProviderModel(encodeServerProviderModel(model))
+      : undefined;
+    expect(modelRoundTrip?.metadata).toEqual({
+      limits: { context: 128_000, output: 16_000 },
+      modalities: { input: ["text", "image"] },
+      reasoning: true,
+      inputLimits: {
+        maxRequestBytes: 0,
+        images: {
+          maxPerMessage: 0,
+          maxPerRequest: 10,
+          resize: {
+            maxWidth: 1024,
+            maxHeight: 768,
+            maxBytes: 0,
+            jpegQuality: 0,
+          },
+        },
+      },
+      pricing: {
+        unit: "usd_per_million_tokens",
+        base: { input: 2, output: 8, cache: { read: 0.2, write: 2.5 } },
+        tiers: [
+          {
+            inputTokensAbove: 200_000,
+            input: 1,
+            output: 4,
+            cache: { read: 0.1, write: 1.25 },
+          },
+        ],
+      },
+      promptCacheSeconds: { short: 0, long: 86_400 },
+    });
+    expect(model?.capabilities?.optionDescriptors?.[0]?.id).toBe("thinkingLevel");
+  });
+
+  it("preserves explicit zero rates, false reasoning, empty tiers, and empty prompt-cache details", () => {
+    const [model] = piModelsFromSdk([
+      {
+        provider: "custom",
+        id: "zero-cost",
+        name: "Zero Cost",
+        reasoning: false,
+        input: [],
+        contextWindow: 0,
+        maxTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, tiers: [] },
+        promptCache: {},
+      },
+    ]);
+
+    expect(model?.metadata).toEqual({
+      limits: { context: 0, output: 0 },
+      modalities: { input: [] },
+      reasoning: false,
+      pricing: {
+        unit: "usd_per_million_tokens",
+        base: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+        tiers: [],
+      },
+      promptCacheSeconds: {},
+    });
+  });
+
+  it("omits optional model metadata when the SDK model does not provide it", () => {
+    const [model] = piModelsFromSdk([
+      { provider: "custom", id: "minimal", name: "Minimal", reasoning: false },
+    ]);
+
+    expect(model?.metadata).toEqual({ reasoning: false });
   });
 
   it("advertises standard SDK thinking levels with medium as the default", () => {
@@ -226,7 +374,13 @@ describe("Pi provider catalog", () => {
     },
   ])("$behavior for custom SDK model metadata", ({ thinkingLevelMap, levels, defaultLevel }) => {
     const [model] = piModelsFromSdk([
-      { provider: "custom", id: "reasoner", name: "Reasoner", reasoning: true, thinkingLevelMap },
+      {
+        provider: "custom",
+        id: "reasoner",
+        name: "Reasoner",
+        reasoning: true,
+        thinkingLevelMap,
+      },
     ]);
     const descriptor = model?.capabilities?.optionDescriptors?.[0];
     expect(descriptor).toMatchObject({
@@ -280,7 +434,12 @@ describe("Pi provider catalog", () => {
     () =>
       Effect.gen(function* () {
         const models = piModelsFromSdk([
-          { provider: "custom", id: "reasoner", name: "Reasoner", reasoning: true },
+          {
+            provider: "custom",
+            id: "reasoner",
+            name: "Reasoner",
+            reasoning: true,
+          },
           { provider: "custom", id: "plain", name: "Plain", reasoning: false },
         ]);
         const settings = decodePiSettings({
@@ -288,10 +447,18 @@ describe("Pi provider catalog", () => {
             "custom/reasoner",
             { slug: "custom/plain", capabilities: customCapabilities },
             "custom/unlisted",
-            { slug: "custom/declared", name: "Declared", capabilities: customCapabilities },
+            {
+              slug: "custom/declared",
+              name: "Declared",
+              capabilities: customCapabilities,
+            },
           ],
         });
-        const snapshot = yield* buildPiProviderSnapshot({ settings, models, installed: true });
+        const snapshot = yield* buildPiProviderSnapshot({
+          settings,
+          models,
+          installed: true,
+        });
         expect(snapshot.models).toEqual([
           ...models,
           {
@@ -326,7 +493,11 @@ describe("Pi provider catalog", () => {
       const settings = decodePiSettings({
         customModels: [
           "openai/gpt-5",
-          { slug: "custom/declared", name: "Declared", capabilities: customCapabilities },
+          {
+            slug: "custom/declared",
+            name: "Declared",
+            capabilities: customCapabilities,
+          },
         ],
       });
       const snapshot = yield* buildInitialPiProviderSnapshot(settings);

@@ -5,16 +5,29 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import { CONFIG_DIR_NAME, ModelRuntime, VERSION } from "@earendil-works/pi-coding-agent";
+import {
+  CONFIG_DIR_NAME,
+  DefaultResourceLoader,
+  ModelRuntime,
+  VERSION,
+} from "@earendil-works/pi-coding-agent";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 import { PiSettings, ProviderInstanceId } from "@t3tools/contracts";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { BUILT_IN_DRIVERS } from "../builtInDrivers.ts";
 import { PiDriver, piResourcesForCwd } from "./PiDriver.ts";
+import type { PiAdapterFactoryOptions } from "../PiAdapterFactoryOptions.ts";
+import * as PiAdapterModule from "../Layers/PiAdapter.ts";
+
+const adapterFactory = { options: new Map<string, PiAdapterFactoryOptions>() };
 
 vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@earendil-works/pi-coding-agent")>();
@@ -48,6 +61,13 @@ describe("Pi built-in driver", () => {
   let cwd: string;
 
   beforeEach(() => {
+    const originalFactory = PiAdapterModule.makePiAdapter;
+    vi.spyOn(PiAdapterModule, "makePiAdapter").mockImplementation(
+      (options: PiAdapterFactoryOptions = {}) => {
+        if (options.instanceId) adapterFactory.options.set(options.instanceId, options);
+        return originalFactory(options);
+      },
+    );
     root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pi-resource-catalog-"));
     home = NodePath.join(root, "home");
     agentDir = NodePath.join(home, CONFIG_DIR_NAME, "agent");
@@ -60,10 +80,232 @@ describe("Pi built-in driver", () => {
   });
 
   afterEach(() => {
+    adapterFactory.options.clear();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     NodeFS.rmSync(root, { recursive: true, force: true });
   });
+
+  const instanceCreate = (id: string) =>
+    PiDriver.create({
+      instanceId: ProviderInstanceId.make(id),
+      displayName: id,
+      environment: [],
+      enabled: false,
+      config: decodePiSettings({ enabled: false, customModels: ["fixture/custom"] }),
+    });
+  const testLayer = () =>
+    ServerConfig.layerTest(root, { prefix: "t3-pi-initialized-resources-" }).pipe(
+      Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(
+        Layer.mock(BackgroundPolicy.BackgroundPolicy)({
+          shouldRunScopeWork: () => Effect.succeed(false),
+        }),
+      ),
+    );
+  const catalog = (directory: string, name = "dynamic") => ({
+    cwd: directory,
+    checkedAt: "2026-10-01T20:00:00.000Z",
+    slashCommands: [{ name, description: "Initialized extension command" }],
+    skills: [{ name, path: NodePath.join(directory, "SKILL.md"), enabled: true }],
+  });
+  const publisher = (id: string) => adapterFactory.options.get(id)!.publishInitializedResources!;
+
+  it.effect(
+    "publishes initialized catalogs on the instance stream and prefers them to static discovery",
+    () =>
+      Effect.gen(function* () {
+        const instance = yield* instanceCreate("initialized");
+        const machine = yield* instance.snapshot.getSnapshot;
+        const pull = yield* Stream.toPull(instance.streamWorkspaceSnapshotChanges!);
+        const notification = yield* pull.pipe(Effect.forkChild({ startImmediately: true }));
+        const resources = catalog(cwd);
+        yield* publisher("initialized")({ ...resources, cwd: ` ${cwd}/nested/.. ` });
+        expect(yield* Fiber.join(notification)).toEqual([resources]);
+        const reload = vi.spyOn(DefaultResourceLoader.prototype, "reload");
+        const scoped = yield* instance.snapshotForCwd!(`${cwd}/.`);
+        expect(scoped).toEqual({
+          ...machine,
+          checkedAt: resources.checkedAt,
+          slashCommands: resources.slashCommands,
+          skills: resources.skills,
+        });
+        expect(reload).not.toHaveBeenCalled();
+        yield* instance.snapshot.refresh;
+        expect((yield* instance.snapshotForCwd!(cwd)).slashCommands).toEqual(
+          resources.slashCommands,
+        );
+        expect(reload).not.toHaveBeenCalled();
+      }).pipe(Effect.scoped, Effect.provide(testLayer())),
+  );
+
+  it.effect(
+    "retains machine SDK models, metadata, provider identity and preset preferences on publication",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* Effect.promise(() =>
+          ModelRuntime.create({
+            refreshOnCreate: false,
+            allowModelNetwork: false,
+          }),
+        );
+        vi.spyOn(runtime, "getModels").mockReturnValue([
+          {
+            provider: "fixture",
+            id: "reasoner",
+            name: "Fixture reasoner",
+            reasoning: true,
+            api: "openai-responses",
+            baseUrl: "https://example.invalid",
+            input: ["text"],
+            contextWindow: 16000,
+            maxTokens: 2000,
+            cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0.2 },
+          },
+        ]);
+        vi.spyOn(ModelRuntime, "create").mockResolvedValue(runtime);
+        NodeFS.writeFileSync(NodePath.join(agentDir, "presets.json"), '{"fast":{}}');
+        const instance = yield* PiDriver.create({
+          instanceId: ProviderInstanceId.make("metadata"),
+          displayName: "Metadata",
+          environment: [],
+          enabled: true,
+          config: decodePiSettings({}),
+        });
+        const machine = yield* instance.snapshot.refresh;
+        expect(machine.models[0]).toMatchObject({
+          slug: "fixture/reasoner",
+          metadata: { limits: { context: 16000, output: 2000 } },
+          capabilities: {
+            optionDescriptors: [
+              { id: "thinkingLevel", currentValue: "medium" },
+              { id: "preset", options: [{ id: "none" }, { id: "fast" }] },
+            ],
+          },
+        });
+        const resources = catalog(cwd);
+        yield* publisher("metadata")(resources);
+        expect(yield* instance.snapshotForCwd!(cwd)).toEqual({
+          ...machine,
+          checkedAt: resources.checkedAt,
+          slashCommands: resources.slashCommands,
+          skills: resources.skills,
+        });
+        expect(yield* instance.snapshot.getSnapshot).toEqual(machine);
+      }).pipe(Effect.scoped, Effect.provide(testLayer())),
+  );
+
+  it.effect("initialized publication wins over an in-flight unbound catalog refresh", () =>
+    Effect.gen(function* () {
+      const instance = yield* instanceCreate("race");
+      const { promise: started, resolve: markStarted } = Promise.withResolvers<void>();
+      const { promise: release, resolve: releaseDiscovery } = Promise.withResolvers<void>();
+      const original = DefaultResourceLoader.prototype.reload;
+      vi.spyOn(DefaultResourceLoader.prototype, "reload").mockImplementationOnce(async function (
+        this: DefaultResourceLoader,
+      ) {
+        markStarted();
+        await release;
+        return original.call(this);
+      });
+      const discovery = yield* instance.snapshotForCwd!(cwd).pipe(Effect.forkChild);
+      yield* Effect.promise(() => started);
+      const resources = catalog(cwd);
+      yield* publisher("race")(resources);
+      releaseDiscovery();
+      const scoped = yield* Fiber.join(discovery);
+      expect(scoped).toMatchObject({
+        checkedAt: resources.checkedAt,
+        slashCommands: resources.slashCommands,
+        skills: resources.skills,
+      });
+      expect((yield* instance.snapshotForCwd!(cwd)).slashCommands).toEqual(resources.slashCommands);
+    }).pipe(Effect.scoped, Effect.provide(testLayer())),
+  );
+
+  it.effect("initialized publication survives a concurrent static discovery failure", () =>
+    Effect.gen(function* () {
+      const instance = yield* instanceCreate("failed-race");
+      const { promise: started, resolve: markStarted } = Promise.withResolvers<void>();
+      const { promise: release, resolve: releaseDiscovery } = Promise.withResolvers<void>();
+      vi.spyOn(DefaultResourceLoader.prototype, "reload").mockImplementationOnce(async () => {
+        markStarted();
+        await release;
+        throw new Error("Unbound discovery failed after successful binding");
+      });
+      const discovery = yield* instance.snapshotForCwd!(cwd).pipe(Effect.forkChild);
+      yield* Effect.promise(() => started);
+      const resources = catalog(cwd);
+      yield* publisher("failed-race")(resources);
+      releaseDiscovery();
+      expect(yield* Fiber.join(discovery)).toMatchObject({
+        checkedAt: resources.checkedAt,
+        slashCommands: resources.slashCommands,
+        skills: resources.skills,
+      });
+    }).pipe(Effect.scoped, Effect.provide(testLayer())),
+  );
+
+  it.effect("bounds initialized workspaces to 16 and refreshes an existing cwd's recency", () =>
+    Effect.gen(function* () {
+      const instance = yield* instanceCreate("bounded");
+      for (let index = 0; index < 16; index++) {
+        yield* publisher("bounded")(
+          catalog(NodePath.join(root, `cwd-${index}`), `dynamic-${index}`),
+        );
+      }
+      const first = NodePath.join(root, "cwd-0");
+      yield* publisher("bounded")(catalog(first, "updated-first"));
+      yield* publisher("bounded")(catalog(NodePath.join(root, "cwd-16"), "dynamic-16"));
+      const reload = vi.spyOn(DefaultResourceLoader.prototype, "reload");
+      expect((yield* instance.snapshotForCwd!(first)).slashCommands).toEqual(
+        catalog(first, "updated-first").slashCommands,
+      );
+      expect(reload).not.toHaveBeenCalled();
+      const evicted = yield* instance.snapshotForCwd!(NodePath.join(root, "cwd-1"));
+      expect(evicted.slashCommands).toEqual([]);
+      expect(reload).toHaveBeenCalledTimes(1);
+    }).pipe(Effect.scoped, Effect.provide(testLayer())),
+  );
+
+  it.effect(
+    "fences disposed publishers and isolates replacement and parallel instance caches/streams",
+    () =>
+      Effect.gen(function* () {
+        const oldScope = yield* Scope.make();
+        const old = yield* instanceCreate("replaced").pipe(Scope.provide(oldScope));
+        const oldPublish = publisher("replaced");
+        const oldPull = yield* Stream.toPull(old.streamWorkspaceSnapshotChanges!);
+        const oldNotification = yield* oldPull.pipe(Effect.forkChild({ startImmediately: true }));
+        yield* oldPublish(catalog(cwd, "old"));
+        expect(yield* Fiber.join(oldNotification)).toEqual([catalog(cwd, "old")]);
+        yield* Scope.close(oldScope, Exit.void);
+        yield* oldPublish(catalog(cwd, "late-old"));
+        expect(Exit.isFailure(yield* oldPull.pipe(Effect.exit))).toBe(true);
+        const replacement = yield* instanceCreate("replaced");
+        const other = yield* instanceCreate("parallel");
+        const replacementPull = yield* Stream.toPull(replacement.streamWorkspaceSnapshotChanges!);
+        const otherPull = yield* Stream.toPull(other.streamWorkspaceSnapshotChanges!);
+        const replacementNotification = yield* replacementPull.pipe(
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const otherNotification = yield* otherPull.pipe(
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* publisher("replaced")(catalog(cwd, "replacement"));
+        yield* publisher("parallel")(catalog(cwd, "other"));
+        yield* oldPublish(catalog(cwd, "late-again"));
+        expect(yield* Fiber.join(replacementNotification)).toEqual([catalog(cwd, "replacement")]);
+        expect(yield* Fiber.join(otherNotification)).toEqual([catalog(cwd, "other")]);
+        expect((yield* replacement.snapshotForCwd!(cwd)).slashCommands).toEqual(
+          catalog(cwd, "replacement").slashCommands,
+        );
+        expect((yield* other.snapshotForCwd!(cwd)).slashCommands).toEqual(
+          catalog(cwd, "other").slashCommands,
+        );
+      }).pipe(Effect.scoped, Effect.provide(testLayer())),
+  );
 
   it("registers Pi with SDK-only settings", () => {
     expect(BUILT_IN_DRIVERS.some((driver) => driver.driverKind === "pi")).toBe(true);
@@ -109,12 +351,17 @@ describe("Pi built-in driver", () => {
     NodeFS.mkdirSync(prompts, { recursive: true });
     NodeFS.writeFileSync(NodePath.join(prompts, "review.md"), "Template review");
     NodeFS.writeFileSync(NodePath.join(prompts, "deploy.md"), "Deploy template");
+    const startupMarker = NodePath.join(root, "session-start");
     NodeFS.writeFileSync(
       NodePath.join(extensions, "first.js"),
-      `export default function (pi) {
+      `import { writeFileSync } from "node:fs";
+      export default function (pi) {
         pi.registerCommand("review", { description: "Extension review", handler: async () => {} });
         pi.registerCommand("inspect", { description: "First inspect", handler: async () => {} });
-        pi.on("session_start", () => { throw new Error("Discovery must not start a session"); });
+        pi.on("session_start", () => {
+          writeFileSync(${JSON.stringify(startupMarker)}, "started");
+          throw new Error("Discovery must not start a session");
+        });
       }`,
     );
     NodeFS.writeFileSync(
@@ -132,6 +379,8 @@ describe("Pi built-in driver", () => {
       { name: "deploy", description: "Deploy template" },
     ]);
     expect(resources.skills).toEqual([]);
+    expect(await piResourcesForCwd(cwd)).toEqual(resources);
+    expect(NodeFS.existsSync(startupMarker)).toBe(false);
   });
 
   it("discovers global and project Pi and .agents skills, preserving collisions and same-name prompts", async () => {

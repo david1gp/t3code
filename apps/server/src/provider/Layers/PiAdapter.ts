@@ -8,10 +8,13 @@ import {
   DefaultResourceLoader,
   getAgentDir,
   ModelRuntime,
+  parseSessionEntries,
   SessionManager,
   SettingsManager,
   type AgentSession,
   type AgentSessionEvent,
+  type ExtensionCommandContextActions,
+  type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 
 import {
@@ -34,10 +37,11 @@ import * as FileSystem from "effect/FileSystem";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
-import { piPresetNamesFromJson } from "./PiProvider.ts";
+import { piPresetNamesFromJson, piPromptTemplatesToSlashCommands } from "./PiProvider.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
@@ -45,6 +49,9 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import type { ProviderAdapterShape, ProviderThreadSnapshot } from "../Services/ProviderAdapter.ts";
+import { piSummaryUsageObserve } from "../piSummaryUsageObserve.ts";
+import type { PiAdapterFactoryOptions } from "../PiAdapterFactoryOptions.ts";
+import { piSkillsToServerProviderSkills } from "../piSkillsToServerProviderSkills.ts";
 
 const provider = ProviderDriverKind.make("pi");
 const resumeVersion = 1;
@@ -219,18 +226,52 @@ function selectedOptions(
   );
 }
 
-function snapshotFromMessages(
+const turnEntryType = "t3.turn";
+const turnEntrySchema = Schema.Struct({ schemaVersion: Schema.Literal(1), turnId: TurnId });
+const turnEntryDecode = Schema.decodeUnknownOption(turnEntrySchema);
+const jsonEncode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+
+function turnIdentityAppend(manager: SessionManager, sessionId: string): TurnId {
+  const turnId = TurnId.make(`pi:${sessionId}:turn:${NodeCrypto.randomUUID()}`);
+  manager.appendCustomEntry(turnEntryType, { schemaVersion: 1, turnId });
+  return turnId;
+}
+
+function snapshotFromEntries(
   threadId: ThreadId,
   sessionId: string,
-  messages: ReadonlyArray<{ role: string }>,
+  entries: ReadonlyArray<SessionEntry>,
 ): ProviderThreadSnapshot {
   const turns: Array<{ id: TurnId; items: Array<unknown> }> = [];
-  for (const message of messages) {
-    if (message.role === "user") {
-      turns.push({ id: TurnId.make(`pi:${sessionId}:${turns.length}`), items: [message] });
-    } else if (turns.length > 0) {
-      turns[turns.length - 1]!.items.push(message);
+  let associated = false;
+  for (const entry of entries) {
+    if (entry.type === "custom" && entry.customType === turnEntryType) {
+      const association = turnEntryDecode(entry.data);
+      if (association._tag === "Some") {
+        associated = true;
+        turns.push({ id: association.value.turnId, items: [] });
+      }
+      continue;
     }
+    if (entry.type !== "message" && entry.type !== "custom_message") continue;
+    const message =
+      entry.type === "message"
+        ? entry.message
+        : {
+            role: "custom",
+            customType: entry.customType,
+            content: entry.content,
+            display: entry.display,
+            details: entry.details,
+            timestamp: Date.parse(entry.timestamp),
+          };
+    // Keep unmarked legacy history's IDs unchanged. A marked attempt owns all
+    // its SDK messages, including steering and extension-only input.
+    if (!associated && message.role === "user") {
+      turns.push({ id: TurnId.make(`pi:${sessionId}:${turns.length}`), items: [message] });
+      continue;
+    }
+    turns.at(-1)?.items.push(message);
   }
   return { threadId, turns };
 }
@@ -239,8 +280,12 @@ type Turn = {
   readonly id: TurnId;
   readonly settled: Deferred.Deferred<void, ProviderAdapterRequestError>;
   interrupted: boolean;
+  ran: boolean;
   failure: string | undefined;
-  assistantItem: RuntimeItemId | undefined;
+  readonly assistantItems: Map<
+    string,
+    { readonly id: RuntimeItemId; readonly itemType: "assistant_message" | "reasoning" }
+  >;
   segment: number;
   readonly usage: {
     input: number;
@@ -248,8 +293,14 @@ type Turn = {
     cacheRead: number;
     cacheWrite: number;
     reasoning: number;
+    reasoningAvailable: boolean;
+    hasSubagents: boolean;
     costUsd: number;
     messages: number;
+    priced: number;
+    unresolved: number;
+    readonly models: Set<string>;
+    unknownModel: boolean;
   };
 };
 
@@ -265,13 +316,15 @@ type AssistantUsage = {
 const count = (value: unknown) =>
   typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : 0;
 
-/** pi-subagents lifecycle payloads on `pi.events` (subagents:started/completed/failed). */
+/** Public pi-subagents bus payloads; the extension exports no lifecycle schema. */
 type SubagentEvent = {
   readonly id?: unknown;
   readonly type?: unknown;
   readonly description?: unknown;
   readonly result?: unknown;
   readonly error?: unknown;
+  readonly status?: unknown;
+  readonly isBackground?: unknown;
   readonly toolUses?: unknown;
   readonly durationMs?: unknown;
   readonly usage?: {
@@ -282,6 +335,12 @@ type SubagentEvent = {
     readonly totalTokens?: unknown;
     readonly cost?: { readonly total?: unknown };
   };
+};
+
+type SubagentActivation = {
+  readonly turnId: TurnId | undefined;
+  readonly resumed: boolean;
+  state: "pending" | "running" | "terminal";
 };
 
 const text = (value: unknown) =>
@@ -308,26 +367,34 @@ type Session = {
   readonly cwd: string;
   readonly sdk: AgentSession;
   unsubscribe: () => void;
-  readonly completeCommand: (turn: Turn) => Effect.Effect<void>;
+  readonly completeIdlePrompt: (turn: Turn) => Effect.Effect<void>;
+  readonly drainEvents: () => Effect.Effect<void>;
   readonly scope: Scope.Closeable;
   active: Turn | undefined;
+  /** SDK callback-time association, independent of the queued runtime consumer. */
+  historyTurnId: TurnId | undefined;
   /** Covers preflight and the SDK's asynchronous agent_settled dispatch. */
   pendingPrompt: boolean;
+  /** One steering preflight at a time; no successor prompt may overtake it. */
+  pendingSteer: boolean;
+  dispatchSettled: Deferred.Deferred<void> | undefined;
+  steeringSettled: Deferred.Deferred<void> | undefined;
+  stopping: Deferred.Deferred<void, ProviderAdapterRequestError> | undefined;
   /** Background subagents settle after their spawning turn. */
   lastTurnId: TurnId | undefined;
   appliedPreset: string | undefined;
   appliedPresetModelOverride: boolean;
-  /** A child keeps its originating turn even if a later turn becomes active. */
-  readonly subagents: Map<string, TurnId | undefined>;
+  /** Callback-time activation ownership; retain settled IDs to reject duplicate starts. */
+  readonly subagents: Map<string, SubagentActivation>;
   stopped: boolean;
 };
 
+const unsupportedCommandAction = (action: string) => async (): Promise<never> => {
+  throw new Error(`Pi extension command context action ${action} is unsupported by this adapter.`);
+};
+
 /** One SDK session per T3 thread, with persistence owned by T3. */
-export const makePiAdapter = (
-  options: {
-    readonly instanceId?: ProviderInstanceId;
-  } = {},
-) =>
+export const makePiAdapter = (options: PiAdapterFactoryOptions = {}) =>
   Effect.gen(function* () {
     const config = yield* ServerConfig;
     const fs = yield* FileSystem.FileSystem;
@@ -418,127 +485,233 @@ export const makePiAdapter = (
       });
     const requireSession = (threadId: ThreadId) => {
       const ctx = sessions.get(threadId);
-      return ctx && !ctx.stopped
+      return ctx && !ctx.stopped && !ctx.stopping
         ? Effect.succeed(ctx)
         : Effect.fail(new ProviderAdapterSessionNotFoundError({ provider, threadId }));
     };
+    // 0.87.1's emitSessionShutdownEvent is not a package export. Use its public
+    // runner API so extension-owned resources are released before disposal.
+    const shutdownSdk = (sdk: AgentSession) =>
+      request("session_shutdown", async () => {
+        if (sdk.extensionRunner.hasHandlers("session_shutdown"))
+          await sdk.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      }).pipe(Effect.ignore);
     const stop = (ctx: Session) =>
       Effect.gen(function* () {
         if (ctx.stopped) return;
-        ctx.stopped = true;
-        sessions.delete(ctx.session.threadId);
-        if (ctx.active) {
-          yield* Deferred.fail(
-            ctx.active.settled,
-            new ProviderAdapterRequestError({
-              provider,
-              method: "prompt",
-              detail: "Pi session stopped before the turn settled.",
-            }),
-          ).pipe(Effect.ignore);
-          ctx.active = undefined;
-        }
-        ctx.unsubscribe();
-        // Lets extensions (pi-subagents) stop their child sessions before dispose.
-        if (ctx.sdk.extensionRunner.hasHandlers("session_shutdown"))
-          yield* Effect.promise(() =>
-            ctx.sdk.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }),
-          ).pipe(Effect.ignore);
-        ctx.sdk.dispose();
-        yield* Scope.close(ctx.scope, Exit.void);
-        yield* emit({ type: "session.exited", ...base(ctx), payload: { exitKind: "graceful" } });
-      });
+        if (ctx.stopping) return yield* Deferred.await(ctx.stopping);
+        const stopped = yield* Deferred.make<void, ProviderAdapterRequestError>();
+        ctx.stopping = stopped;
+        const result = yield* Effect.gen(function* () {
+          if (ctx.active) ctx.active.interrupted = true;
+          ctx.sdk.clearQueue();
+          // dispose() disconnects SDK persistence synchronously; abort() waits
+          // through tool results, persistence and asynchronous agent_settled.
+          yield* request("abort", () => ctx.sdk.abort());
+          // SDK-idle input handlers are uncancellable and can outlive disposal.
+          // Do not await their dispatch; preflightResult fences stopping/stopped
+          // sessions before the SDK can admit inference when they eventually resolve.
+          yield* ctx.drainEvents();
+          // A stopped idle preflight/handled prompt has no native settlement.
+          if (ctx.active) yield* failPrompt(ctx, ctx.active, "Pi session stopped.");
+          // Lets extensions (pi-subagents) stop their child sessions before dispose.
+          yield* shutdownSdk(ctx.sdk);
+          ctx.unsubscribe();
+          ctx.sdk.dispose();
+          ctx.stopped = true;
+          sessions.delete(ctx.session.threadId);
+          yield* Scope.close(ctx.scope, Exit.void);
+          yield* emit({ type: "session.exited", ...base(ctx), payload: { exitKind: "graceful" } });
+        }).pipe(Effect.exit);
+        if (Exit.isFailure(result)) ctx.stopping = undefined;
+        yield* Deferred.done(stopped, result);
+        return yield* result;
+      }).pipe(Effect.uninterruptible);
 
+    const assistantItemStart = (
+      ctx: Session,
+      turn: Turn,
+      contentIndex: number,
+      itemType: "assistant_message" | "reasoning",
+    ) =>
+      Effect.gen(function* () {
+        // SDK content indexes identify blocks, not ordinal text/reasoning counts.
+        // Keep the kind in the key: an extension may replace a block's kind.
+        const key = `${contentIndex}:${itemType}`;
+        const existing = turn.assistantItems.get(key);
+        if (existing) return existing.id;
+        const id = RuntimeItemId.make(`pi:${turn.id}:${itemType}:${turn.segment++}`);
+        turn.assistantItems.set(key, { id, itemType });
+        yield* emit({
+          type: "item.started",
+          ...base(ctx, turn.id),
+          itemId: id,
+          payload: { itemType, status: "inProgress" },
+        });
+        return id;
+      });
     const closeAssistant = (
       ctx: Session,
       turn: Turn,
       status: "completed" | "failed" = "completed",
+      finalTexts?: ReadonlyMap<string, string>,
     ) =>
       Effect.gen(function* () {
-        if (!turn.assistantItem) return;
-        yield* emit({
-          type: "item.completed",
-          ...base(ctx, turn.id),
-          itemId: turn.assistantItem,
-          payload: { itemType: "assistant_message", status },
-        });
-        turn.assistantItem = undefined;
+        for (const [key, item] of turn.assistantItems) {
+          yield* emit({
+            type: "item.completed",
+            ...base(ctx, turn.id),
+            itemId: item.id,
+            payload: {
+              itemType: item.itemType,
+              status,
+              // Absent finalTexts means an early tool/settlement/failure closure,
+              // not an authoritative empty response. Removed final blocks clear
+              // their whole identified item, including already split display rows.
+              ...(finalTexts ? { finalText: finalTexts.get(key) ?? "" } : {}),
+            },
+          });
+        }
+        turn.assistantItems.clear();
       });
-    // Main-agent usage only: pi-subagents children report through task events.
-    const recordUsage = (ctx: Session, turn: Turn, usage: AssistantUsage | undefined) =>
+    // Authoritative main-session requests only, never child tool results or session totals.
+    const usageAccumulate = (turn: Turn, usage: AssistantUsage, model: string | undefined) => {
+      const totals = turn.usage;
+      totals.messages += 1;
+      totals.input += count(usage.input);
+      totals.output += count(usage.output);
+      totals.cacheRead += count(usage.cacheRead);
+      totals.cacheWrite += count(usage.cacheWrite);
+      totals.reasoning += count(usage.reasoning);
+      totals.reasoningAvailable &&= usage.reasoning !== undefined;
+      const cost = usage.cost?.total;
+      if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) {
+        totals.costUsd += cost;
+        totals.priced += 1;
+      }
+      if (model) totals.models.add(model);
+      else totals.unknownModel = true;
+    };
+    const contextRecord = (
+      ctx: Session,
+      turnId: TurnId | undefined,
+      model: string | undefined,
+      context: ReturnType<AgentSession["getContextUsage"]>,
+      usage?: AssistantUsage,
+    ) =>
       Effect.gen(function* () {
-        if (!usage) return;
-        const totals = turn.usage;
-        totals.messages += 1;
-        totals.input += count(usage.input);
-        totals.output += count(usage.output);
-        totals.cacheRead += count(usage.cacheRead);
-        totals.cacheWrite += count(usage.cacheWrite);
-        totals.reasoning += count(usage.reasoning);
-        const cost = usage.cost?.total;
-        if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) totals.costUsd += cost;
-        const context = ctx.sdk.getContextUsage();
-        const input = count(usage.input) + count(usage.cacheRead) + count(usage.cacheWrite);
+        const parts = model ? modelParts(model) : undefined;
+        // The SDK estimates occupancy, but its limit belongs to the selected model.
+        // A response alias/override must never inherit another model's limit.
+        const selected = ctx.sdk.model;
+        const matchesSelection =
+          parts && selected?.provider === parts.provider && selected.id === parts.modelId;
+        const effectiveModel = matchesSelection
+          ? selected
+          : parts
+            ? ctx.sdk.modelRuntime.getModel(parts.provider, parts.modelId)
+            : undefined;
+        const maxTokens = matchesSelection
+          ? (context?.contextWindow ?? effectiveModel?.contextWindow)
+          : effectiveModel?.contextWindow;
+        const compactsAutomatically = ctx.sdk.autoCompactionEnabled;
+        const reserve =
+          compactsAutomatically && effectiveModel
+            ? ctx.sdk.settingsManager.getCompactionSettings(effectiveModel).reserveTokens
+            : undefined;
+        const threshold =
+          maxTokens !== undefined && reserve !== undefined ? maxTokens - reserve : undefined;
         const usedTokens =
           context?.tokens !== null && context?.tokens !== undefined
             ? count(context.tokens)
-            : input + count(usage.output);
-        if (usedTokens <= 0) return;
+            : undefined;
+        const input = usage
+          ? count(usage.input) + count(usage.cacheRead) + count(usage.cacheWrite)
+          : undefined;
         yield* emit({
           type: "thread.token-usage.updated",
-          ...base(ctx, turn.id),
+          ...base(ctx, turnId),
           payload: {
             usage: {
-              usedTokens,
-              lastUsedTokens: usedTokens,
-              ...(context && context.contextWindow > 0
-                ? { maxTokens: Math.floor(context.contextWindow) }
+              contextUsageStatus: usedTokens === undefined ? "unknown" : "estimated",
+              ...(usedTokens !== undefined ? { usedTokens, lastUsedTokens: usedTokens } : {}),
+              ...(maxTokens !== undefined && maxTokens > 0
+                ? { maxTokens: Math.floor(maxTokens) }
                 : {}),
-              inputTokens: input,
-              cachedInputTokens: count(usage.cacheRead),
-              outputTokens: count(usage.output),
-              ...(usage.reasoning !== undefined
+              ...(usage
+                ? {
+                    inputTokens: input,
+                    cachedInputTokens: count(usage.cacheRead),
+                    outputTokens: count(usage.output),
+                    lastInputTokens: input,
+                    lastCachedInputTokens: count(usage.cacheRead),
+                    lastOutputTokens: count(usage.output),
+                  }
+                : {}),
+              ...(usage?.reasoning !== undefined
                 ? { reasoningOutputTokens: count(usage.reasoning) }
                 : {}),
-              lastInputTokens: input,
-              lastCachedInputTokens: count(usage.cacheRead),
-              lastOutputTokens: count(usage.output),
-              compactsAutomatically: true,
+              compactsAutomatically,
+              ...(threshold !== undefined && threshold > 0
+                ? { autoCompactThreshold: Math.floor(threshold) }
+                : {}),
             },
           },
         });
       });
+    const accountingModel = (turn: Turn) =>
+      !turn.usage.unknownModel && turn.usage.models.size === 1
+        ? [...turn.usage.models][0]
+        : undefined;
     const turnAccounting = (ctx: Session, turn: Turn) => {
       const totals = turn.usage;
-      if (!totals.messages) return {};
+      if (!totals.messages && !totals.unresolved && !totals.hasSubagents) return {};
+      const costModel = accountingModel(turn);
       return {
         tokenUsage: {
           usageScope: "main_agent" as const,
-          usageStatus: "complete" as const,
-          hasSubagents: false,
-          inputTokens: totals.input + totals.cacheRead + totals.cacheWrite,
-          outputTokens: totals.output,
-          cachedInputTokens: totals.cacheRead,
-          cacheCreationTokens: totals.cacheWrite,
-          reasoningTokens: Math.min(totals.output, totals.reasoning),
+          usageStatus: totals.unresolved
+            ? ("partial" as const)
+            : totals.messages
+              ? ("complete" as const)
+              : ("unavailable" as const),
+          hasSubagents: totals.hasSubagents,
+          reasoningTokensAvailable:
+            totals.messages > 0 && !totals.unresolved && totals.reasoningAvailable,
+          ...(totals.messages
+            ? {
+                inputTokens: totals.input + totals.cacheRead + totals.cacheWrite,
+                outputTokens: totals.output,
+                cachedInputTokens: totals.cacheRead,
+                cacheCreationTokens: totals.cacheWrite,
+                ...(!totals.unresolved && totals.reasoningAvailable
+                  ? { reasoningTokens: Math.min(totals.output, totals.reasoning) }
+                  : {}),
+              }
+            : {}),
         },
-        totalCostUsd: totals.costUsd,
-        ...(ctx.session.model ? { costModel: ctx.session.model } : {}),
+        ...(totals.priced === totals.messages && !totals.unresolved && totals.priced > 0
+          ? { totalCostUsd: totals.costUsd }
+          : {}),
+        ...(costModel ? { costModel } : {}),
         costSessionId: ctx.sessionId,
       };
     };
     const subagentEvent = (
       ctx: Session,
-      kind: "started" | "completed" | "failed",
+      kind: "created" | "started" | "completed" | "failed",
       data: SubagentEvent,
+      activation: SubagentActivation,
     ) =>
       Effect.gen(function* () {
         const id = text(data.id);
         if (!id || ctx.stopped) return;
-        const turnId =
-          kind === "started" || !ctx.subagents.has(id)
-            ? (ctx.active?.id ?? ctx.lastTurnId)
-            : ctx.subagents.get(id);
+        // An explicitly absent callback-time origin must stay absent, even
+        // when earlier queued SDK events have since opened a runtime turn.
+        const turnId = activation.turnId;
+        const owningTurn = ctx.active;
+        if ((kind === "created" || kind === "started") && owningTurn && owningTurn.id === turnId)
+          owningTurn.usage.hasSubagents = true;
         const role = text(data.type);
         const description = text(data.description) ?? role ?? "Pi subagent";
         const linkage = {
@@ -548,9 +721,32 @@ export const makePiAdapter = (
           ...(role ? { role } : {}),
         };
         const taskId = RuntimeTaskId.make(`pi:${id}`);
+        if (kind === "created") {
+          // A repeated creation only arms the resume. Running is explicit at
+          // started; do not clear the prior terminal result while still queued.
+          if (activation.resumed) return;
+          yield* emit({
+            type: "task.updated",
+            ...base(ctx, turnId),
+            payload: {
+              taskId,
+              status: "pending",
+              description,
+              ...(typeof data.isBackground === "boolean"
+                ? { isBackgrounded: data.isBackground }
+                : {}),
+              ...linkage,
+            },
+          });
+          return;
+        }
         if (kind === "started") {
-          if (ctx.subagents.has(id)) return;
-          ctx.subagents.set(id, turnId);
+          if (activation.resumed)
+            yield* emit({
+              type: "task.updated",
+              ...base(ctx, turnId),
+              payload: { taskId, status: "running", description, ...linkage },
+            });
           yield* emit({
             type: "task.started",
             ...base(ctx, turnId),
@@ -558,38 +754,71 @@ export const makePiAdapter = (
           });
           return;
         }
-        ctx.subagents.delete(id);
+        // The channel alone cannot distinguish provider errors from interruption.
+        // Reject unknown/nonterminal statuses rather than fabricating completion.
+        let status: "completed" | "failed" | "stopped";
+        switch (data.status) {
+          case undefined:
+            status = kind;
+            break;
+          case "completed":
+          case "steered":
+            status = "completed";
+            break;
+          case "error":
+            status = "failed";
+            break;
+          case "stopped":
+          case "aborted":
+            status = "stopped";
+            break;
+          case "queued":
+          case "running":
+          default:
+            return;
+        }
         const typedUsage = subagentUsage(data);
-        const summary = kind === "failed" ? text(data.error) : text(data.result);
+        const summary = text(data.result);
+        const error = text(data.error);
         yield* emit({
           type: "task.completed",
           ...base(ctx, turnId),
           payload: {
             taskId,
-            status: kind,
+            status,
             ...(summary ? { summary: summary.slice(0, 2_000) } : {}),
+            ...(error ? { error: error.slice(0, 2_000) } : {}),
             ...(typedUsage ? { typedUsage } : {}),
             ...linkage,
           },
         });
       });
-    const turnBegin = (ctx: Session, id: TurnId) =>
+    const turnBegin = (ctx: Session, associatedId?: TurnId) =>
       Effect.gen(function* () {
+        const id = associatedId ?? turnIdentityAppend(ctx.sdk.sessionManager, ctx.sessionId);
+        if (!associatedId) ctx.historyTurnId = id;
         const turn: Turn = {
           id,
           settled: yield* Deferred.make<void, ProviderAdapterRequestError>(),
           interrupted: false,
+          ran: false,
           failure: undefined,
           segment: 0,
-          assistantItem: undefined,
+          assistantItems: new Map(),
           usage: {
             input: 0,
             output: 0,
             cacheRead: 0,
             cacheWrite: 0,
             reasoning: 0,
+            reasoningAvailable: true,
+            hasSubagents: false,
             costUsd: 0,
             messages: 0,
+            priced: 0,
+            unresolved: 0,
+            models: new Set(),
+            unknownModel: false,
           },
         };
         ctx.active = turn;
@@ -607,19 +836,17 @@ export const makePiAdapter = (
         });
         return turn;
       });
-    const consume = (ctx: Session, event: AgentSessionEvent) =>
+    const consume = (ctx: Session, event: AgentSessionEvent, associatedId?: TurnId) =>
       Effect.gen(function* () {
         // Extensions (e.g. background subagent completions) can start a run with
         // sendMessage({ triggerTurn: true }) after the user's turn settled.
         const turn =
           ctx.active ??
-          (event.type === "agent_start"
-            ? yield* turnBegin(
-                ctx,
-                TurnId.make(`pi:${ctx.sessionId}:ext:${NodeCrypto.randomUUID()}`),
-              )
+          (event.type === "agent_start" || event.type === "compaction_start"
+            ? yield* turnBegin(ctx, associatedId)
             : undefined);
         if (!turn) return;
+        if (event.type === "agent_start") turn.ran = true;
         // An interrupt can arrive while Pi is still running prompt preflight.
         if (event.type === "agent_start" && turn.interrupted) {
           ctx.sdk.clearQueue();
@@ -634,13 +861,30 @@ export const makePiAdapter = (
                 ? String(message.errorMessage ?? "Pi model failed")
                 : undefined;
             if (message.stopReason === "aborted") turn.interrupted = true;
-            yield* recordUsage(ctx, turn, message.usage);
+            const responseModel = message.responseModel ?? message.model;
+            const identity =
+              message.provider && responseModel
+                ? `${message.provider}/${responseModel}`
+                : undefined;
+            usageAccumulate(turn, message.usage, identity);
+            yield* contextRecord(ctx, turn.id, identity, ctx.sdk.getContextUsage(), message.usage);
+            const finalTexts = new Map<string, string>();
+            for (const [index, block] of message.content.entries()) {
+              if (block.type !== "text" && block.type !== "thinking") continue;
+              const itemType = block.type === "text" ? "assistant_message" : "reasoning";
+              finalTexts.set(
+                `${index}:${itemType}`,
+                block.type === "text" ? block.text : block.thinking,
+              );
+              yield* assistantItemStart(ctx, turn, index, itemType);
+            }
             yield* closeAssistant(
               ctx,
               turn,
               message.stopReason === "error" || message.stopReason === "aborted"
                 ? "failed"
                 : "completed",
+              finalTexts,
             );
           }
           return;
@@ -649,19 +893,16 @@ export const makePiAdapter = (
           const update = event.assistantMessageEvent;
           if (update.type !== "text_delta" && update.type !== "thinking_delta") return;
           const reasoning = update.type === "thinking_delta";
-          if (!reasoning && !turn.assistantItem) {
-            turn.assistantItem = RuntimeItemId.make(`pi:${turn.id}:assistant:${turn.segment++}`);
-            yield* emit({
-              type: "item.started",
-              ...base(ctx, turn.id),
-              itemId: turn.assistantItem,
-              payload: { itemType: "assistant_message", status: "inProgress" },
-            });
-          }
+          const itemId = yield* assistantItemStart(
+            ctx,
+            turn,
+            update.contentIndex,
+            reasoning ? "reasoning" : "assistant_message",
+          );
           yield* emit({
             type: "content.delta",
             ...base(ctx, turn.id),
-            ...(reasoning ? {} : { itemId: turn.assistantItem }),
+            itemId,
             payload: {
               streamKind: reasoning ? "reasoning_text" : "assistant_text",
               delta: update.delta,
@@ -718,7 +959,29 @@ export const makePiAdapter = (
           return;
         }
         if (event.type !== "agent_settled") return;
+        yield* turnComplete(ctx, turn);
+      });
+    const turnCostIncompleteEmit = (ctx: Session, turn: Turn) => {
+      const totals = turn.usage;
+      if (!totals.priced || (totals.priced === totals.messages && !totals.unresolved))
+        return Effect.void;
+      const costModel = accountingModel(turn);
+      return emit({
+        type: "turn.cost.updated",
+        ...base(ctx, turn.id),
+        turnId: turn.id,
+        payload: {
+          totalCostUsd: totals.costUsd,
+          status: "provisional",
+          costSessionId: ctx.sessionId,
+          ...(costModel ? { costModel } : {}),
+        },
+      });
+    };
+    const turnComplete = (ctx: Session, turn: Turn) =>
+      Effect.gen(function* () {
         yield* closeAssistant(ctx, turn);
+        if (ctx.historyTurnId === turn.id) ctx.historyTurnId = undefined;
         ctx.active = undefined;
         ctx.session = {
           ...ctx.session,
@@ -736,6 +999,7 @@ export const makePiAdapter = (
             ...turnAccounting(ctx, turn),
           },
         });
+        yield* turnCostIncompleteEmit(ctx, turn);
         yield* Deferred.succeed(turn.settled, undefined).pipe(Effect.ignore);
       });
 
@@ -744,6 +1008,7 @@ export const makePiAdapter = (
         if (ctx.active !== turn) return;
         if (!turn.interrupted) turn.failure = detail;
         yield* closeAssistant(ctx, turn, "failed");
+        if (ctx.historyTurnId === turn.id) ctx.historyTurnId = undefined;
         ctx.active = undefined;
         ctx.session = {
           ...ctx.session,
@@ -761,6 +1026,7 @@ export const makePiAdapter = (
             ...turnAccounting(ctx, turn),
           },
         });
+        yield* turnCostIncompleteEmit(ctx, turn);
         if (turn.interrupted) {
           yield* Deferred.succeed(turn.settled, undefined).pipe(Effect.ignore);
         } else {
@@ -865,50 +1131,35 @@ export const makePiAdapter = (
                 }),
             ),
           );
+        if (sessionFile) {
+          // Validate without opening a manager whose in-memory branch would be
+          // stale while the outgoing SDK still owns this file.
+          const source = yield* fs.readFileString(sessionFile).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterProcessError({
+                  provider,
+                  threadId: input.threadId,
+                  detail: cause.message,
+                  cause,
+                }),
+            ),
+          );
+          const header = parseSessionEntries(source)[0];
+          if (header?.type !== "session" || header.id !== sessionId)
+            return yield* new ProviderAdapterProcessError({
+              provider,
+              threadId: input.threadId,
+              detail: "Invalid Pi session header.",
+            });
+        }
         // Extensions publish on this bus; pi-subagents reports child lifecycle here.
         const eventBus = createEventBus();
-        const opened = yield* Effect.tryPromise({
-          try: async () => {
-            const manager = sessionFile
-              ? SessionManager.open(sessionFile, ownedDirectory, cwd)
-              : SessionManager.create(cwd, ownedDirectory, { id: sessionId });
-            if (manager.getSessionId() !== sessionId)
-              throw new Error("Pi returned a different session id.");
-            const agentDir = getAgentDir();
-            const settingsManager = SettingsManager.create(cwd, agentDir);
-            const loader = new DefaultResourceLoader({
-              cwd,
-              agentDir,
-              settingsManager,
-              eventBus,
-            });
-            await loader.reload();
-            const result = await createAgentSession({
-              cwd,
-              sessionManager: manager,
-              settingsManager,
-              resourceLoader: loader,
-              modelRuntime,
-              ...(model ? { model } : {}),
-            });
-            // Headless binding, as in Pi's print mode: extensions see hasUI === false.
-            // This emits session_start, so extension tools (e.g. pi-subagents) register.
-            await result.session.bindExtensions({
-              mode: "rpc",
-              onError: (error) =>
-                Effect.runFork(
-                  Effect.logWarning("Pi extension error", {
-                    extension: error.extensionPath,
-                    error: String(error.error),
-                  }),
-                ),
-            });
-            // A session_start extension (e.g. a preset) may switch models; T3's selection wins.
-            const current = result.session.model;
-            if (model && (current?.provider !== model.provider || current.id !== model.id))
-              await result.session.setModel(model);
-            return result.session;
-          },
+        const agentDir = getAgentDir();
+        const settingsManager = SettingsManager.create(cwd, agentDir);
+        const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, eventBus });
+        yield* Effect.tryPromise({
+          try: () => loader.reload(),
           catch: (cause) =>
             new ProviderAdapterProcessError({
               provider,
@@ -918,30 +1169,142 @@ export const makePiAdapter = (
             }),
         });
         const previous = sessions.get(input.threadId);
-        if (previous) yield* stop(previous);
-        const scope = yield* Scope.make("sequential");
+        // A same-file manager must only open after outgoing persistence settles.
+        // Independent replacements can finish validation/binding before retiring
+        // the usable session, and a failed start must not destroy that session.
+        if (previous && sessionFile === previous.sdk.sessionManager.getSessionFile())
+          yield* stop(previous);
+        let transferred = false;
+        let consuming = false;
+        let scope: Scope.Closeable | undefined;
+        let startupContext: Session | undefined;
+        const observers: Array<() => void> = [];
+        const unsubscribe = () => {
+          for (const off of observers.splice(0)) off();
+        };
+        const opened = yield* Effect.acquireRelease(
+          Effect.tryPromise({
+            try: async () => {
+              const manager = sessionFile
+                ? SessionManager.open(sessionFile, ownedDirectory, cwd)
+                : SessionManager.create(cwd, ownedDirectory, { id: sessionId });
+              if (manager.getSessionId() !== sessionId)
+                throw new Error("Pi returned a different session id.");
+              if (!sessionFile) {
+                // Pi defers creating a fresh file until an assistant is persisted.
+                // Open its actual header first so state-only and rejected attempts
+                // are durable too, without private flush APIs or fabricated messages.
+                const path = manager.getSessionFile()!;
+                await Effect.runPromise(
+                  fs.writeFileString(path, `${jsonEncode(manager.getHeader())}\n`, {
+                    flag: "wx",
+                  }),
+                );
+                manager.setSessionFile(path);
+              }
+              const result = await createAgentSession({
+                cwd,
+                sessionManager: manager,
+                settingsManager,
+                resourceLoader: loader,
+                modelRuntime,
+                ...(model ? { model } : {}),
+              });
+              return result.session;
+            },
+            catch: (cause) =>
+              new ProviderAdapterProcessError({
+                provider,
+                threadId: input.threadId,
+                detail: String(cause),
+                cause,
+              }),
+          }),
+          (sdk) =>
+            transferred
+              ? Effect.void
+              : Effect.gen(function* () {
+                  if (startupContext) startupContext.stopped = true;
+                  yield* request("abort", async () => {
+                    sdk.clearQueue();
+                    await sdk.abort();
+                  }).pipe(Effect.ignore);
+                  if (consuming && startupContext) yield* startupContext.drainEvents();
+                  yield* shutdownSdk(sdk);
+                }).pipe(
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      if (startupContext) startupContext.unsubscribe();
+                      unsubscribe();
+                      sdk.dispose();
+                    }).pipe(
+                      Effect.ensuring(
+                        Effect.suspend(() => (scope ? Scope.close(scope, Exit.void) : Effect.void)),
+                      ),
+                    ),
+                  ),
+                ),
+        );
+        scope = yield* Scope.make("sequential");
         const cursor = { schemaVersion: resumeVersion, sessionId };
         const now = nowIso();
         type Queued =
-          | { readonly source: "sdk"; readonly event: AgentSessionEvent }
-          | { readonly source: "command"; readonly turn: Turn }
+          | {
+              readonly source: "sdk";
+              readonly event: AgentSessionEvent;
+              readonly turnId: TurnId | undefined;
+            }
+          | { readonly source: "idle-prompt"; readonly turn: Turn }
+          | {
+              readonly source: "context";
+              readonly turnId: TurnId | undefined;
+              readonly model: string | undefined;
+              readonly context: ReturnType<AgentSession["getContextUsage"]>;
+            }
+          | {
+              readonly source: "summary";
+              readonly observation: Parameters<Parameters<typeof piSummaryUsageObserve>[1]>[0];
+              readonly turnId: TurnId | undefined;
+            }
+          | {
+              readonly source: "summary-end";
+              readonly turnId: TurnId;
+              readonly standalone: boolean;
+              readonly unresolved: boolean;
+              readonly aborted: boolean;
+              readonly errorMessage: string | undefined;
+            }
+          | { readonly source: "drain"; readonly done: Deferred.Deferred<void> }
           | {
               readonly source: "subagent";
-              readonly kind: "started" | "completed" | "failed";
+              readonly kind: "created" | "started" | "completed" | "failed";
               readonly data: SubagentEvent;
+              readonly activation: SubagentActivation;
             };
         const events = yield* Queue.unbounded<Queued>();
+        yield* Scope.addFinalizer(scope, Queue.shutdown(events));
         const ctx: Session = {
           sessionId,
           cwd,
           sdk: opened,
           unsubscribe: () => {},
-          completeCommand: (turn) =>
-            Queue.offer(events, { source: "command", turn }).pipe(Effect.asVoid),
+          completeIdlePrompt: (turn) =>
+            Queue.offer(events, { source: "idle-prompt", turn }).pipe(Effect.asVoid),
+          drainEvents: () =>
+            Effect.gen(function* () {
+              const done = yield* Deferred.make<void>();
+              yield* Queue.offer(events, { source: "drain", done });
+              yield* Deferred.await(done);
+            }),
           scope,
           stopped: false,
           active: undefined,
+          historyTurnId: undefined,
           pendingPrompt: false,
+          pendingSteer: false,
+          dispatchSettled: undefined,
+          steeringSettled: undefined,
+          stopping: undefined,
           lastTurnId: undefined,
           appliedPreset: undefined,
           appliedPresetModelOverride: false,
@@ -958,82 +1321,337 @@ export const makePiAdapter = (
             resumeCursor: cursor,
           },
         };
+        startupContext = ctx;
         ctx.session = {
           ...ctx.session,
           model: opened.model ? `${opened.model.provider}/${opened.model.id}` : undefined,
         };
-        // Extension command dispatch is an SDK preflight, not a T3 turn. Apply it only
-        // after extension binding and before exposing the session to real prompts.
-        const presetResult = yield* applyPreset(ctx, preset, modelOverride).pipe(Effect.exit);
-        if (Exit.isFailure(presetResult)) {
-          opened.dispose();
-          return yield* Effect.failCause(presetResult.cause);
-        }
-        ctx.session = {
-          ...ctx.session,
-          model: opened.model ? `${opened.model.provider}/${opened.model.id}` : undefined,
-        };
-        if (model) {
-          const current = opened.model;
-          if (current?.provider !== model.provider || current.id !== model.id)
-            yield* request("set_model", () => opened.setModel(model));
-          ctx.session = { ...ctx.session, model: `${model.provider}/${model.id}` };
-        }
-        if (
-          thinkingLevel &&
-          opened.model &&
-          !modelSupportsThinkingLevel(opened.model, thinkingLevel)
-        ) {
-          opened.dispose();
-          return yield* new ProviderAdapterValidationError({
-            provider,
-            operation: "startSession",
-            issue: `Pi thinking level ${thinkingLevel} is not supported by this model.`,
-          });
-        }
-        const initialThinkingLevel =
-          thinkingLevel ??
-          (preset === "none" || model !== undefined ? defaultThinkingLevel(opened.model) : null);
-        if (initialThinkingLevel) opened.setThinkingLevel(initialThinkingLevel);
-        const unsubscribeSdk = opened.subscribe((event) => {
-          Effect.runSync(Queue.offer(events, { source: "sdk", event }));
+        // Bind hooks and preset commands can run inference before they return.
+        // Buffer once in the normal queue; no runtime work may precede the initial lifecycle.
+        let subscribed = true;
+        let startupAgentStarted = false;
+        let summaryOwner:
+          | {
+              readonly turnId: TurnId;
+              readonly standalone: boolean;
+              observed: boolean;
+            }
+          | undefined;
+        // Subscribe before binding and before the ordinary SDK listener: usage must
+        // reach the queue before compaction_end can close a standalone activation.
+        const summaries = piSummaryUsageObserve(opened, (observation) => {
+          if (!subscribed || ctx.stopped) return;
+          if (summaryOwner) summaryOwner.observed = true;
+          Effect.runSync(
+            Queue.offer(events, {
+              source: "summary",
+              observation,
+              turnId: summaryOwner?.turnId,
+            }),
+          );
         });
-        const unsubscribeBus = (["started", "completed", "failed"] as const).map((kind) =>
-          eventBus.on(`subagents:${kind}`, (data) => {
-            if (data !== null && typeof data === "object")
+        observers.push(summaries.unsubscribe);
+        // The public bus has no activation ID. Agent's actual resume argument
+        // supplies a one-shot admission boundary, including foreground resumes
+        // (started only) and background resumes (created can follow started).
+        const pendingResumes = new Map<
+          string,
+          { readonly toolCallId: string; readonly turnId: TurnId | undefined }
+        >();
+        observers.push(
+          opened.subscribe((event) => {
+            if (!subscribed) return;
+            if (event.type === "compaction_start") {
+              if (ctx.stopped || ctx.stopping) return;
+              const standalone = ctx.historyTurnId === undefined;
+              const turnId =
+                ctx.historyTurnId ?? turnIdentityAppend(opened.sessionManager, sessionId);
+              ctx.historyTurnId = turnId;
+              summaryOwner = { turnId, standalone, observed: false };
+            }
+            if (event.type === "compaction_end") {
+              const owner = summaryOwner;
+              summaryOwner = undefined;
               Effect.runSync(
-                Queue.offer(events, { source: "subagent", kind, data: data as SubagentEvent }),
+                Queue.offer(events, {
+                  source: "context",
+                  turnId: owner?.turnId,
+                  model: opened.model ? `${opened.model.provider}/${opened.model.id}` : undefined,
+                  context: opened.getContextUsage(),
+                }),
               );
+              if (owner) {
+                if (owner.standalone && ctx.historyTurnId === owner.turnId)
+                  ctx.historyTurnId = undefined;
+                Effect.runSync(
+                  Queue.offer(events, {
+                    source: "summary-end",
+                    turnId: owner.turnId,
+                    standalone: owner.standalone,
+                    unresolved: !owner.observed,
+                    aborted: event.aborted,
+                    errorMessage: event.errorMessage,
+                  }),
+                );
+              }
+              return;
+            }
+            // Public message_end listeners run before SDK persistence. Reserve an
+            // extension activation at agent_start, not later in the queue consumer,
+            // or its messages may precede their durable turn marker.
+            if (event.type === "agent_start") {
+              startupAgentStarted = true;
+              if (!ctx.historyTurnId)
+                ctx.historyTurnId = turnIdentityAppend(opened.sessionManager, sessionId);
+            }
+            const turnId = ctx.historyTurnId;
+            if (event.type === "tool_execution_start" && event.toolName === "Agent") {
+              const args = event.args;
+              const id =
+                args && typeof args === "object" ? text(Reflect.get(args, "resume")) : undefined;
+              if (id && !pendingResumes.has(id))
+                pendingResumes.set(id, { toolCallId: event.toolCallId, turnId });
+            }
+            if (event.type === "tool_execution_end")
+              for (const [id, pending] of pendingResumes)
+                if (pending.toolCallId === event.toolCallId) pendingResumes.delete(id);
+            if (event.type === "agent_settled") ctx.historyTurnId = undefined;
+            Effect.runSync(Queue.offer(events, { source: "sdk", event, turnId }));
           }),
         );
+        for (const kind of ["created", "started", "completed", "failed"] as const)
+          observers.push(
+            eventBus.on(`subagents:${kind}`, (data) => {
+              if (!subscribed || data === null || typeof data !== "object") return;
+              const payload = data as SubagentEvent;
+              const id = text(payload.id);
+              if (!id) return;
+              let activation = ctx.subagents.get(id);
+              const pending = pendingResumes.get(id);
+              if (kind === "created" || kind === "started") {
+                if (activation?.state === "terminal") {
+                  // Neither a duplicate started nor a late created is evidence
+                  // of a new run. Require the real tool's pending resume first.
+                  if (!pending) return;
+                  activation = undefined;
+                } else if (activation && (kind === "created" || activation.state === "running")) {
+                  return;
+                }
+                if (!activation) {
+                  activation = {
+                    turnId: pending
+                      ? pending.turnId
+                      : (ctx.historyTurnId ?? ctx.active?.id ?? ctx.lastTurnId),
+                    // A resumed SDK session may have task history retained by
+                    // T3 even when this adapter instance has not observed it.
+                    resumed: pending !== undefined || ctx.subagents.has(id),
+                    state: "pending",
+                  };
+                  ctx.subagents.set(id, activation);
+                  pendingResumes.delete(id);
+                }
+                if (kind === "started") activation.state = "running";
+              } else {
+                switch (payload.status) {
+                  case undefined:
+                  case "completed":
+                  case "steered":
+                  case "error":
+                  case "stopped":
+                  case "aborted":
+                    break;
+                  default:
+                    return;
+                }
+                if (activation?.state === "terminal") return;
+                if (!activation) {
+                  activation = {
+                    turnId: ctx.historyTurnId ?? ctx.active?.id ?? ctx.lastTurnId,
+                    resumed: false,
+                    state: "pending",
+                  };
+                  ctx.subagents.set(id, activation);
+                }
+                // Corrected manager callbacks fence prior generations at the
+                // source. Here, duplicate terminals cannot release/relabel an
+                // ID, and each queued event retains its original activation.
+                activation.state = "terminal";
+              }
+              Effect.runSync(
+                Queue.offer(events, { source: "subagent", kind, data: payload, activation }),
+              );
+            }),
+          );
         ctx.unsubscribe = () => {
-          unsubscribeSdk();
-          for (const off of unsubscribeBus) off();
+          subscribed = false;
+          unsubscribe();
         };
-        sessions.set(input.threadId, ctx);
-        yield* Stream.fromQueue(events).pipe(
-          Stream.runForEach((item) =>
-            ctx.stopped
-              ? Effect.void
-              : item.source === "sdk"
-                ? consume(ctx, item.event)
-                : item.source === "command"
-                  ? ctx.active === item.turn && ctx.sdk.isIdle && ctx.sdk.pendingMessageCount === 0
-                    ? consume(ctx, { type: "agent_settled" })
-                    : Effect.void
-                  : subagentEvent(ctx, item.kind, item.data),
+        observers.push(
+          opened.extensionRunner.onError((error) =>
+            Effect.runFork(
+              Effect.logWarning("Pi extension error", {
+                extension: error.extensionPath,
+                error: String(error.error),
+              }),
+            ),
           ),
-          Effect.forkIn(scope),
         );
+        yield* Effect.gen(function* () {
+          // Headless binding awaits session_start and then resources_discover.
+          yield* Effect.tryPromise({
+            try: () =>
+              opened.bindExtensions({
+                mode: "rpc",
+                commandContextActions: {
+                  waitForIdle: () => {
+                    // Registered commands run before Pi starts the prompt's agent
+                    // turn. Waiting from an active run would wait on the command's
+                    // own dispatch, so only expose the SDK idle primitive there.
+                    if (!opened.isIdle)
+                      return Promise.reject(
+                        new Error(
+                          "Pi command ctx.waitForIdle() is only supported while the agent is idle.",
+                        ),
+                      );
+                    return opened.waitForIdle();
+                  },
+                  newSession: unsupportedCommandAction("newSession"),
+                  fork: unsupportedCommandAction("fork"),
+                  navigateTree: unsupportedCommandAction("navigateTree"),
+                  switchSession: unsupportedCommandAction("switchSession"),
+                  reload: unsupportedCommandAction("reload"),
+                } satisfies ExtensionCommandContextActions,
+              }),
+            catch: (cause) =>
+              new ProviderAdapterProcessError({
+                provider,
+                threadId: input.threadId,
+                detail: String(cause),
+                cause,
+              }),
+          });
+          // A session_start extension may switch models; T3's explicit selection wins.
+          if (model) {
+            const current = opened.model;
+            if (current?.provider !== model.provider || current.id !== model.id)
+              yield* request("set_model", () => opened.setModel(model));
+          }
+          // Extension command dispatch is an SDK preflight, not a T3 turn. Apply it only
+          // after extension binding and before exposing the session to real prompts.
+          yield* applyPreset(ctx, preset, modelOverride);
+          ctx.session = {
+            ...ctx.session,
+            model: opened.model ? `${opened.model.provider}/${opened.model.id}` : undefined,
+          };
+          if (model) {
+            const current = opened.model;
+            if (current?.provider !== model.provider || current.id !== model.id)
+              yield* request("set_model", () => opened.setModel(model));
+            ctx.session = { ...ctx.session, model: `${model.provider}/${model.id}` };
+          }
+          if (
+            thinkingLevel &&
+            opened.model &&
+            !modelSupportsThinkingLevel(opened.model, thinkingLevel)
+          ) {
+            return yield* new ProviderAdapterValidationError({
+              provider,
+              operation: "startSession",
+              issue: `Pi thinking level ${thinkingLevel} is not supported by this model.`,
+            });
+          }
+          const initialThinkingLevel =
+            thinkingLevel ??
+            (preset === "none" || model !== undefined ? defaultThinkingLevel(opened.model) : null);
+          if (initialThinkingLevel)
+            yield* request("set_thinking_level", async () =>
+              opened.setThinkingLevel(initialThinkingLevel),
+            );
+        });
+        if (previous && !previous.stopped) yield* stop(previous);
         yield* emit({ type: "session.started", ...base(ctx), payload: { resume: cursor } });
-        yield* emit({ type: "session.state.changed", ...base(ctx), payload: { state: "ready" } });
+        yield* emit({
+          type: "session.state.changed",
+          ...base(ctx),
+          payload: { state: startupAgentStarted || !opened.isIdle ? "running" : "ready" },
+        });
         yield* emit({
           type: "thread.started",
           ...base(ctx),
           payload: { providerThreadId: sessionId },
         });
+        yield* Stream.fromQueue(events).pipe(
+          Stream.runForEach((item) =>
+            item.source === "drain"
+              ? Deferred.succeed(item.done, undefined).pipe(Effect.asVoid)
+              : ctx.stopped
+                ? Effect.void
+                : item.source === "sdk"
+                  ? consume(ctx, item.event, item.turnId)
+                  : item.source === "context"
+                    ? contextRecord(ctx, item.turnId, item.model, item.context)
+                    : item.source === "summary"
+                      ? Effect.sync(() => {
+                          if (!ctx.active || ctx.active.id !== item.turnId) return;
+                          const identity = item.observation.modelIdentity;
+                          usageAccumulate(
+                            ctx.active,
+                            item.observation.usage,
+                            identity ? `${identity.provider}/${identity.model}` : undefined,
+                          );
+                        })
+                      : item.source === "summary-end"
+                        ? Effect.gen(function* () {
+                            const turn = ctx.active;
+                            if (!turn || turn.id !== item.turnId) return;
+                            if (item.unresolved) turn.usage.unresolved += 1;
+                            if (item.standalone) {
+                              turn.interrupted = item.aborted;
+                              turn.failure = item.errorMessage;
+                              yield* turnComplete(ctx, turn);
+                            }
+                          })
+                        : item.source === "idle-prompt"
+                          ? ctx.active === item.turn &&
+                            !item.turn.ran &&
+                            ctx.sdk.isIdle &&
+                            ctx.sdk.pendingMessageCount === 0
+                            ? consume(ctx, { type: "agent_settled" })
+                            : Effect.void
+                          : subagentEvent(ctx, item.kind, item.data, item.activation),
+          ),
+          Effect.forkIn(scope),
+        );
+        consuming = true;
+        yield* ctx.drainEvents();
+        // Admission must see the drained startup activation, never the provisional idle context.
+        sessions.set(input.threadId, ctx);
+        transferred = true;
+        if (options.publishInitializedResources) {
+          // Read the bound runner, not an unbound discovery runner: startup and
+          // preset handlers can register commands and install resources.
+          const commands = opened.extensionRunner.getRegisteredCommands().map((command) => {
+            const description = command.description?.trim();
+            return {
+              name: command.invocationName,
+              ...(description ? { description } : {}),
+            };
+          });
+          const names = new Set(commands.map((command) => command.name));
+          yield* options.publishInitializedResources({
+            cwd: ctx.cwd,
+            checkedAt: nowIso(),
+            slashCommands: [
+              ...commands,
+              ...piPromptTemplatesToSlashCommands(
+                opened.resourceLoader.getPrompts().prompts,
+              ).filter((command) => !names.has(command.name)),
+            ],
+            skills: piSkillsToServerProviderSkills(opened.resourceLoader.getSkills().skills),
+          });
+        }
         return ctx.session;
-      });
+      }).pipe(Effect.scoped);
 
     const sendTurn: ProviderAdapterShape<
       | ProviderAdapterRequestError
@@ -1099,6 +1717,18 @@ export const makePiAdapter = (
           });
         }
         const steering = ctx.active;
+        if (ctx.stopping || ctx.stopped)
+          return yield* new ProviderAdapterRequestError({
+            provider,
+            method: "prompt",
+            detail: "Pi session is stopping.",
+          });
+        if (ctx.pendingSteer)
+          return yield* new ProviderAdapterRequestError({
+            provider,
+            method: steering ? "steer" : "prompt",
+            detail: "Pi is processing steering input; send again once it finishes.",
+          });
         // Pi's prompt() only interprets streamingBehavior after asynchronous preflight.
         // Never let a second prompt start while the first has not entered an agent run.
         if (steering && !ctx.sdk.isStreaming)
@@ -1119,10 +1749,20 @@ export const makePiAdapter = (
         // would otherwise defer both /preset and the next user prompt, reporting success
         // before either has run. Reserve the SDK prompt slot across all async preflight.
         if (!steering) ctx.pendingPrompt = true;
+        else ctx.pendingSteer = true;
+        const dispatchSettled = yield* Deferred.make<void>();
+        if (!steering) ctx.dispatchSettled = dispatchSettled;
+        else ctx.steeringSettled = dispatchSettled;
         return yield* Effect.gen(function* () {
           // Do not mutate Pi's active preset/model until all send preflight and turn-eligibility
           // checks pass. In particular, rejected attachments or a busy turn must be side-effect free.
           yield* applyPreset(ctx, preset, modelOverride);
+          if (ctx.stopping || ctx.stopped)
+            return yield* new ProviderAdapterRequestError({
+              provider,
+              method: "prompt",
+              detail: "Pi session is stopping.",
+            });
           ctx.session = {
             ...ctx.session,
             model: ctx.sdk.model ? `${ctx.sdk.model.provider}/${ctx.sdk.model.id}` : undefined,
@@ -1148,11 +1788,13 @@ export const makePiAdapter = (
               ? defaultThinkingLevel(ctx.sdk.model)
               : null);
           if (promptThinkingLevel) ctx.sdk.setThinkingLevel(promptThinkingLevel);
-          const count = ctx.sdk.sessionManager
-            .getEntries()
-            .filter((entry) => entry.type === "message" && entry.message.role === "user").length;
-          const turn =
-            steering ?? (yield* turnBegin(ctx, TurnId.make(`pi:${ctx.sessionId}:${count}`)));
+          if (ctx.stopping || ctx.stopped)
+            return yield* new ProviderAdapterRequestError({
+              provider,
+              method: "prompt",
+              detail: "Pi session is stopping.",
+            });
+          const turn = steering ?? (yield* turnBegin(ctx));
           // T3 skill chips use $name; Pi owns body/base-directory expansion for both paths.
           // Native Pi expands only one leading skill command, not additional chips in args.
           const skillName = /^\$([^\s]+)/.exec(message)?.[1];
@@ -1161,10 +1803,16 @@ export const makePiAdapter = (
             ctx.sdk.resourceLoader.getSkills().skills.some((skill) => skill.name === skillName)
               ? `/skill:${skillName}${message.slice(skillName.length + 1)}`
               : message;
-          const commandName = !steering ? /^\/([^\s]+)/.exec(promptMessage)?.[1] : undefined;
+          const commandName = /^\/([^\s]+)/.exec(promptMessage)?.[1];
           const nativeCommand = commandName
             ? ctx.sdk.extensionRunner.getCommand(commandName)
             : undefined;
+          if (steering && nativeCommand)
+            return yield* new ProviderAdapterRequestError({
+              provider,
+              method: "steer",
+              detail: `Pi extension command /${commandName} cannot be queued.`,
+            });
           let commandError: string | undefined;
           const offCommandError = nativeCommand
             ? ctx.sdk.extensionRunner.onError((error) => {
@@ -1173,18 +1821,51 @@ export const makePiAdapter = (
               })
             : () => {};
           let accepted = false;
-          const prompt = steering
-            ? ctx.sdk.steer(promptMessage, images.length ? images : undefined)
-            : ctx.sdk.prompt(promptMessage, {
-                ...(images.length ? { images } : {}),
-                preflightResult: (success) => {
-                  accepted = success;
-                },
-              });
+          let deliveryTurnId = turn.id;
           const response = yield* Effect.tryPromise({
             try: async () => {
               try {
-                await prompt;
+                if (ctx.stopping || ctx.stopped) throw new Error("Pi session is stopping.");
+                if (
+                  steering &&
+                  (ctx.stopped ||
+                    turn.interrupted ||
+                    ctx.active !== turn ||
+                    ctx.historyTurnId !== turn.id ||
+                    !ctx.sdk.isStreaming)
+                )
+                  throw new Error(
+                    "Pi's active turn ended before steering dispatch; send again once it settles.",
+                  );
+                // prompt() rechecks activity after asynchronous input handlers.
+                // A successful streaming enqueue can also outlive its original run:
+                // it yields before preflightResult, so reconcile delivery below.
+                await ctx.sdk.prompt(promptMessage, {
+                  ...(images.length ? { images } : {}),
+                  ...(steering ? { streamingBehavior: "steer" as const } : {}),
+                  preflightResult: (success) => {
+                    accepted = success;
+                    if (!success) return;
+                    if (ctx.stopping || ctx.stopped || (steering && turn.interrupted)) {
+                      // Intentional interruption discards pending input. This is not
+                      // failed-steering cleanup: no request owns the global queues.
+                      if (steering) ctx.sdk.clearQueue();
+                      throw new Error(
+                        "Pi session stopped or was interrupted while processing input.",
+                      );
+                    }
+                    if (steering) {
+                      // The idle branch calls this before agent.prompt(), while the
+                      // queue branch calls it after enqueue. Reserve the successor's
+                      // durable identity in either case, before any new persistence.
+                      ctx.historyTurnId ??= turnIdentityAppend(
+                        ctx.sdk.sessionManager,
+                        ctx.sessionId,
+                      );
+                      deliveryTurnId = ctx.historyTurnId;
+                    }
+                  },
+                });
               } finally {
                 offCommandError();
               }
@@ -1192,12 +1873,18 @@ export const makePiAdapter = (
             catch: (cause) =>
               new ProviderAdapterRequestError({
                 provider,
-                method: "prompt",
+                method: steering ? "steer" : "prompt",
                 detail: String(cause),
                 cause,
               }),
           }).pipe(Effect.exit);
+          if (!steering) {
+            yield* Deferred.succeed(dispatchSettled, undefined);
+            if (ctx.dispatchSettled === dispatchSettled) ctx.dispatchSettled = undefined;
+          }
           if (Exit.isFailure(response)) {
+            // Failed preflight owns no queue entries. In particular, extension
+            // follow-ups must survive an unrelated steering rejection.
             if (!steering) yield* failPrompt(ctx, turn, String(response.cause));
             if (!steering && turn.interrupted) {
               return {
@@ -1213,28 +1900,65 @@ export const makePiAdapter = (
             yield* failPrompt(ctx, turn, detail);
             return yield* new ProviderAdapterRequestError({ provider, method: "prompt", detail });
           }
-          if (!steering && !accepted) {
-            yield* failPrompt(ctx, turn, "Pi did not accept the prompt.");
+          if (!accepted) {
+            if (!steering) yield* failPrompt(ctx, turn, "Pi did not accept the prompt.");
             return yield* new ProviderAdapterRequestError({
               provider,
-              method: "prompt",
+              method: steering ? "steer" : "prompt",
               detail: "Pi did not accept the prompt.",
             });
           }
-          if (steering)
+          if (steering) {
+            yield* ctx.drainEvents();
+            if (ctx.sdk.isIdle && ctx.sdk.pendingMessageCount > 0) {
+              // AgentSession has no public continue(). agent.continue() skips its
+              // session lifecycle, including agent_settled. A hidden custom input
+              // uses the public session lifecycle to consume all preserved queues
+              // without replaying the user's processed input or adding a user message.
+              if (ctx.dispatchSettled) yield* Deferred.await(ctx.dispatchSettled);
+              yield* ctx.drainEvents();
+              if (turn.interrupted || ctx.stopping || ctx.stopped) {
+                ctx.sdk.clearQueue();
+                return yield* new ProviderAdapterRequestError({
+                  provider,
+                  method: "steer",
+                  detail: "Pi was interrupted before queued input could continue.",
+                });
+              }
+              if (ctx.sdk.isIdle && ctx.sdk.pendingMessageCount > 0) {
+                ctx.historyTurnId ??= turnIdentityAppend(ctx.sdk.sessionManager, ctx.sessionId);
+                deliveryTurnId = ctx.historyTurnId;
+                yield* request("steer", () =>
+                  ctx.sdk.sendCustomMessage(
+                    { customType: "t3.queued-input", content: "", display: false },
+                    { triggerTurn: true },
+                  ),
+                );
+                yield* ctx.drainEvents();
+                deliveryTurnId = ctx.lastTurnId ?? deliveryTurnId;
+              }
+            } else if (deliveryTurnId !== turn.id && ctx.lastTurnId !== deliveryTurnId) {
+              // An input handler may handle the input after the original activation
+              // settled without starting inference. Acknowledge a distinct no-run attempt.
+              const handled = yield* turnBegin(ctx, deliveryTurnId);
+              yield* ctx.completeIdlePrompt(handled);
+              yield* Deferred.await(handled.settled);
+              deliveryTurnId = handled.id;
+            }
             return {
               threadId: input.threadId,
-              turnId: turn.id,
+              turnId: deliveryTurnId,
               resumeCursor: ctx.session.resumeCursor,
             };
+          }
           if (turn.interrupted && !ctx.stopped && ctx.active === turn) {
             ctx.sdk.clearQueue();
             yield* request("abort", () => ctx.sdk.abort());
           }
-          // Commands that only change extension state have no agent_settled event.
-          // Queue completion behind their SDK events; model-triggering commands keep
-          // the normal native settlement path instead of being completed early.
-          if (nativeCommand) yield* ctx.completeCommand(turn);
+          // Commands and handled ordinary inputs may have no agent run. Queue an
+          // idle/no-pending check behind their SDK events; inference or pending
+          // extension work still completes only through native agent_settled.
+          yield* ctx.completeIdlePrompt(turn);
           yield* Deferred.await(turn.settled);
           return {
             threadId: input.threadId,
@@ -1243,8 +1967,15 @@ export const makePiAdapter = (
           };
         }).pipe(
           Effect.ensuring(
-            Effect.sync(() => {
-              if (!steering) ctx.pendingPrompt = false;
+            Effect.gen(function* () {
+              if (!steering) {
+                ctx.pendingPrompt = false;
+                ctx.dispatchSettled = undefined;
+              } else {
+                ctx.pendingSteer = false;
+                ctx.steeringSettled = undefined;
+              }
+              yield* Deferred.succeed(dispatchSettled, undefined);
             }),
           ),
         );
@@ -1269,14 +2000,7 @@ export const makePiAdapter = (
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
         // The active branch preserves Pi's append-only history without duplicating message_end.
-        return snapshotFromMessages(
-          threadId,
-          ctx.sessionId,
-          ctx.sdk.sessionManager
-            .getBranch()
-            .filter((entry) => entry.type === "message")
-            .map((entry) => entry.message),
-        );
+        return snapshotFromEntries(threadId, ctx.sessionId, ctx.sdk.sessionManager.getBranch());
       });
     const unsupported = (method: string) =>
       Effect.fail(
@@ -1324,7 +2048,7 @@ export const makePiAdapter = (
       | ProviderAdapterValidationError
     >;
     yield* Effect.addFinalizer(() =>
-      adapter.stopAll().pipe(Effect.tap(() => PubSub.shutdown(bus))),
+      adapter.stopAll().pipe(Effect.orDie, Effect.ensuring(PubSub.shutdown(bus))),
     );
     return adapter;
   });

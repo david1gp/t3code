@@ -7,10 +7,16 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
-import { PiSettings, ProviderDriverKind } from "@t3tools/contracts";
+import {
+  PiSettings,
+  ProviderDriverKind,
+  type ServerProviderWorkspaceSnapshot,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import serverPackage from "../../../package.json" with { type: "json" };
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import type { ServerConfig } from "../../config.ts";
@@ -41,8 +47,10 @@ import {
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import { piSkillsToServerProviderSkills } from "../piSkillsToServerProviderSkills.ts";
 import { piExtensionCommandsForResources } from "../piExtensionCommandsForResources.ts";
+import type { PiAdapterFactoryOptions } from "../PiAdapterFactoryOptions.ts";
 
 const DRIVER = ProviderDriverKind.make("pi");
+const MAX_INITIALIZED_WORKSPACES = 16;
 // SDK VERSION resolves package.json relative to import.meta.url, which becomes T3's
 // package directory in the server bundle. The exact dependency pin identifies the embedded SDK.
 const SDK_VERSION = serverPackage.dependencies["@earendil-works/pi-coding-agent"];
@@ -107,7 +115,48 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
         accentColor,
         continuationGroupKey: continuationIdentity.continuationKey,
       });
-      const adapter = yield* makePiAdapter({ instanceId });
+      const initializedResources = new Map<string, ServerProviderWorkspaceSnapshot>();
+      const workspaceChanges = yield* Effect.acquireRelease(
+        PubSub.unbounded<ServerProviderWorkspaceSnapshot>(),
+        PubSub.shutdown,
+      );
+      let disposed = false;
+      const adapterOptions: PiAdapterFactoryOptions = {
+        instanceId,
+        publishInitializedResources: Effect.fnUntraced(function* (resources) {
+          if (disposed) return;
+          const cwd = NodePath.resolve(resources.cwd.trim());
+          const current = yield* snapshot.getSnapshot;
+          const names = new Set(resources.slashCommands.map((command) => command.name));
+          const initialized = {
+            cwd,
+            checkedAt: resources.checkedAt,
+            slashCommands: [
+              ...resources.slashCommands,
+              ...current.slashCommands.filter((command) => {
+                if (names.has(command.name)) return false;
+                names.add(command.name);
+                return true;
+              }),
+            ],
+            skills: resources.skills,
+          };
+          initializedResources.delete(cwd);
+          initializedResources.set(cwd, initialized);
+          if (initializedResources.size > MAX_INITIALIZED_WORKSPACES) {
+            const oldestCwd = initializedResources.keys().next().value;
+            if (oldestCwd !== undefined) initializedResources.delete(oldestCwd);
+          }
+          yield* PubSub.publish(workspaceChanges, initialized);
+        }),
+      };
+      const adapter = yield* makePiAdapter(adapterOptions);
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          disposed = true;
+          initializedResources.clear();
+        }),
+      );
       const textGeneration = makePiTextGeneration();
       const checkProvider = Effect.gen(function* () {
         if (!settings.enabled)
@@ -178,15 +227,37 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
             }),
         ),
       );
-      const snapshotForCwd: NonNullable<ProviderInstance["snapshotForCwd"]> = (cwd) =>
-        Effect.all([snapshot.getSnapshot, Effect.tryPromise(() => piResourcesForCwd(cwd))]).pipe(
-          Effect.map(([current, resources]) => ({ ...current, ...resources })),
+      const snapshotForCwd: NonNullable<ProviderInstance["snapshotForCwd"]> = (directory) =>
+        Effect.gen(function* () {
+          const cwd = NodePath.resolve(directory.trim());
+          const current = yield* snapshot.getSnapshot;
+          const initialized = initializedResources.get(cwd);
+          if (initialized) {
+            const { cwd: _cwd, ...resources } = initialized;
+            return { ...current, ...resources };
+          }
+          const discovered = yield* Effect.tryPromise(() => piResourcesForCwd(cwd)).pipe(
+            // Binding can publish while unbound discovery is in flight, even if
+            // that discovery fails. Its initialized resources remain authoritative.
+            Effect.catch((cause) => {
+              const initialized = initializedResources.get(cwd);
+              return initialized ? Effect.succeed(initialized) : Effect.fail(cause);
+            }),
+          );
+          const resources = initializedResources.get(cwd) ?? discovered;
+          return {
+            ...current,
+            slashCommands: resources.slashCommands,
+            skills: resources.skills,
+            ...("checkedAt" in resources ? { checkedAt: resources.checkedAt } : {}),
+          };
+        }).pipe(
           Effect.mapError(
             (cause) =>
               new ProviderDriverError({
                 driver: DRIVER,
                 instanceId,
-                detail: `Failed to discover Pi resources for '${cwd}'.`,
+                detail: `Failed to discover Pi resources for '${directory}'.`,
                 cause,
               }),
           ),
@@ -200,6 +271,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
         enabled,
         snapshot,
         snapshotForCwd,
+        streamWorkspaceSnapshotChanges: Stream.fromPubSub(workspaceChanges),
         adapter,
         textGeneration,
       } satisfies ProviderInstance;

@@ -23,6 +23,7 @@ import {
   ProviderInstanceId,
   ServerSettings,
   type ServerProvider,
+  type ServerProviderWorkspaceSnapshot,
   type ServerProviderSlashCommand,
   type ServerSettings as ContractServerSettings,
 } from "@t3tools/contracts";
@@ -32,6 +33,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { deepMerge } from "@t3tools/shared/Struct";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
+import { providerModelsResolveForCwd } from "../../../../../packages/client-runtime/src/providerModelsResolveForCwd.ts";
 
 import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
 import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
@@ -369,6 +371,145 @@ const awaitPersistedProvider = (
     Effect.forkScoped,
   );
 
+const workspacePublicationFixtureCreate = Effect.fnUntraced(function* (
+  overrides: Partial<ServerProvider> = {},
+  snapshotForCwd?: (
+    cwd: string,
+    provider: ServerProvider,
+  ) => ReturnType<NonNullable<ProviderInstance["snapshotForCwd"]>>,
+) {
+  const machineProvider = {
+    instanceId: ProviderInstanceId.make("pi"),
+    driver: ProviderDriverKind.make("pi"),
+    enabled: true,
+    installed: true,
+    status: "ready",
+    auth: { status: "authenticated" },
+    version: "0.87.1",
+    checkedAt: "2026-10-01T00:00:00.000Z",
+    models: [
+      {
+        slug: "machine-model",
+        name: "Machine model",
+        isCustom: false,
+        capabilities: createModelCapabilities({
+          optionDescriptors: [
+            selectDescriptor("agent", "Agent", [{ id: "build", label: "Build", isDefault: true }]),
+          ],
+        }),
+        metadata: { limits: { context: 200_000 }, tools: true },
+      },
+    ],
+    slashCommands: [{ name: "global" }],
+    skills: [{ name: "global", path: "/global/SKILL.md", enabled: true }],
+    ...overrides,
+  } as const satisfies ServerProvider;
+  const otherProvider = {
+    ...machineProvider,
+    instanceId: ProviderInstanceId.make("pi-other"),
+  } satisfies ServerProvider;
+  const discoveryCalls = yield* Ref.make(0);
+  const makeInstance = Effect.fnUntraced(function* (provider: ServerProvider) {
+    const publications = yield* Effect.acquireRelease(
+      PubSub.unbounded<ServerProviderWorkspaceSnapshot>(),
+      PubSub.shutdown,
+    );
+    const subscribed = yield* Deferred.make<void>();
+    const drained = yield* Deferred.make<void>();
+    const instance = {
+      instanceId: provider.instanceId,
+      driverKind: provider.driver,
+      continuationIdentity: {
+        driverKind: provider.driver,
+        continuationKey: `pi:instance:${provider.instanceId}`,
+      },
+      displayName: undefined,
+      enabled: true,
+      snapshot: {
+        resolveMaintenance: () =>
+          Effect.succeed(
+            makeManualOnlyProviderMaintenanceCapabilities({
+              provider: provider.driver,
+              packageName: null,
+            }),
+          ),
+        getSnapshot: Effect.succeed(provider),
+        refresh: Ref.update(discoveryCalls, (count) => count + 1).pipe(Effect.as(provider)),
+        streamChanges: Stream.empty,
+        applyUsageLimits: () => Effect.void,
+      },
+      snapshotForCwd: (cwd) =>
+        Ref.update(discoveryCalls, (count) => count + 1).pipe(
+          Effect.andThen(snapshotForCwd ? snapshotForCwd(cwd, provider) : Effect.succeed(provider)),
+        ),
+      streamWorkspaceSnapshotChanges: Stream.unwrap(
+        PubSub.subscribe(publications).pipe(
+          Effect.tap(() => Deferred.succeed(subscribed, undefined)),
+          Effect.map((subscription) => Stream.fromSubscription(subscription)),
+        ),
+      ).pipe(
+        Stream.rechunk(1),
+        Stream.mapEffect((snapshot) =>
+          snapshot.cwd === "/barrier"
+            ? Deferred.succeed(drained, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.succeed(snapshot),
+        ),
+      ),
+      adapter: {} as ProviderInstance["adapter"],
+      textGeneration: {} as ProviderInstance["textGeneration"],
+    } satisfies ProviderInstance;
+    return { instance, publications, subscribed, drained };
+  });
+  const first = yield* makeInstance(machineProvider);
+  const other = yield* makeInstance(otherProvider);
+  const instances = yield* Ref.make<ReadonlyArray<ProviderInstance>>([
+    first.instance,
+    other.instance,
+  ]);
+  const changes = yield* Effect.acquireRelease(PubSub.unbounded<void>(), PubSub.shutdown);
+  const instanceRegistryLayer = Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
+    getInstance: (id) =>
+      Ref.get(instances).pipe(Effect.map((current) => current.find((i) => i.instanceId === id))),
+    listInstances: Ref.get(instances),
+    listUnavailable: Effect.succeed([]),
+    streamChanges: Stream.fromPubSub(changes),
+    subscribeChanges: PubSub.subscribe(changes),
+  });
+  const scope = yield* Scope.make();
+  yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+  const context = yield* Layer.build(
+    ProviderRegistryLive.pipe(
+      Layer.provideMerge(instanceRegistryLayer),
+      Layer.provideMerge(
+        ServerConfig.layerTest(process.cwd(), { prefix: "t3-workspace-publication-" }),
+      ),
+      Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(ModelManifest.layerTest),
+    ),
+  ).pipe(Scope.provide(scope));
+  yield* Deferred.await(first.subscribed);
+  const registry = yield* ProviderRegistry.ProviderRegistry.pipe(Effect.provide(context));
+  const snapshot = (cwd: string): ServerProviderWorkspaceSnapshot => ({
+    cwd,
+    checkedAt: "2026-10-01T00:01:00.000Z",
+    slashCommands: [{ name: "initialized", description: "Registered during binding" }],
+    skills: [{ name: "project", path: `${cwd}/SKILL.md`, enabled: true, userInvocable: false }],
+  });
+  return {
+    machineProvider,
+    otherProvider,
+    discoveryCalls,
+    makeInstance,
+    first,
+    other,
+    instances,
+    changes,
+    registry,
+    snapshot,
+  };
+});
+const workspacePublicationFixture = workspacePublicationFixtureCreate();
+
 it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), TestHttpClientLive))(
   "ProviderRegistry",
   (it) => {
@@ -577,6 +718,288 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
     });
 
     describe("ProviderRegistryLive", () => {
+      it.effect(
+        "publishes initialized workspace catalogs without discovery and bounds cwd snapshots",
+        () =>
+          Effect.gen(function* () {
+            const fixture = yield* workspacePublicationFixture;
+            const { registry, first, machineProvider, otherProvider } = fixture;
+            const snapshot = (cwd: string): ServerProviderWorkspaceSnapshot => ({
+              ...fixture.snapshot(cwd),
+              modelOptionOverlays: [
+                {
+                  slug: "machine-model",
+                  optionDescriptors: [
+                    selectDescriptor("agent", "Agent", [
+                      { id: "initialized-agent", label: "Initialized agent", isDefault: true },
+                    ]),
+                  ],
+                },
+              ],
+            });
+            const nextUpdate = yield* Stream.toPull(registry.streamChanges);
+            const firstReceipt = yield* nextUpdate.pipe(
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* PubSub.publish(first.publications, snapshot("/workspace-0"));
+            const [published] = yield* Fiber.join(firstReceipt);
+            assert.deepStrictEqual(published, yield* registry.getProviders);
+            assert.strictEqual(published?.length, 2);
+            const provider = published?.find((p) => p.instanceId === machineProvider.instanceId);
+            assert.deepStrictEqual(provider?.workspaceSnapshots, [snapshot("/workspace-0")]);
+            assert.strictEqual(
+              providerModelsResolveForCwd(
+                provider!,
+                "/workspace-0",
+              )[0]?.capabilities?.optionDescriptors?.find((descriptor) => descriptor.id === "agent")
+                ?.currentValue,
+              "initialized-agent",
+            );
+            const { workspaceSnapshots: _workspaceSnapshots, ...machine } = provider!;
+            assert.deepStrictEqual(machine, withBundledCompatibility(machineProvider));
+            assert.deepStrictEqual(
+              published?.find((p) => p.instanceId === otherProvider.instanceId),
+              withBundledCompatibility(otherProvider),
+            );
+
+            // The next real change is the receipt: a duplicate must not emit or
+            // promote its cwd in the bounded insertion order.
+            yield* PubSub.publish(first.publications, snapshot("/workspace-0"));
+            for (let index = 1; index <= 16; index++) {
+              yield* PubSub.publish(first.publications, snapshot(`/workspace-${index}`));
+              const [update] = yield* nextUpdate;
+              const workspaces = update?.find(
+                (p) => p.instanceId === machineProvider.instanceId,
+              )?.workspaceSnapshots;
+              assert.strictEqual(workspaces?.at(-1)?.cwd, `/workspace-${index}`);
+              assert.strictEqual(workspaces?.length, Math.min(index + 1, 16));
+            }
+            const replacement = {
+              ...snapshot("/workspace-1"),
+              modelOptionOverlays: [{ slug: "machine-model", optionDescriptors: [] }],
+            };
+            yield* PubSub.publish(first.publications, replacement);
+            const [updated] = yield* nextUpdate;
+            const workspaces = updated?.find(
+              (p) => p.instanceId === machineProvider.instanceId,
+            )?.workspaceSnapshots;
+            assert.strictEqual(workspaces?.length, 16);
+            assert.deepStrictEqual(workspaces?.at(-1), replacement);
+            assert.strictEqual(workspaces?.filter((s) => s.cwd === replacement.cwd).length, 1);
+            const updatedProvider = updated!.find(
+              (p) => p.instanceId === machineProvider.instanceId,
+            )!;
+            assert.deepStrictEqual(
+              providerModelsResolveForCwd(updatedProvider, replacement.cwd)[0]?.capabilities
+                ?.optionDescriptors,
+              [],
+            );
+            yield* registry.refreshWorkspaceSnapshot({
+              instanceId: machineProvider.instanceId,
+              cwd: replacement.cwd,
+            });
+            assert.strictEqual(yield* Ref.get(fixture.discoveryCalls), 0);
+          }),
+      );
+
+      it.effect(
+        "publishes scoped native agent overlays to the shared resolver without replacing machine models or other instances",
+        () =>
+          Effect.gen(function* () {
+            const machineAgent = selectDescriptor("agent", "Agent", [
+              { id: "build", label: "Build", isDefault: true },
+            ]);
+            const projectAgent = selectDescriptor("agent", "Agent", [
+              { id: "project-only", label: "Project only", isDefault: true },
+              { id: "review", label: "Review" },
+            ]);
+            const variant = selectDescriptor("variant", "Variant", [
+              { id: "high", label: "High", isDefault: true },
+            ]);
+            const reasoning = booleanDescriptor("reasoning", "Reasoning");
+            const model = {
+              slug: "openai/gpt-5",
+              name: "Machine GPT-5",
+              subProvider: "OpenAI",
+              isCustom: false,
+              metadata: { limits: { context: 128_000 }, tools: true },
+              capabilities: createModelCapabilities({
+                optionDescriptors: [variant, machineAgent, reasoning],
+              }),
+            } satisfies ServerProvider["models"][number];
+            const models = [
+              model,
+              { ...model, slug: "openai/no-agent" },
+              { ...model, slug: "openai/unmatched" },
+            ] as const;
+            const scopedModels = [
+              {
+                ...model,
+                slug: "openai/no-agent",
+                capabilities: createModelCapabilities({ optionDescriptors: [reasoning] }),
+              },
+              {
+                ...model,
+                name: "Must not replace machine name",
+                metadata: { limits: { context: 1 } },
+                capabilities: createModelCapabilities({
+                  optionDescriptors: [projectAgent, booleanDescriptor("workspace-only", "Other")],
+                }),
+              },
+              { ...model, slug: "project-only-model" },
+            ];
+            const fixture = yield* workspacePublicationFixtureCreate(
+              {
+                instanceId: ProviderInstanceId.make("opencode-personal"),
+                driver: ProviderDriverKind.make("opencode"),
+                version: "2.0.18",
+                models,
+              },
+              (_cwd, machineProvider) =>
+                Effect.succeed({
+                  ...machineProvider,
+                  checkedAt: "2026-10-01T00:03:00.000Z",
+                  models: scopedModels,
+                }),
+            );
+            const before = yield* fixture.registry.getProviders;
+            const beforeProvider = before.find(
+              (entry) => entry.instanceId === fixture.machineProvider.instanceId,
+            )!;
+            const beforeOther = before.find(
+              (entry) => entry.instanceId === fixture.otherProvider.instanceId,
+            )!;
+            const nextUpdate = yield* Stream.toPull(fixture.registry.streamChanges);
+            const receipt = yield* nextUpdate.pipe(Effect.forkChild({ startImmediately: true }));
+            yield* fixture.registry.refreshWorkspaceSnapshot({
+              instanceId: fixture.machineProvider.instanceId,
+              cwd: "/project",
+            });
+            const [published] = yield* Fiber.join(receipt);
+            assert.deepStrictEqual(published, yield* fixture.registry.getProviders);
+            const provider = published!.find(
+              (entry) => entry.instanceId === fixture.machineProvider.instanceId,
+            )!;
+            assert.strictEqual(provider.models, beforeProvider.models);
+            assert.deepStrictEqual(provider.models, models);
+            assert.deepStrictEqual(provider.workspaceSnapshots?.[0], {
+              cwd: "/project",
+              checkedAt: "2026-10-01T00:03:00.000Z",
+              slashCommands: fixture.machineProvider.slashCommands,
+              skills: fixture.machineProvider.skills,
+              modelOptionOverlays: [
+                { slug: "openai/no-agent", optionDescriptors: [] },
+                { slug: model.slug, optionDescriptors: [projectAgent] },
+                { slug: "project-only-model", optionDescriptors: [machineAgent] },
+              ],
+            });
+            const resolved = providerModelsResolveForCwd(provider, "/project");
+            assert.deepStrictEqual(resolved, [
+              {
+                ...model,
+                capabilities: {
+                  ...model.capabilities,
+                  optionDescriptors: [variant, projectAgent, reasoning],
+                },
+              },
+              {
+                ...models[1],
+                capabilities: {
+                  ...model.capabilities,
+                  optionDescriptors: [variant, reasoning],
+                },
+              },
+              models[2],
+            ]);
+            assert.strictEqual(
+              providerModelsResolveForCwd(provider, "/project/child"),
+              provider.models,
+            );
+            const other = published!.find(
+              (entry) => entry.instanceId === fixture.otherProvider.instanceId,
+            )!;
+            assert.deepStrictEqual(other, withBundledCompatibility(fixture.otherProvider));
+            assert.strictEqual(other, beforeOther);
+            assert.strictEqual(providerModelsResolveForCwd(other, "/project"), other.models);
+            yield* fixture.registry.refreshWorkspaceSnapshot({
+              instanceId: provider.instanceId,
+              cwd: "/project",
+            });
+            assert.strictEqual(yield* Ref.get(fixture.discoveryCalls), 1);
+          }),
+      );
+
+      it.effect(
+        "discards initialized workspace publications from a replaced instance before registry sync",
+        () =>
+          Effect.gen(function* () {
+            const fixture = yield* workspacePublicationFixture;
+            const { registry, first, snapshot, machineProvider } = fixture;
+            const nextUpdate = yield* Stream.toPull(registry.streamChanges);
+            const firstReceipt = yield* nextUpdate.pipe(
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* PubSub.publish(first.publications, snapshot("/workspace"));
+            yield* Fiber.join(firstReceipt);
+            const replacementProvider = {
+              ...machineProvider,
+              checkedAt: "2026-10-01T00:02:00.000Z",
+            };
+            const replacement = yield* fixture.makeInstance(replacementProvider);
+            yield* Ref.set(fixture.instances, [replacement.instance, fixture.other.instance]);
+            const beforeStalePublication = yield* registry.getProviders;
+            yield* PubSub.publish(first.publications, {
+              ...snapshot("/workspace"),
+              modelOptionOverlays: [
+                {
+                  slug: "machine-model",
+                  optionDescriptors: [
+                    selectDescriptor("agent", "Agent", [
+                      { id: "retired-agent", label: "Retired agent", isDefault: true },
+                    ]),
+                  ],
+                },
+              ],
+            });
+            // The marker cannot be pulled until runForEach has finished the
+            // preceding publication. Hold it upstream rather than publishing it.
+            yield* PubSub.publish(first.publications, snapshot("/barrier"));
+            yield* Deferred.await(first.drained);
+            assert.deepStrictEqual(yield* registry.getProviders, beforeStalePublication);
+
+            const rebuilt = yield* Stream.toPull(
+              registry.streamChanges.pipe(
+                Stream.filter((providers) =>
+                  providers.some((p) => p.checkedAt === replacementProvider.checkedAt),
+                ),
+              ),
+            );
+            const rebuiltReceipt = yield* rebuilt.pipe(
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* PubSub.publish(fixture.changes, undefined);
+            const [rebuiltProviders] = yield* Fiber.join(rebuiltReceipt);
+            assert.strictEqual(
+              rebuiltProviders?.find((p) => p.instanceId === machineProvider.instanceId)
+                ?.workspaceSnapshots,
+              undefined,
+            );
+            yield* Deferred.await(replacement.subscribed);
+            const currentUpdate = yield* Stream.toPull(registry.streamChanges);
+            const currentReceipt = yield* currentUpdate.pipe(
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* PubSub.publish(replacement.publications, snapshot("/workspace"));
+            const [currentProviders] = yield* Fiber.join(currentReceipt);
+            assert.deepStrictEqual(
+              currentProviders?.find((p) => p.instanceId === machineProvider.instanceId)
+                ?.workspaceSnapshots,
+              [snapshot("/workspace")],
+            );
+            assert.strictEqual(yield* Ref.get(fixture.discoveryCalls), 0);
+          }),
+      );
+
       it("invalidates older OpenCode cwd catalogs when native discovery gains resources", () => {
         const base = {
           instanceId: ProviderInstanceId.make("opencode"),

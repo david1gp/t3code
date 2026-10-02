@@ -28,6 +28,7 @@ import {
   type ProviderInstanceId,
   type ServerProvider,
   type ServerProviderUpdateState,
+  type ServerProviderWorkspaceSnapshot,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -56,6 +57,7 @@ import {
 import type { ProviderInstance } from "../ProviderDriver.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import type { ProviderSnapshotSource } from "../builtInProviderCatalog.ts";
+import { providerWorkspaceSnapshotCreate } from "../providerWorkspaceSnapshotCreate.ts";
 
 const loadProviders = (
   providerSources: ReadonlyArray<ProviderSnapshotSource>,
@@ -82,24 +84,32 @@ const hasModelCapabilities = (model: ServerProvider["models"][number]): boolean 
 
 const MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER = 16;
 
+const providerWorkspaceSnapshotUpsert = (
+  provider: ServerProvider,
+  workspaceSnapshot: ServerProviderWorkspaceSnapshot,
+): ServerProvider => {
+  const previous = provider.workspaceSnapshots?.find(
+    (snapshot) => snapshot.cwd === workspaceSnapshot.cwd,
+  );
+  if (Equal.equals(previous, workspaceSnapshot)) return provider;
+  return {
+    ...provider,
+    workspaceSnapshots: [
+      ...(provider.workspaceSnapshots ?? []).filter(
+        (snapshot) => snapshot.cwd !== workspaceSnapshot.cwd,
+      ),
+      workspaceSnapshot,
+    ].slice(-MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER),
+  };
+};
+
 export function upsertProviderWorkspaceSnapshot(
   provider: ServerProvider,
   cwd: string,
   scopedSnapshot: ServerProvider,
 ): ServerProvider {
-  const workspaceSnapshot = {
-    cwd,
-    checkedAt: scopedSnapshot.checkedAt,
-    slashCommands: scopedSnapshot.slashCommands,
-    skills: scopedSnapshot.skills,
-  } satisfies NonNullable<ServerProvider["workspaceSnapshots"]>[number];
-  return {
-    ...provider,
-    workspaceSnapshots: [
-      ...(provider.workspaceSnapshots ?? []).filter((snapshot) => snapshot.cwd !== cwd),
-      workspaceSnapshot,
-    ].slice(-MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER),
-  };
+  const workspaceSnapshot = providerWorkspaceSnapshotCreate(cwd, scopedSnapshot);
+  return providerWorkspaceSnapshotUpsert(provider, workspaceSnapshot);
 }
 
 const shouldRetainMissingProviderModels = (provider: ServerProvider): boolean => {
@@ -645,6 +655,34 @@ export const ProviderRegistryLive = Layer.effect(
       return yield* instance.snapshot.resolveMaintenance(options);
     });
 
+    const providerWorkspaceSnapshotPublish = Effect.fn("providerWorkspaceSnapshotPublish")(
+      function* (
+        instance: ProviderInstance,
+        snapshot: ServerProviderWorkspaceSnapshot,
+        onlyIfMissing = false,
+      ) {
+        const currentInstance = yield* instanceRegistry.getInstance(instance.instanceId);
+        if (currentInstance !== instance) return yield* Ref.get(providersRef);
+        const [previousProviders, providers] = yield* Ref.modify(
+          providersRef,
+          (previousProviders) => {
+            const providers = previousProviders.map((provider) =>
+              provider.instanceId === instance.instanceId &&
+              provider.enabled &&
+              (!onlyIfMissing || !provider.workspaceSnapshots?.some((s) => s.cwd === snapshot.cwd))
+                ? providerWorkspaceSnapshotUpsert(provider, snapshot)
+                : provider,
+            );
+            return [[previousProviders, providers] as const, providers];
+          },
+        );
+        if (haveProvidersChanged(previousProviders, providers)) {
+          yield* PubSub.publish(changesPubSub, providers);
+        }
+        return providers;
+      },
+    );
+
     /**
      * Diff the aggregator's live-source set against the current
      * `ProviderInstanceRegistry` and:
@@ -731,6 +769,11 @@ export const ProviderRegistryLive = Layer.effect(
           yield* Stream.runForEach(source.streamChanges, (provider) =>
             correlateSnapshotWithSource(source, provider).pipe(Effect.flatMap(syncProvider)),
           ).pipe(Effect.forkScoped);
+          if (instance.streamWorkspaceSnapshotChanges) {
+            yield* Stream.runForEach(instance.streamWorkspaceSnapshotChanges, (snapshot) =>
+              providerWorkspaceSnapshotPublish(instance, snapshot),
+            ).pipe(Effect.forkScoped);
+          }
         }
         yield* Effect.yieldNow;
 
@@ -890,26 +933,10 @@ export const ProviderRegistryLive = Layer.effect(
         Effect.flatMap((scopedSnapshot) =>
           scopedSnapshot.status === "error"
             ? Ref.get(providersRef)
-            : instanceRegistry.getInstance(input.instanceId).pipe(
-                Effect.flatMap((currentInstance) => {
-                  if (currentInstance !== instance) return Ref.get(providersRef);
-                  return Ref.modify(providersRef, (currentProviders) => {
-                    const nextProviders = currentProviders.map((candidate) =>
-                      candidate.instanceId === input.instanceId &&
-                      !candidate.workspaceSnapshots?.some((s) => s.cwd === input.cwd)
-                        ? upsertProviderWorkspaceSnapshot(candidate, input.cwd, scopedSnapshot)
-                        : candidate,
-                    );
-                    return [[currentProviders, nextProviders] as const, nextProviders];
-                  }).pipe(
-                    Effect.tap(([previousProviders, nextProviders]) =>
-                      haveProvidersChanged(previousProviders, nextProviders)
-                        ? PubSub.publish(changesPubSub, nextProviders)
-                        : Effect.void,
-                    ),
-                    Effect.map(([, nextProviders]) => nextProviders),
-                  );
-                }),
+            : providerWorkspaceSnapshotPublish(
+                instance,
+                providerWorkspaceSnapshotCreate(input.cwd, scopedSnapshot),
+                true,
               ),
         ),
         Effect.ensuring(
